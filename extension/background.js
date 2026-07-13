@@ -402,10 +402,16 @@ async function runTool(base, taskId, phase) {
 
   if (phase.tool === 'type') {
     const tabId = await currentTab(taskId);
-    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value: p.value || '' });
     const t = await getTask(base, taskId);
+    // Models emit placeholders like "<generated text>" — substitute the text
+    // the generate_text phase produced (also used when value is omitted).
+    let value = p.value || '';
+    if (t?.generatedText && (!value || /^\s*<[^>]*>\s*$/.test(value) || /\bgenerated\s+(text|post|content)\b/i.test(value))) {
+      value = t.generatedText;
+    }
+    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value });
     await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
-    const okMsg = res && res.ok ? `Typed into ${res.matched || 'field'}: "${String(p.value || '').slice(0, 60)}"` : `type failed: ${(res && res.error) || 'no field'}`;
+    const okMsg = res && res.ok ? `Typed into ${res.matched || 'field'}: "${String(value).slice(0, 60)}"` : `type failed: ${(res && res.error) || 'no field'}`;
     await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
     if (res && !res.ok) throw new Error(okMsg);
     return;
@@ -414,10 +420,14 @@ async function runTool(base, taskId, phase) {
   if (phase.tool === 'generate_text') {
     const t = await getTask(base, taskId);
     const prompt = p.prompt || t.goal;
-    await taskEvent(base, taskId, 'think', `Generating text: ${String(prompt).slice(0, 80)}…`);
+    // Hand the latest found/collected post text to the model as source
+    // material, so "regenerate the found post" actually sees the post.
+    const last = (t.collected || [])[(t.collected || []).length - 1] || null;
+    const context = last ? String(last.text || last._sourceText || '').slice(0, 4000) : '';
+    await taskEvent(base, taskId, 'think', `Generating text: ${String(prompt).slice(0, 80)}…${context ? ' (using the found post as source)' : ''}`);
     const gen = await jf(`${base}/ai/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: t.model, prompt, words: p.words }),
+      body: JSON.stringify({ model: t.model, prompt, words: p.words, context }),
     }).catch(() => null);
     const text = gen && gen.ok ? gen.text : '';
     if (!text) throw new Error(`generate_text failed: ${(gen && gen.error) || 'no text produced'}`);
@@ -425,10 +435,18 @@ async function runTool(base, taskId, phase) {
     await patchTask(base, taskId, { generatedText: text, actions: (t?.actions || 0) + 1 });
     const tabId = await currentTab(taskId);
     const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value: text });
-    const okMsg = res && res.ok ? `Wrote generated text into ${res.matched || 'field'}.` : `type failed: ${(res && res.error) || 'no field'}`;
-    await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
-    if (res && !res.ok) throw new Error(okMsg);
-    return;
+    if (res && res.ok) { await taskEvent(base, taskId, 'obs', `Wrote generated text into ${res.matched || 'field'}.`); return; }
+    // No editable field yet — common when the composer opens in a LATER click
+    // phase. If a later type phase will paste the text, defer instead of failing.
+    const idx = t.currentPhaseIndex || 0;
+    const laterTyper = (t.plan?.phases || []).slice(idx + 1).some((ph) => ph.tool === 'type');
+    if (laterTyper) {
+      await taskEvent(base, taskId, 'obs', 'No editable field open yet — generated text saved for the later type phase.');
+      return;
+    }
+    const okMsg = `type failed: ${(res && res.error) || 'no field'}`;
+    await taskEvent(base, taskId, 'err', okMsg);
+    throw new Error(okMsg);
   }
 
   if (phase.tool === 'scroll_and_collect_links') {
@@ -672,9 +690,11 @@ async function executeLoop(base, taskId) {
       : (task.collected?.length || 0);
     await taskEvent(base, taskId, 'obs', `Target check: ${have}/${count} ${metric}.`);
 
-    if (have >= count) {
+    // An ACTION plan that ran every phase without error IS the job done —
+    // repeating it would re-click/re-type (e.g. post the same text twice).
+    if (metric === 'actions' || have >= count) {
       await patchTask(base, taskId, { status: 'done', finishedAt: new Date().toISOString() });
-      await taskEvent(base, taskId, 'ok', `Task complete: ${have}/${count} ${metric}.`);
+      await taskEvent(base, taskId, 'ok', `Task complete: ${have >= count ? `${have}/${count} ${metric}` : `all ${task.plan.phases.length} phases ran`}.`);
       return;
     }
 

@@ -895,6 +895,26 @@ function feedPostNodes() {
     .filter((el) => !(el.parentElement && el.parentElement.closest('[role="article"]')));
 }
 
+// Visible message text of a feed unit. Whole-unit innerText drags in dozens of
+// hidden accessibility labels (e.g. "Facebook" repeated for every icon/link),
+// so prefer the post's message container(s), then top-most dir="auto" blocks,
+// and collapse any token that repeats 3+ times in a row.
+function postText(article) {
+  let parts = [...article.querySelectorAll('[data-ad-comet-preview="message"], [data-ad-preview="message"]')]
+    .map((el) => fullText(el)).filter(Boolean);
+  if (!parts.length) {
+    parts = [...article.querySelectorAll('div[dir="auto"]')]
+      .filter((el) => {
+        const anc = el.parentElement && el.parentElement.closest('div[dir="auto"]');
+        return !(anc && article.contains(anc)); // keep top-most blocks only (no nested dupes)
+      })
+      .map((el) => fullText(el)).filter(Boolean);
+  }
+  let text = parts.join('\n') || fullText(article);
+  text = text.replace(/(^|\s)(\S{2,40})(?:\s+\2){2,}(?=\s|$)/g, '$1$2'); // strip "Facebook Facebook Facebook…" noise
+  return text.trim();
+}
+
 // Best-effort permalink of a post (timestamp/permalink anchor inside it).
 function postPermalink(article) {
   const a = article.querySelector(
@@ -947,7 +967,7 @@ async function scanNextPost({ settle = 700, maxLoadScrolls = 6 } = {}) {
           break;
         }
       }
-      const text = fullText(article).slice(0, 6000);
+      const text = postText(article).slice(0, 6000);
       article.__baScanned = true;
       if (!text) continue; // placeholder that never hydrated — move to the next
       return { ok: true, post: { text, url: postPermalink(article) || location.href }, y: scanScrollY() };
@@ -1048,6 +1068,9 @@ function findField(selector, text) {
     || (el.tagName === 'INPUT' && /^(text|search|email|url|tel|)$/i.test(el.type || ''))
     || el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox');
   if (selector) { try { const el = document.querySelector(selector); if (el) return el; } catch {} }
+  // Models often put a human label in `selector` (e.g. "New post input") — if it
+  // matched nothing as CSS, reuse it as the placeholder/aria-label hint.
+  if (!text && selector && /[A-Z\s]/.test(selector)) text = selector;
   if (text) {
     const t = String(text).toLowerCase().trim();
     const all = [...document.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"]')].filter(editable);
@@ -1061,8 +1084,10 @@ function findField(selector, text) {
     .find((el) => el.offsetParent !== null) || null;
 }
 
-// Type text into a field. Uses execCommand insertText (works for React-controlled
-// inputs and contenteditable), with a value-setter fallback.
+// Type text into a field. Contenteditables (FB's Lexical post composer) go
+// through insertIntoLexical, which clears the field first and tries ONE insert
+// method at a time, verifying between attempts — inserting and then also
+// dispatching a synthetic input event makes Lexical insert the text TWICE.
 async function typeInto(selector, text, value) {
   const el = findField(selector, text);
   if (!el) return { ok: false, error: 'no editable field found' };
@@ -1072,10 +1097,8 @@ async function typeInto(selector, text, value) {
   const label = norm(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.tagName).slice(0, 50);
   try {
     if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
-      let ok = false;
-      try { ok = document.execCommand('insertText', false, value); } catch {}
-      if (!ok) { el.textContent = value; }
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+      const method = await insertIntoLexical(el, value);
+      if (!method) return { ok: false, error: 'could not insert text into the editor' };
     } else {
       const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;

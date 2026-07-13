@@ -63,9 +63,16 @@ function filteredTasks() {
   });
 }
 
+let listSig = '';
+
 function renderList() {
   const list = $('#taskList');
   const items = filteredTasks();
+  // Skip the rebuild when nothing visible changed — a full innerHTML swap every
+  // poll makes the sidebar flicker while a task is running.
+  const sig = selectedId + '|' + items.map((t) => `${t.taskId}:${t.status}:${haveOf(t)}`).join('|');
+  if (sig === listSig) return;
+  listSig = sig;
   if (!items.length) { list.innerHTML = '<li class="empty">No tasks.</li>'; return; }
   list.innerHTML = items.map((t) => {
     const tg = t.plan?.target;
@@ -91,6 +98,7 @@ function renderList() {
 async function selectTask(id) {
   selectedId = id;
   dataFilter = '';
+  ui = null; // force a full preview rebuild for the newly selected task
   renderList();
   const t = TASKS.find((x) => x.taskId === id) || (await api(`/tasks/${id}`)).task;
   if (t) renderPreview(t);
@@ -116,28 +124,21 @@ function collectedRows(t) {
     });
 }
 
+// Incremental preview. The skeleton is built ONCE per selected task; each poll
+// only patches what changed (badge, counters, new activity lines, data table).
+// Rebuilding everything with innerHTML every 2s made the page flicker, reset
+// scroll positions, reload images, wipe the debug panel, and steal focus.
+let ui = null; // { taskId, status, events, errors, phaseSig, dataSig }
+
 function renderPreview(t) {
-  const tg = t.plan?.target;
-  const end = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
-  const elapsed = Math.max(0, Math.round((end - new Date(t.createdAt).getTime()) / 1000));
+  if (!ui || ui.taskId !== t.taskId) buildPreview(t);
+  updatePreview(t);
+}
 
-  const phases = (t.plan?.phases || [])
-    .map((p, i) => `<span class="chip"><span class="i">${i + 1}</span>${esc(p.tool)}</span>`).join('') || '<span class="chip">not planned yet</span>';
-
-  const events = (t.events || []).map((e) =>
-    `<li class="${esc(e.kind)}"><span class="t">${timeOf(e.at)}</span><span class="m">${esc(e.msg)}</span></li>`).join('');
-
-  const errorsCard = (t.errors && t.errors.length) ? `
-    <div class="card errbox">
-      <p class="section-title">Errors (${t.errors.length})</p>
-      <ul class="timeline">${t.errors.map((e) => `<li class="err"><span class="t">${timeOf(e.at)}</span><span class="m">${esc(e.phase)}: ${esc(e.message)}</span></li>`).join('')}</ul>
-    </div>` : '';
-
+function buildPreview(t) {
   const useSchema = !!(t.schemas && t.schemas.length);
-  let dataCard;
-  if (useSchema) {
-    // Records live in the task's schema collection(s); loaded async below.
-    dataCard = `
+  const dataCard = useSchema
+    ? `
       <div class="card">
         <div class="data-head">
           <p class="section-title">Collected data — ${esc(t.schemas.map((s) => s.name).join(', '))}</p>
@@ -145,35 +146,17 @@ function renderPreview(t) {
           <input id="dataFilter" class="input" style="max-width:220px" placeholder="Filter records…" value="${esc(dataFilter)}" />
         </div>
         <div id="schemaData" class="table-wrap"><span class="mut">Loading…</span></div>
-      </div>`;
-  } else {
-    const rows = collectedRows(t);
-    const hasDetails = rows.some((r) => r.phone || r.email || r.website);
-    dataCard = `
+      </div>`
+    : `
       <div class="card">
         <div class="data-head">
           <p class="section-title">Collected data</p>
-          <span class="count-pill">${rows.length} shown</span>
+          <span class="count-pill" id="genCount"></span>
           <span class="grow"></span>
           <input id="dataFilter" class="input" style="max-width:220px" placeholder="Filter collected…" value="${esc(dataFilter)}" />
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>Name</th><th>URL</th>${hasDetails ? '<th>Phone</th><th>Email</th><th>Website</th>' : ''}<th></th>
-            </tr></thead>
-            <tbody>
-              ${rows.map((r) => `<tr>
-                <td>${esc(r.name || '')}</td>
-                <td><a href="${esc(r.url)}" target="_blank">${esc((r.url || '').replace(/^https?:\/\/(www\.)?/, ''))}</a></td>
-                ${hasDetails ? `<td>${esc(r.phone || '')}</td><td>${esc(r.email || '')}</td><td>${r.website ? `<a href="${esc(r.website)}" target="_blank">link</a>` : ''}</td>` : ''}
-                <td>${r._extracted ? '<span class="tag ex">extracted</span>' : '<span class="tag">link</span>'}</td>
-              </tr>`).join('') || `<tr><td colspan="6" class="mut">No collected items${dataFilter ? ' match the filter' : ' yet'}.</td></tr>`}
-            </tbody>
-          </table>
-        </div>
+        <div class="table-wrap" id="genericData"></div>
       </div>`;
-  }
 
   $('#preview').innerHTML = `
     <div class="card">
@@ -183,27 +166,30 @@ function renderPreview(t) {
           <div class="p-sub">
             <span>${esc(t.model)}</span>
             <span>${esc(t.mode)}</span>
-            <span>${elapsed}s</span>
-            ${tg ? `<span>${haveOf(t)}/${tg.count} ${esc(tg.metric)}</span>` : ''}
+            <span id="pElapsed"></span>
+            <span id="pProg"></span>
             ${useSchema ? `<span>schema: ${esc(t.schemas.map((s) => s.name).join(', '))}</span>` : ''}
             <span>${dateOf(t.createdAt)}</span>
           </div>
         </div>
-        <span class="${badgeClass(t.status)}">${esc(t.status)}</span>
+        <span id="pBadge"></span>
         <button id="deleteBtn" class="btn sm danger">Delete</button>
       </div>
     </div>
 
     <div class="card">
-      <p class="section-title">Plan (${(t.plan?.phases || []).length} phases)</p>
-      <div class="phases">${phases}</div>
+      <p class="section-title">Plan (<span id="pPhaseCount">0</span> phases)</p>
+      <div class="phases" id="pPhases"></div>
     </div>
 
-    ${errorsCard}
+    <div class="card errbox" id="errCard" style="display:none">
+      <p class="section-title" id="errTitle">Errors</p>
+      <ul class="timeline" id="errList"></ul>
+    </div>
 
     <div class="card">
       <p class="section-title">Activity</p>
-      <ul class="timeline">${events || '<li class="mut">No activity.</li>'}</ul>
+      <ul class="timeline" id="pEvents"><li class="mut" id="noAct">No activity.</li></ul>
     </div>
 
     ${dataCard}
@@ -218,20 +204,96 @@ function renderPreview(t) {
     </div>
   `;
 
+  ui = { taskId: t.taskId, status: null, events: 0, errors: -1, phaseSig: null, dataSig: null };
+
   const fi = $('#dataFilter');
-  if (fi) {
-    fi.addEventListener('input', (e) => {
-      dataFilter = e.target.value;
-      if (useSchema) loadSchemaData(t);                                   // just refilter the records table
-      else renderPreview(TASKS.find((x) => x.taskId === selectedId) || t); // generic path re-renders
-    });
-    // keep focus/caret while typing across re-renders
-    fi.focus(); fi.setSelectionRange(fi.value.length, fi.value.length);
-  }
+  if (fi) fi.addEventListener('input', (e) => {
+    dataFilter = e.target.value;
+    const cur = TASKS.find((x) => x.taskId === selectedId) || t;
+    if (useSchema) loadSchemaData(cur); else renderGenericTable(cur);
+  });
   $('#deleteBtn').addEventListener('click', () => deleteTask(t.taskId));
   $('#debugToggle').addEventListener('click', () => loadDebugItems(t.taskId));
+}
 
-  if (useSchema) loadSchemaData(t);
+const setText = (sel, txt) => { const el = $(sel); if (el && el.textContent !== txt) el.textContent = txt; };
+
+function updatePreview(t) {
+  const tg = t.plan?.target;
+  const end = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
+  setText('#pElapsed', Math.max(0, Math.round((end - new Date(t.createdAt).getTime()) / 1000)) + 's');
+  if (tg) setText('#pProg', `${haveOf(t)}/${tg.count} ${tg.metric}`);
+
+  if (ui.status !== t.status) {
+    ui.status = t.status;
+    const badge = $('#pBadge');
+    badge.className = badgeClass(t.status);
+    badge.textContent = t.status;
+    scheduleRefresh(t); // stops the poll once the task reaches a terminal state
+  }
+
+  const phaseSig = (t.plan?.phases || []).map((p) => p.tool).join(',');
+  if (ui.phaseSig !== phaseSig) {
+    ui.phaseSig = phaseSig;
+    setText('#pPhaseCount', String((t.plan?.phases || []).length));
+    $('#pPhases').innerHTML = (t.plan?.phases || [])
+      .map((p, i) => `<span class="chip"><span class="i">${i + 1}</span>${esc(p.tool)}</span>`).join('') || '<span class="chip">not planned yet</span>';
+  }
+
+  // Activity: append only NEW lines; keep the log pinned to the bottom only if
+  // the user was already there (so scrolling up to read isn't yanked away).
+  const evs = t.events || [];
+  const ul = $('#pEvents');
+  if (evs.length < ui.events) { ul.innerHTML = ''; ui.events = 0; }
+  if (evs.length > ui.events) {
+    const noAct = $('#noAct'); if (noAct) noAct.remove();
+    const atBottom = ul.scrollHeight - ul.scrollTop - ul.clientHeight < 40;
+    ul.insertAdjacentHTML('beforeend', evs.slice(ui.events).map((e) =>
+      `<li class="${esc(e.kind)}"><span class="t">${timeOf(e.at)}</span><span class="m">${esc(e.msg)}</span></li>`).join(''));
+    ui.events = evs.length;
+    if (atBottom) ul.scrollTop = ul.scrollHeight;
+  }
+
+  const errs = t.errors || [];
+  if (errs.length !== ui.errors) {
+    ui.errors = errs.length;
+    $('#errCard').style.display = errs.length ? '' : 'none';
+    setText('#errTitle', `Errors (${errs.length})`);
+    $('#errList').innerHTML = errs.map((e) =>
+      `<li class="err"><span class="t">${timeOf(e.at)}</span><span class="m">${esc(e.phase)}: ${esc(e.message)}</span></li>`).join('');
+  }
+
+  // Data table: reload only when the records plausibly changed (count moved, or
+  // record contents were corrected in place by ai_verify).
+  const dataSig = `${(t.collected || []).length}:${(t.extracted || []).length}:${JSON.stringify(t.collected || []).length}`;
+  if (ui.dataSig !== dataSig) {
+    ui.dataSig = dataSig;
+    if (t.schemas && t.schemas.length) loadSchemaData(t); else renderGenericTable(t);
+  }
+}
+
+// The non-schema (legacy) collected table, rendered into its own container so
+// refreshing it never touches the filter input or the rest of the page.
+function renderGenericTable(t) {
+  const el = $('#genericData');
+  if (!el) return;
+  const rows = collectedRows(t);
+  const hasDetails = rows.some((r) => r.phone || r.email || r.website);
+  setText('#genCount', `${rows.length} shown`);
+  el.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Name</th><th>URL</th>${hasDetails ? '<th>Phone</th><th>Email</th><th>Website</th>' : ''}<th></th>
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => `<tr>
+          <td>${esc(r.name || '')}</td>
+          <td><a href="${esc(r.url)}" target="_blank">${esc((r.url || '').replace(/^https?:\/\/(www\.)?/, ''))}</a></td>
+          ${hasDetails ? `<td>${esc(r.phone || '')}</td><td>${esc(r.email || '')}</td><td>${r.website ? `<a href="${esc(r.website)}" target="_blank">link</a>` : ''}</td>` : ''}
+          <td>${r._extracted ? '<span class="tag ex">extracted</span>' : '<span class="tag">link</span>'}</td>
+        </tr>`).join('') || `<tr><td colspan="6" class="mut">No collected items${dataFilter ? ' match the filter' : ' yet'}.</td></tr>`}
+      </tbody>
+    </table>`;
 }
 
 // --- debug view ------------------------------------------------------------
@@ -329,7 +391,7 @@ async function loadSchemaData(t) {
 async function deleteTask(id) {
   if (!confirm('Delete this task and its saved state? (Collected pages in the CRM are not removed.)')) return;
   await api(`/tasks/${id}`, { method: 'DELETE' });
-  if (selectedId === id) { selectedId = null; $('#preview').innerHTML = '<div class="empty">Select a task to preview.</div>'; }
+  if (selectedId === id) { selectedId = null; ui = null; $('#preview').innerHTML = '<div class="empty">Select a task to preview.</div>'; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   loadTasks();
 }

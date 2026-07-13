@@ -621,6 +621,7 @@ app.post('/tasks', async (req, res) => {
     extracted: [],               // task-scoped urls whose details were extracted
     scrolls: 0,                  // task-scoped scroll steps performed (scroll tool)
     scanY: 0,                    // saved feed scroll offset of the post scan (resume point)
+    actions: 0,                  // task-scoped click/hover/type/generate actions performed
     repeats: 0,
     maxRepeats: 3,
     messages: [],                // LLM planning transcript (audit/resume)
@@ -635,7 +636,7 @@ app.post('/tasks', async (req, res) => {
 });
 
 // Whitelisted field updates (the extension persists progress through here).
-const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'repeats', 'plan', 'finishedAt', 'messages']);
+const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'repeats', 'plan', 'finishedAt', 'messages']);
 app.patch('/tasks/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (PATCHABLE.has(k)) set[k] = v;
@@ -996,18 +997,21 @@ app.post('/ai/verify-record', async (req, res) => {
 
 // AI text generation — write content from a prompt (post, message, comment…).
 app.post('/ai/generate', async (req, res) => {
-  const { model, prompt, words } = req.body || {};
+  const { model, prompt, words, context } = req.body || {};
   if (!model || !prompt) return res.json({ ok: false, error: 'model and prompt required' });
+  const ctx = String(context || '').slice(0, 4000);
   const sys = [
     'You are a skilled writing assistant.',
     'Write exactly what the user asks for and OUTPUT ONLY that text.',
     'No preamble, no sign-off, no surrounding quotation marks, no markdown headings, no explanations.',
+    ctx ? 'SOURCE MATERIAL is provided. Write an ORIGINAL text based on it — rephrase/regenerate it in your own words as the task asks. This is the user\'s own material to rework; do not refuse and do not copy it verbatim.' : '',
     words ? `Keep it to roughly ${words} words.` : 'Keep it concise and natural.',
-  ].join('\n');
+  ].filter(Boolean).join('\n');
+  const user = ctx ? `SOURCE MATERIAL:\n"""\n${ctx}\n"""\n\nTASK: ${prompt}` : prompt;
   try {
     const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, stream: false, options: { temperature: 0.7 }, messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt }] }),
+      body: JSON.stringify({ model, stream: false, options: { temperature: 0.7 }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }),
     })).json();
     let text = (j.message?.content || '').trim().replace(/^["'\s]+|["'\s]+$/g, '');
     res.json({ ok: !!text, text, error: text ? undefined : 'empty generation' });
