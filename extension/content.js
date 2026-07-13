@@ -95,13 +95,31 @@ async function scrollAndCollectLinks({ target = 10, delay = 1200, maxScrolls = 3
   return Array.from(found, ([url, label]) => ({ url, label })).slice(0, target);
 }
 
-// Plain scroll: step down the page `times` times WITHOUT collecting anything.
-// Scrolls the feed container if it scrolls, else the window. Returns count done.
-async function scrollPage(times = 10, delay = 1200) {
+// The largest horizontally-scrollable container currently in view — a carousel,
+// stories/reels row, or product strip. Used by horizontal scrolling.
+function findHScrollable() {
+  let best = null, bestW = 0;
+  for (const el of document.querySelectorAll('div, ul, section')) {
+    if (el.scrollWidth > el.clientWidth + 20 && el.clientWidth > 200 && el.clientHeight > 60) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > 0 && r.top < window.innerHeight && el.clientWidth > bestW) { best = el; bestW = el.clientWidth; }
+    }
+  }
+  return best;
+}
+
+// Plain scroll: step the page `times` times WITHOUT collecting anything.
+// Vertical (default) steps the feed container if it scrolls, else the window.
+// Horizontal steps the largest carousel/row in view, else the window sideways.
+async function scrollPage(times = 10, delay = 1200, direction = 'vertical') {
   const scope = getMainScope();
   let done = 0;
   for (let i = 0; i < times; i++) {
-    if (scope && scope.scrollHeight > scope.clientHeight + 4) {
+    if (direction === 'horizontal') {
+      const el = findHScrollable();
+      if (el) el.scrollLeft += Math.round(el.clientWidth * 0.8);
+      else window.scrollBy(Math.round(window.innerWidth * 0.8), 0);
+    } else if (scope && scope.scrollHeight > scope.clientHeight + 4) {
       scope.scrollTop += Math.round(scope.clientHeight * 0.8);
     } else {
       window.scrollBy(0, Math.round(window.innerHeight * 0.8));
@@ -857,8 +875,22 @@ async function collectBySkill(skill, target = 20, delay = 1200, maxScrolls = 200
 // "See more", and returns its full text. Scan state lives on the elements
 // (__baScanned), so repeated calls step through the feed post by post.
 
-// Top-level feed posts only — comments render as nested [role="article"].
-function articleNodes() {
+// Real feed posts. In Facebook's CURRENT feed DOM, posts do NOT carry
+// role="article" (only comments do), so matching articles scans comments and
+// misses the posts entirely. Feed units — regular posts AND sponsored ones —
+// are marked aria-posinset inside the role="feed" container. Layered fallbacks
+// keep older layouts and other sites working.
+function feedPostNodes() {
+  // 1) Feed units (posts + ads) in the current Facebook layout.
+  let nodes = [...document.querySelectorAll('div[aria-posinset]')];
+  if (nodes.length) return nodes;
+  // 2) Direct children of the feed container.
+  const feed = document.querySelector('div[role="feed"]');
+  if (feed) {
+    nodes = [...feed.children].filter((el) => (el.textContent || '').trim());
+    if (nodes.length) return nodes;
+  }
+  // 3) Old layout / other sites: top-level articles (excludes nested comments).
   return [...document.querySelectorAll('[role="article"]')]
     .filter((el) => !(el.parentElement && el.parentElement.closest('[role="article"]')));
 }
@@ -872,10 +904,39 @@ function postPermalink(article) {
   try { return cleanUrl(new URL(a.getAttribute('href'), location.origin).toString()); } catch { return ''; }
 }
 
-async function scanNextPost({ settle = 700, maxLoadScrolls = 4 } = {}) {
+// Current scroll offset of whatever actually scrolls (feed container or window).
+function scanScrollY() {
+  const scope = getMainScope();
+  return Math.round((scope && scope.scrollHeight > scope.clientHeight + 4) ? scope.scrollTop : window.scrollY);
+}
+
+// Reset or restore scan state. y=0 (a NEW task): forget every mark from earlier
+// tasks in this tab and scroll to the very top, so scanning starts at post 1.
+// y>0 (a resumed task): scroll back to the saved offset and mark only the posts
+// fully above it as scanned, so scanning continues where the task left off.
+async function resetScan({ y = 0 } = {}) {
+  for (const el of document.getElementsByTagName('*')) {
+    if (el.__baScanned) delete el.__baScanned;
+    if (el.__baCollected) delete el.__baCollected;
+    if (el.__baTextGrabbed) delete el.__baTextGrabbed;
+  }
+  const scope = getMainScope();
+  if (scope && scope.scrollHeight > scope.clientHeight + 4) scope.scrollTop = y;
+  else window.scrollTo(0, y);
+  await sleep(800); // let the feed settle/re-render at this offset
+  if (y > 0) {
+    for (const a of feedPostNodes()) {
+      const r = a.getBoundingClientRect();
+      if (r.bottom < 0) a.__baScanned = true; // fully above the restored viewport
+    }
+  }
+  return { ok: true, y: scanScrollY() };
+}
+
+async function scanNextPost({ settle = 700, maxLoadScrolls = 6 } = {}) {
   const scope = getMainScope();
   for (let attempt = 0; attempt <= maxLoadScrolls; attempt++) {
-    for (const article of articleNodes()) {
+    for (const article of feedPostNodes()) {
       if (article.__baScanned) continue;
       try { article.scrollIntoView({ block: 'center' }); } catch {}
       await sleep(settle); // let the post hydrate in view
@@ -889,14 +950,15 @@ async function scanNextPost({ settle = 700, maxLoadScrolls = 4 } = {}) {
       const text = fullText(article).slice(0, 6000);
       article.__baScanned = true;
       if (!text) continue; // placeholder that never hydrated — move to the next
-      return { ok: true, post: { text, url: postPermalink(article) || location.href } };
+      return { ok: true, post: { text, url: postPermalink(article) || location.href }, y: scanScrollY() };
     }
-    // Every post in the DOM is scanned — nudge one small step to load more.
+    // Every post in the DOM is scanned — nudge one small step to load more
+    // (feed batches can take a moment to arrive, hence the generous wait).
     if (scope && scope.scrollHeight > scope.clientHeight + 4) scope.scrollTop += Math.round(scope.clientHeight * 0.6);
     else window.scrollBy(0, Math.round(window.innerHeight * 0.6));
-    await sleep(1000);
+    await sleep(1300);
   }
-  return { ok: true, noMore: true };
+  return { ok: true, noMore: true, y: scanScrollY() };
 }
 
 // Scroll and collect the FULL inner text of every element matching a CSS
@@ -1002,7 +1064,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const links = await scrollAndCollectLinks(msg.options || {});
         sendResponse({ ok: true, links });
       } else if (msg?.type === 'SCROLL_PAGE') {
-        const scrolled = await scrollPage(msg.times || 10, msg.delay || 1200);
+        const scrolled = await scrollPage(msg.times || 10, msg.delay || 1200, msg.direction || 'vertical');
         sendResponse({ ok: true, scrolled });
       } else if (msg?.type === 'USE_SKILL') {
         sendResponse(await useSkill(msg.skill));
@@ -1014,6 +1076,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, records });
       } else if (msg?.type === 'SCAN_NEXT_POST') {
         sendResponse(await scanNextPost(msg || {}));
+      } else if (msg?.type === 'RESET_SCAN') {
+        sendResponse(await resetScan({ y: Number(msg.y) || 0 }));
       } else if (msg?.type === 'CLICK_ELEMENT') {
         sendResponse(await clickElement(msg.selector, msg.text));
       } else if (msg?.type === 'HOVER_ELEMENT') {

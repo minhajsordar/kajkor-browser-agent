@@ -378,7 +378,7 @@ async function runTool(base, taskId, phase) {
 
   if (phase.tool === 'scroll') {
     const tabId = await currentTab(taskId);
-    const res = await msgTab(tabId, { type: 'SCROLL_PAGE', times: p.times || 10, delay: p.delay || 1200 });
+    const res = await msgTab(tabId, { type: 'SCROLL_PAGE', times: p.times || 10, delay: p.delay || 1200, direction: p.direction || 'vertical' });
     const did = (res && res.ok) ? res.scrolled : 0;
     const t = await getTask(base, taskId);
     await patchTask(base, taskId, { scrolls: (t?.scrolls || 0) + did });
@@ -455,6 +455,13 @@ async function runTool(base, taskId, phase) {
     const tab = await chrome.tabs.get(tabId);
     const skill = await findSkill(base, hostOfTab(tab), p.skill);
     if (!skill || skill.kind !== 'collection') throw new Error(`No collection skill "${p.skill}" for ${hostOfTab(tab)}`);
+    // First pass of the task: start from the top of the feed, dropping any
+    // scroll position / collected-marks a previous task left in this tab.
+    const t0 = await getTask(base, taskId);
+    if (!(t0?.collected || []).length && !Number(t0?.repeats)) {
+      await msgTab(tabId, { type: 'RESET_SCAN', y: 0 });
+      await taskEvent(base, taskId, 'obs', 'Scrolled to the top of the feed — collecting from the first post.');
+    }
     const res = await msgTab(tabId, { type: 'COLLECT_BY_SKILL', skill, target: p.target || 20, delay: p.delay || 1200, fields: p.fields || null });
     const records = (res && res.ok && Array.isArray(res.records)) ? res.records : [];
     // Keep saved data clean; keep the item HTML separately for debugging.
@@ -470,6 +477,11 @@ async function runTool(base, taskId, phase) {
 
   if (phase.tool === 'collect_text') {
     const tabId = await currentTab(taskId);
+    const t0 = await getTask(base, taskId);
+    if (!(t0?.collected || []).length && !Number(t0?.repeats)) {
+      await msgTab(tabId, { type: 'RESET_SCAN', y: 0 });
+      await taskEvent(base, taskId, 'obs', 'Scrolled to the top of the feed — collecting from the first post.');
+    }
     const res = await msgTab(tabId, {
       type: 'COLLECT_TEXT', selector: p.selector || '[role="article"]', target: p.target || 20, delay: p.delay || 1200,
     });
@@ -492,11 +504,21 @@ async function runTool(base, taskId, phase) {
     const maxPosts = Number(p.maxPosts) || 40;   // per pass; the repeat loop can extend
     let found = (t0?.collected || []).length;    // resume-safe: matches already saved
     let checked = 0;
+    // A NEW task starts scanning from the TOP of the feed (the tab may be left
+    // scrolled by a previous task); a resumed/repeated task restores its saved
+    // scroll offset and continues from there. Both clear stale marks left in
+    // the tab by earlier tasks.
+    const startY = Number(t0?.scanY) || 0;
+    await msgTab(tabId, { type: 'RESET_SCAN', y: startY });
+    await taskEvent(base, taskId, 'obs', startY
+      ? `Resuming scan from saved scroll position (${startY}px).`
+      : 'Scrolled to the top of the feed — scanning from the first post.');
     await taskEvent(base, taskId, 'act', `Scanning posts one by one for: "${query}"…`);
     while (found < target && checked < maxPosts) {
       if (!AGENT[taskId]?.running) break;
       const r = await msgTab(tabId, { type: 'SCAN_NEXT_POST' });
       if (!r || !r.ok) throw new Error((r && r.error) || 'post scan failed');
+      if (r.y != null) await patchTask(base, taskId, { scanY: r.y }); // persist progress
       if (r.noMore) { await taskEvent(base, taskId, 'obs', 'No more posts to scan on this page.'); break; }
       checked++;
       const post = r.post || {};

@@ -182,8 +182,8 @@ const tasksColl = () => collFor('tasks');
 const TOOL_CATALOG = [
   { name: 'navigate', params: ['url', 'newTab'],
     desc: 'Open a web page by full URL. Set newTab=true to force a NEW tab; otherwise an already-open tab on the same site is reused.' },
-  { name: 'scroll', params: ['times', 'delay'],
-    desc: 'Scroll the current page down `times` steps WITHOUT collecting anything. Use when the user only wants to scroll.' },
+  { name: 'scroll', params: ['times', 'delay', 'direction'],
+    desc: 'Scroll the current page `times` steps WITHOUT collecting anything. Use when the user only wants to scroll. `direction` is "vertical" (default, down the feed) or "horizontal" (sideways through a carousel/stories/reels row) — set horizontal ONLY when the user asks to scroll sideways.' },
   { name: 'click', params: ['selector', 'text'],
     desc: 'Click the element matching a CSS `selector` on the current page (or the first element whose visible text contains `text`). Use for buttons, links, tabs, "See more", etc.' },
   { name: 'hover', params: ['selector', 'text'],
@@ -609,6 +609,7 @@ app.post('/tasks', async (req, res) => {
     collected: [],               // task-scoped {url,name} collected this task
     extracted: [],               // task-scoped urls whose details were extracted
     scrolls: 0,                  // task-scoped scroll steps performed (scroll tool)
+    scanY: 0,                    // saved feed scroll offset of the post scan (resume point)
     repeats: 0,
     maxRepeats: 3,
     messages: [],                // LLM planning transcript (audit/resume)
@@ -623,7 +624,7 @@ app.post('/tasks', async (req, res) => {
 });
 
 // Whitelisted field updates (the extension persists progress through here).
-const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'repeats', 'plan', 'finishedAt', 'messages']);
+const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'repeats', 'plan', 'finishedAt', 'messages']);
 app.patch('/tasks/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (PATCHABLE.has(k)) set[k] = v;
@@ -751,6 +752,15 @@ app.post('/tasks/:id/plan', async (req, res) => {
   if (nav) {
     if (/\bnew tab\b/i.test(task.goal)) nav.params.newTab = true;
     else if (/\b(current|this|existing|same)\s+tab\b/i.test(task.goal)) delete nav.params.newTab;
+  }
+
+  // Scroll direction, decided from the goal (models often miss it). Vertical is
+  // the default; horizontal only when the user says sideways/horizontally.
+  const wantsHorizontal = /\b(horizontal(ly)?|sideways|side\s*ways|left\s+to\s+right|right\s+to\s+left|carousel|stories\s+row)\b/i.test(task.goal);
+  for (const ph of plan.phases) {
+    if (ph.tool !== 'scroll') continue;
+    if (wantsHorizontal) ph.params.direction = 'horizontal';
+    else if (ph.params.direction !== 'horizontal') ph.params.direction = 'vertical';
   }
 
   messages.push({ role: 'assistant', content: raw });
