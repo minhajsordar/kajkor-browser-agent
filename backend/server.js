@@ -37,6 +37,8 @@ async function connectDb() {
   }
   await collFor('tasks').createIndex({ taskId: 1 }, { unique: true });
   await collFor('tasks').createIndex({ createdAt: -1 });
+  await collFor('elements').createIndex({ elementId: 1 }, { unique: true });
+  await collFor('elements').createIndex({ host: 1 });
   await collFor('schemas').createIndex({ schemaId: 1 }, { unique: true });
   await collFor('schemas').createIndex({ slug: 1 }, { unique: true });
   await collFor('skills').createIndex({ skillId: 1 }, { unique: true });
@@ -198,6 +200,8 @@ const TOOL_CATALOG = [
     desc: 'Open each collected page and extract full details (name, phone, email, website, address, followers), saving them to the database.' },
   { name: 'use_skill', params: ['skill'],
     desc: 'Perform a learned single-element skill (click/scroll/read…) by its name on the current page.' },
+  { name: 'run_skill', params: ['skill', 'text'],
+    desc: 'Run a learned multi-step WORKFLOW skill: performs each of its action/input steps IN ORDER (click → type → click…) on the current page. For "type" steps it types `text`, or the text produced by an earlier generate_text phase. Use when a listed skill is described as a workflow of several steps.' },
   { name: 'collect_by_skill', params: ['skill', 'target'],
     desc: 'Use a learned "collection" skill to scroll and extract its taught fields from each repeating item (e.g. each post), saving up to `target` records.' },
   { name: 'collect_text', params: ['selector', 'target'],
@@ -294,8 +298,10 @@ function planningSystemPrompt(schemas, skills) {
   if (skills && skills.length) {
     base.push('', 'Learned skills you can use (reference by exact name):');
     for (const s of skills) {
-      if (s.kind === 'collection') base.push(`- collect_by_skill skill="${s.name}" → fields: ${(s.fields || []).map((f) => f.name).join(', ')}  [${s.urlPattern}]`);
-      else base.push(`- use_skill skill="${s.name}" (${s.action})  [${s.urlPattern}]`);
+      const about = s.details ? ` — ${s.details}` : '';
+      if (s.kind === 'collection') base.push(`- collect_by_skill skill="${s.name}"${about} → fields: ${(s.fields || []).map((f) => f.name).join(', ')}  [${s.urlPattern}]`);
+      else if (Array.isArray(s.steps) && s.steps.length > 1) base.push(`- run_skill skill="${s.name}"${about} → workflow: ${s.steps.map((x) => `${x.name}(${x.action})`).join(' → ')}  [${s.urlPattern}]`);
+      else base.push(`- use_skill skill="${s.name}" (${s.action})${about}  [${s.urlPattern}]`);
     }
     base.push('Prefer collect_by_skill (metric "items") when a matching collection skill exists for the data requested.');
   }
@@ -344,7 +350,7 @@ function normalizePlan(plan) {
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
     else {
       // Pure action task (click/hover/scroll only): target = number of such phases.
-      const acts = clean.filter((p) => ['click', 'hover', 'scroll', 'type', 'generate_text'].includes(p.tool)).length;
+      const acts = clean.filter((p) => ['click', 'hover', 'scroll', 'type', 'generate_text', 'use_skill', 'run_skill'].includes(p.tool)).length;
       if (acts) target = { metric: 'actions', count: acts };
       else return null;
     }
@@ -408,7 +414,7 @@ function repairPlan(plan) {
   }
 
   // Enforce order: one navigate first, then scroll/collect/act, then extract, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
+  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
   const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
   const rest = phases.filter((p) => p.tool !== 'navigate')
     .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
@@ -605,7 +611,7 @@ app.post('/tasks', async (req, res) => {
   let taskUseSkills = [];
   const skIds = Array.isArray(useSkills) ? useSkills : [];
   if (skIds.length) {
-    const docs = await collFor('skills').find({ skillId: { $in: skIds } }, { projection: { _id: 0 } }).toArray();
+    const docs = await resolveSkills(await collFor('skills').find({ skillId: { $in: skIds } }, { projection: { _id: 0 } }).toArray());
     taskUseSkills = docs.map((s) => ({ skillId: s.skillId, name: s.name, kind: s.kind, action: s.action, fields: s.fields, urlPattern: s.urlPattern }));
   }
 
@@ -705,7 +711,9 @@ app.post('/tasks/:id/plan', async (req, res) => {
     if (resolved.why) modelEvents.push({ at: nowIso(), kind: 'think', msg: resolved.why + '.' });
   }
 
-  const skills = await skillsColl().find({}, { projection: { _id: 0 } }).toArray();
+  // Hydrate v2 skills (element refs) into runtime shape so planning, routing
+  // and field-subset logic see real field lists.
+  const skills = await resolveSkills(await skillsColl().find({}, { projection: { _id: 0 } }).toArray());
   const messages = [
     { role: 'system', content: planningSystemPrompt(task.schemas, skills) },
     { role: 'user', content: task.goal },
@@ -1134,6 +1142,241 @@ app.post('/schemas/:id/records', async (req, res) => {
   res.json({ ok: true, added, updated, total });
 });
 
+// ========================= Introduced Elements ==============================
+// Phase 1 of the two-step skill redesign (docs/skill-redesign-plan.md).
+// An ELEMENT is a named, route-bound pointer to one thing on a page. Skills
+// (v2) reference elements by id, so repointing one element heals every skill
+// that uses it. Selectors are stored RELATIVE to the parent element when
+// parentId is set; the resolver composes absolute chains for the legacy
+// runtime.
+
+// --- route patterns ---
+// Accepted forms (host prefix optional and stripped): 'facebook.com',
+// 'facebook.com/*', '/', '/*', '/post/[postId]'. A bare host or '/*' means ANY
+// path on the host; an explicit '/' means the root page only. '[slug]' matches
+// exactly one path segment; '*' matches anything (including '/').
+
+function normalizeRoute(pattern, host) {
+  let p = String(pattern || '').trim().replace(/^https?:\/\//, '');
+  const h = String(host || '').replace(/^www\./, '').toLowerCase();
+  if (h) {
+    const low = p.toLowerCase();
+    for (const pre of [h, 'www.' + h]) {
+      if (low === pre || low === pre + '/*') return '/*';
+      if (low.startsWith(pre + '/')) { p = p.slice(pre.length); break; }
+    }
+  }
+  if (!p) return '/*';
+  if (!p.startsWith('/')) p = '/' + p;
+  return p;
+}
+
+function routeToRegex(route) {
+  const src = String(route || '/*')
+    .replace(/[.+?^${}()|\\]/g, '\\$&')   // escape regex chars (not * or [])
+    .replace(/\[[^\]/]+\]/g, '[^/]+')     // [slug] -> one path segment
+    .replace(/\*/g, '.*');                // * -> anything
+  return new RegExp('^' + src + '/?$', 'i');
+}
+
+function routeMatches(route, path) {
+  const p = (String(path || '/').split('?')[0].replace(/\/+$/, '')) || '/';
+  try { return routeToRegex(route).test(p); } catch { return false; }
+}
+
+// Generalize a concrete path into a pattern: dynamic-looking segments (long
+// numbers, hashes, fb post ids) become editable [slug] params.
+function generalizeRoute(path) {
+  const segs = String(path || '/').split('?')[0].split('/').filter(Boolean);
+  const out = segs.map((s) => {
+    if (/^pfbid/i.test(s)) return '[postId]';
+    if (/^\d{4,}$/.test(s)) return '[id]';
+    if (/^[0-9a-f]{10,}$/i.test(s) || /^[A-Za-z0-9_=-]{18,}$/.test(s)) return '[id]';
+    return s;
+  });
+  return '/' + out.join('/');
+}
+
+// --- elements CRUD ---
+
+const elementsColl = () => collFor('elements');
+const ELEMENT_TYPES = new Set(['container', 'item', 'field', 'action', 'input']);
+const ELEMENT_PATCHABLE = new Set(['name', 'details', 'route', 'type', 'action', 'attr', 'parentId', 'selectors']);
+
+// Unique snake_case name per host (suffixes _2, _3… on collision).
+async function uniqueElementName(host, wanted, ignoreId) {
+  const base = snakeName(wanted);
+  const taken = new Set((await elementsColl().find({ host }, { projection: { name: 1, elementId: 1 } }).toArray())
+    .filter((e) => e.elementId !== ignoreId).map((e) => e.name));
+  let name = base, i = 2;
+  while (taken.has(name)) name = `${base}_${i++}`;
+  return name;
+}
+
+app.get('/elements', async (req, res) => {
+  const q = {};
+  if (req.query.host) q.host = String(req.query.host).replace(/^www\./, '');
+  let elements = await elementsColl().find(q, { projection: { _id: 0, sampleHtml: 0 } }).sort({ createdAt: -1 }).toArray();
+  if (req.query.path) elements = elements.filter((e) => routeMatches(e.route, req.query.path));
+  res.json({ ok: true, elements });
+});
+
+app.get('/elements/:id', async (req, res) => {
+  const element = await elementsColl().findOne({ elementId: req.params.id }, { projection: { _id: 0 } });
+  if (!element) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, element });
+});
+
+app.post('/elements', async (req, res) => {
+  const b = req.body || {};
+  if (!b.host || !b.name || !b.type) return res.status(400).json({ ok: false, error: 'host, name and type required' });
+  if (!ELEMENT_TYPES.has(b.type)) return res.status(400).json({ ok: false, error: 'type must be one of ' + [...ELEMENT_TYPES].join('|') });
+  const host = String(b.host).replace(/^www\./, '');
+  if (b.parentId && !(await elementsColl().findOne({ elementId: b.parentId }))) {
+    return res.status(400).json({ ok: false, error: 'parentId does not exist' });
+  }
+  const element = {
+    elementId: crypto.randomUUID(),
+    host,
+    route: normalizeRoute(b.route, host),
+    name: await uniqueElementName(host, b.name),
+    details: String(b.details || ''),
+    type: b.type,
+    action: b.action || null,
+    attr: b.attr || null,
+    parentId: b.parentId || null,
+    selectors: Array.isArray(b.selectors) ? b.selectors : [],
+    sample: b.sample || null,
+    sampleHtml: b.sampleHtml ? String(b.sampleHtml).slice(0, 60000) : null,
+    version: 1,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+  await elementsColl().insertOne({ ...element });
+  delete element._id;
+  res.json({ ok: true, element });
+});
+
+app.patch('/elements/:id', async (req, res) => {
+  const el = await elementsColl().findOne({ elementId: req.params.id });
+  if (!el) return res.status(404).json({ ok: false, error: 'not found' });
+  const set = {};
+  for (const [k, v] of Object.entries(req.body || {})) if (ELEMENT_PATCHABLE.has(k)) set[k] = v;
+  if (set.route != null) set.route = normalizeRoute(set.route, el.host);
+  if (set.name != null) set.name = await uniqueElementName(el.host, set.name, el.elementId);
+  if (set.parentId === el.elementId) return res.status(400).json({ ok: false, error: 'element cannot be its own parent' });
+  set.updatedAt = nowIso();
+  const doc = await elementsColl().findOneAndUpdate(
+    { elementId: req.params.id }, { $set: set }, { returnDocument: 'after', projection: { _id: 0 } });
+  res.json({ ok: true, element: doc?.value || doc });
+});
+
+// Repoint (re-introduce): NEW selectors go in on top; the previous ones are
+// kept as demoted fallbacks (the runtime tries candidates in score order, so
+// old selectors give free resilience). Identity, name and skill references
+// are untouched — this is the whole point of elements.
+app.post('/elements/:id/repoint', async (req, res) => {
+  const el = await elementsColl().findOne({ elementId: req.params.id });
+  if (!el) return res.status(404).json({ ok: false, error: 'not found' });
+  const fresh = Array.isArray(req.body?.selectors) ? req.body.selectors : [];
+  if (!fresh.length) return res.status(400).json({ ok: false, error: 'selectors required' });
+  const demoted = (el.selectors || []).map((s) => ({ ...s, score: Math.max(1, (s.score || 50) - 20) }));
+  const seen = new Set();
+  const merged = [...fresh, ...demoted].filter((s) => {
+    const k = s.strategy + '|' + (s.value || s.text || '');
+    if (seen.has(k)) return false; seen.add(k); return true;
+  }).slice(0, 6); // cap history
+  const set = { selectors: merged, version: (el.version || 1) + 1, updatedAt: nowIso() };
+  if (req.body.sample) set.sample = req.body.sample;
+  if (req.body.sampleHtml) set.sampleHtml = String(req.body.sampleHtml).slice(0, 60000);
+  const doc = await elementsColl().findOneAndUpdate(
+    { elementId: req.params.id }, { $set: set }, { returnDocument: 'after', projection: { _id: 0 } });
+  res.json({ ok: true, element: doc?.value || doc });
+});
+
+app.delete('/elements/:id', async (req, res) => {
+  const refs = await skillsColl().find(
+    { 'elements.elementId': req.params.id }, { projection: { _id: 0, skillId: 1, name: 1 } }).toArray();
+  if (refs.length && !req.query.force) {
+    return res.status(409).json({ ok: false, error: 'element is used by skills', skills: refs });
+  }
+  if (refs.length) {
+    await skillsColl().updateMany(
+      { 'elements.elementId': req.params.id },
+      { $pull: { elements: { elementId: req.params.id } }, $set: { updatedAt: nowIso() } });
+  }
+  await elementsColl().deleteOne({ elementId: req.params.id });
+  res.json({ ok: true, removedFromSkills: refs.length });
+});
+
+// --- v2 skill resolver ---
+// Hydrate a v2 skill (element references) into the legacy runtime shape the
+// extension already executes ({ kind, action, selectors, item, fields }), so
+// use_skill / collect_by_skill / content.js need no changes.
+
+const topCss = (el) => {
+  const c = (el.selectors || []).find((s) => s.strategy === 'css' && s.value);
+  return c ? c.value : '';
+};
+
+// Absolute selector candidates for an element: prefix each css candidate with
+// the ancestor chain's top css selectors.
+function absSelectors(el, byId) {
+  let prefix = '';
+  let p = el.parentId ? byId.get(el.parentId) : null;
+  for (let hops = 0; p && hops < 5; hops++) {
+    const ps = topCss(p);
+    if (ps) prefix = prefix ? ps + ' ' + prefix : ps;
+    p = p.parentId ? byId.get(p.parentId) : null;
+  }
+  if (!prefix) return el.selectors || [];
+  return (el.selectors || []).map((s) => (s.strategy === 'css' && s.value) ? { ...s, value: prefix + ' ' + s.value } : s);
+}
+
+function resolveSkillDoc(skill, byId) {
+  const refs = Array.isArray(skill.elements) ? skill.elements : null;
+  if (!refs || !refs.length) return skill; // legacy skill — already runtime-shaped
+  const els = refs
+    .slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    .map((r) => byId.get(typeof r === 'string' ? r : r.elementId))
+    .filter(Boolean);
+  const out = { ...skill, resolved: true };
+  const item = els.find((e) => e.type === 'item');
+  if (item) {
+    out.kind = 'collection';
+    out.item = { selectors: absSelectors(item, byId) };
+    out.fields = els
+      .filter((e) => e !== item && e.type !== 'container' && e.type !== 'item')
+      .map((e) => ({
+        name: e.name,
+        attr: e.attr || (e.action === 'click' ? 'click' : 'text'),
+        // field selectors resolve INSIDE each item node, so keep them relative
+        selectors: e.selectors || [],
+      }));
+  } else {
+    const acts = els.filter((e) => e.type === 'action' || e.type === 'input');
+    if (acts.length) {
+      out.kind = 'action';
+      out.action = acts[0].action || 'click';
+      out.selectors = absSelectors(acts[0], byId);
+      if (acts.length > 1) {
+        // Ordered bundle for the future run_skill sequence runner.
+        out.steps = acts.map((e) => ({ name: e.name, action: e.action || 'click', attr: e.attr || null, selectors: absSelectors(e, byId) }));
+      }
+    }
+  }
+  return out;
+}
+
+// Hydrate a list of skills, loading each host's elements once.
+async function resolveSkills(skills) {
+  if (!skills.some((s) => Array.isArray(s.elements) && s.elements.length)) return skills;
+  const hosts = [...new Set(skills.map((s) => s.host))];
+  const all = await elementsColl().find({ host: { $in: hosts } }, { projection: { _id: 0, sampleHtml: 0 } }).toArray();
+  const byId = new Map(all.map((e) => [e.elementId, e]));
+  return skills.map((s) => resolveSkillDoc(s, byId));
+}
+
 // ============================= Page Skills ==================================
 // Learned page features taught in a learning session. Scoped per URL pattern.
 // A skill is either an "action" (one element + a verb) or a "collection"
@@ -1145,25 +1388,42 @@ const skillsColl = () => collFor('skills');
 app.get('/skills', async (req, res) => {
   const q = {};
   if (req.query.host) q.host = req.query.host;
-  const skills = await skillsColl().find(q, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray();
+  let skills = await skillsColl().find(q, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray();
+  if (req.query.resolve) skills = await resolveSkills(skills); // v2 → legacy runtime shape
   res.json({ ok: true, skills });
 });
 
 app.get('/skills/:id', async (req, res) => {
-  const skill = await skillsColl().findOne({ skillId: req.params.id }, { projection: { _id: 0 } });
+  let skill = await skillsColl().findOne({ skillId: req.params.id }, { projection: { _id: 0 } });
   if (!skill) return res.status(404).json({ ok: false, error: 'not found' });
+  if (req.query.resolve) [skill] = await resolveSkills([skill]);
   res.json({ ok: true, skill });
 });
 
 app.post('/skills', async (req, res) => {
   const b = req.body || {};
-  if (!b.name || !b.kind || !b.host) return res.status(400).json({ ok: false, error: 'host, name and kind required' });
+  const isV2 = Array.isArray(b.elements) && b.elements.length;
+  if (!b.name || !b.host || (!b.kind && !isV2)) {
+    return res.status(400).json({ ok: false, error: isV2 ? 'host and name required' : 'host, name and kind required' });
+  }
+  // v2: validate the element references exist.
+  let elementRefs = null;
+  if (isV2) {
+    const ids = b.elements.map((r) => (typeof r === 'string' ? r : r.elementId)).filter(Boolean);
+    const found = await elementsColl().find({ elementId: { $in: ids } }, { projection: { elementId: 1 } }).toArray();
+    const have = new Set(found.map((e) => e.elementId));
+    const missing = ids.filter((id) => !have.has(id));
+    if (missing.length) return res.status(400).json({ ok: false, error: 'unknown elementId(s): ' + missing.join(', ') });
+    elementRefs = b.elements.map((r, i) => (typeof r === 'string' ? { elementId: r, order: i } : { elementId: r.elementId, order: r.order ?? i }));
+  }
   const skill = {
     skillId: crypto.randomUUID(),
     host: String(b.host),
     urlPattern: b.urlPattern || `${b.host}/*`,
     name: String(b.name).trim(),
-    kind: b.kind,                     // 'action' | 'collection'
+    details: String(b.details || ''),
+    kind: b.kind || null,             // legacy: 'action' | 'collection'; v2 derives at resolve
+    elements: elementRefs,            // v2: [{elementId, order}] — resolver hydrates these
     action: b.action || null,         // action kind: click | type | read | hover
     selectors: Array.isArray(b.selectors) ? b.selectors : [],
     item: b.item || null,             // collection kind: { selectors: [...] }
@@ -1174,10 +1434,11 @@ app.post('/skills', async (req, res) => {
     updatedAt: nowIso(),
   };
   await skillsColl().insertOne({ ...skill });
+  delete skill._id;
   res.json({ ok: true, skill });
 });
 
-const SKILL_PATCHABLE = new Set(['name', 'urlPattern', 'kind', 'action', 'selectors', 'item', 'fields']);
+const SKILL_PATCHABLE = new Set(['name', 'urlPattern', 'kind', 'action', 'selectors', 'item', 'fields', 'details', 'elements']);
 app.patch('/skills/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (SKILL_PATCHABLE.has(k)) set[k] = v;

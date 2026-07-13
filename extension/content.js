@@ -1125,6 +1125,64 @@ async function useSkill(skill) {
   return { ok: true, action: act };
 }
 
+// Run ONE step of a multi-action (v2) skill: resolve the step's element and
+// perform its action. "type" inserts the provided value (composer-safe via
+// insertIntoLexical for contenteditables).
+async function runStep(step, value) {
+  const el = resolveOne(document, step.selectors);
+  if (!el) return { ok: false, error: 'element not found for step ' + (step.name || '?') };
+  try { el.scrollIntoView({ block: 'center' }); } catch {}
+  await sleep(150);
+  const act = step.action || 'click';
+  try {
+    if (act === 'click') el.click();
+    else if (act === 'hover') { for (const t of ['pointerover', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); }
+    else if (act === 'scroll') { if (el.scrollHeight > el.clientHeight + 4) el.scrollTop += Math.round(el.clientHeight * 0.8); else el.scrollIntoView({ block: 'center' }); }
+    else if (act === 'read') return { ok: true, value: norm(el.textContent) };
+    else if (act === 'type') {
+      if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
+        const method = await insertIntoLexical(el, value || '');
+        if (!method) return { ok: false, error: 'could not insert text into the editor' };
+      } else {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        el.focus();
+        if (setter) setter.call(el, value || ''); else el.value = value || '';
+        el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+  } catch (e) { return { ok: false, error: e.message }; }
+  return { ok: true, action: act };
+}
+
+// --- Introduced-element resolution (health check) ----------------------------
+// Resolve introduced elements (parent chains, css candidates) and report how
+// many nodes each matches on THIS page — the skills page uses it as a live
+// health check ("repoint me" signal).
+function resolveElementCounts(elements) {
+  const byId = new Map((elements || []).map((e) => [e.elementId, e]));
+  const own = (elDoc, root) => {
+    for (const s of (elDoc.selectors || [])) {
+      if (s.strategy !== 'css' || !s.value) continue;
+      try { const ns = [...root.querySelectorAll(s.value)]; if (ns.length) return ns; } catch {}
+    }
+    return [];
+  };
+  const nodesOf = (elDoc, seen = new Set()) => {
+    if (!elDoc || seen.has(elDoc.elementId)) return [];
+    seen.add(elDoc.elementId);
+    const parent = elDoc.parentId ? byId.get(elDoc.parentId) : null;
+    if (!parent) return own(elDoc, document);
+    const out = [];
+    for (const p of nodesOf(parent, seen)) out.push(...own(elDoc, p));
+    return out;
+  };
+  const counts = {};
+  for (const e of (elements || [])) counts[e.elementId] = nodesOf(e).length;
+  return counts;
+}
+
 // --- Message handling ------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -1148,6 +1206,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(await scanNextPost(msg || {}));
       } else if (msg?.type === 'RESET_SCAN') {
         sendResponse(await resetScan({ y: Number(msg.y) || 0 }));
+      } else if (msg?.type === 'RESOLVE_ELEMENTS') {
+        sendResponse({ ok: true, counts: resolveElementCounts(msg.elements || []), url: location.href });
+      } else if (msg?.type === 'RUN_STEP') {
+        sendResponse(await runStep(msg.step || {}, msg.value || ''));
       } else if (msg?.type === 'CLICK_ELEMENT') {
         sendResponse(await clickElement(msg.selector, msg.text));
       } else if (msg?.type === 'HOVER_ELEMENT') {

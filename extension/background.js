@@ -304,9 +304,10 @@ async function saveToSchemas(base, taskId, schemas, objs) {
   }
 }
 
-// Look up a learned skill by name for a host (via the backend).
+// Look up a learned skill by name for a host (via the backend). resolve=1
+// hydrates v2 skills (element references) into the legacy runtime shape.
 async function findSkill(base, host, name) {
-  const j = await jf(`${base}/skills?host=${encodeURIComponent(host)}`);
+  const j = await jf(`${base}/skills?host=${encodeURIComponent(host)}&resolve=1`);
   return (j?.skills || []).find((s) => s.name === name) || null;
 }
 
@@ -496,6 +497,36 @@ async function runTool(base, taskId, phase) {
     const res = await msgTab(tabId, { type: 'USE_SKILL', skill });
     await taskEvent(base, taskId, 'obs', `Ran skill "${p.skill}" (${skill.action || 'click'}): ${res && res.ok ? 'ok' : (res && res.error) || 'failed'}`);
     if (res && res.value != null) await taskEvent(base, taskId, 'obs', `Read: ${String(res.value).slice(0, 100)}`);
+    return;
+  }
+
+  if (phase.tool === 'run_skill') {
+    const tabId = await currentTab(taskId);
+    const tab = await chrome.tabs.get(tabId);
+    const skill = await findSkill(base, hostOfTab(tab), p.skill);
+    if (!skill) throw new Error(`No skill "${p.skill}" for ${hostOfTab(tab)}`);
+    const t = await getTask(base, taskId);
+    // v2 multi-action skills resolve with an ordered `steps` list; a single
+    // action skill runs as one step.
+    const steps = (Array.isArray(skill.steps) && skill.steps.length)
+      ? skill.steps
+      : [{ name: skill.name, action: skill.action || 'click', selectors: skill.selectors || [] }];
+    let done = 0;
+    await taskEvent(base, taskId, 'act', `Running skill "${p.skill}" (${steps.length} step${steps.length > 1 ? 's' : ''})…`);
+    for (const step of steps) {
+      if (!AGENT[taskId]?.running) break;
+      // "type" steps get explicit text, else whatever generate_text produced.
+      const value = step.action === 'type' ? (p.text || t?.generatedText || '') : '';
+      const r = await msgTab(tabId, { type: 'RUN_STEP', step, value });
+      await taskEvent(base, taskId, r && r.ok ? 'obs' : 'err',
+        `Step "${step.name}" (${step.action}): ${r && r.ok ? 'ok' : (r && r.error) || 'failed'}`);
+      if (r && r.value != null) await taskEvent(base, taskId, 'obs', `Read: ${String(r.value).slice(0, 100)}`);
+      if (!r || !r.ok) throw new Error(`run_skill step "${step.name}" failed: ${(r && r.error) || 'not found'}`);
+      done++;
+      await new Promise((res) => setTimeout(res, 700)); // let the page react between steps
+    }
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + done });
+    await taskEvent(base, taskId, 'ok', `Skill "${p.skill}" ran ${done}/${steps.length} steps.`);
     return;
   }
 
@@ -819,6 +850,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } catch (e) {
           sendResponse({ ok: false, error: e?.message || 'Injection failed' });
         }
+      } else if (msg?.type === 'RESOLVE_ELEMENTS_HOST') {
+        // Health check for the skills page: resolve elements on an open tab of
+        // their host and report per-element match counts.
+        const host = String(msg.host || '').replace(/^www\./, '');
+        const tabs = await chrome.tabs.query({ url: [`*://${host}/*`, `*://*.${host}/*`] });
+        const tab = tabs[0];
+        if (!tab) { sendResponse({ ok: false, error: `No open tab on ${host} — open one first.` }); return; }
+        const r = await msgTab(tab.id, { type: 'RESOLVE_ELEMENTS', elements: msg.elements || [] });
+        sendResponse({ ...(r || { ok: false, error: 'no response' }), url: tab.url });
       } else if (msg?.type === 'RESUME_TASKS') {
         resumeUnfinished();
         sendResponse({ ok: true });
