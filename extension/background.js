@@ -400,6 +400,37 @@ async function runTool(base, taskId, phase) {
     return;
   }
 
+  if (phase.tool === 'type') {
+    const tabId = await currentTab(taskId);
+    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value: p.value || '' });
+    const t = await getTask(base, taskId);
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    const okMsg = res && res.ok ? `Typed into ${res.matched || 'field'}: "${String(p.value || '').slice(0, 60)}"` : `type failed: ${(res && res.error) || 'no field'}`;
+    await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
+    if (res && !res.ok) throw new Error(okMsg);
+    return;
+  }
+
+  if (phase.tool === 'generate_text') {
+    const t = await getTask(base, taskId);
+    const prompt = p.prompt || t.goal;
+    await taskEvent(base, taskId, 'think', `Generating text: ${String(prompt).slice(0, 80)}…`);
+    const gen = await jf(`${base}/ai/generate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: t.model, prompt, words: p.words }),
+    }).catch(() => null);
+    const text = gen && gen.ok ? gen.text : '';
+    if (!text) throw new Error(`generate_text failed: ${(gen && gen.error) || 'no text produced'}`);
+    await taskEvent(base, taskId, 'obs', `Generated ${text.length} chars: "${text.slice(0, 80)}${text.length > 80 ? '…' : ''}"`);
+    await patchTask(base, taskId, { generatedText: text, actions: (t?.actions || 0) + 1 });
+    const tabId = await currentTab(taskId);
+    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value: text });
+    const okMsg = res && res.ok ? `Wrote generated text into ${res.matched || 'field'}.` : `type failed: ${(res && res.error) || 'no field'}`;
+    await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
+    if (res && !res.ok) throw new Error(okMsg);
+    return;
+  }
+
   if (phase.tool === 'scroll_and_collect_links') {
     const tabId = await ensureFacebookTab(taskId);
     const res = await msgTab(tabId, { type: 'COLLECT_LINKS', options: { target: p.target || 10, delay: p.delay || 1200 } });

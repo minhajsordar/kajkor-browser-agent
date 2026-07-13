@@ -1041,6 +1041,53 @@ async function hoverElement(selector, text) {
   return { ok: true, matched: norm(el.getAttribute('aria-label') || el.innerText || el.textContent).slice(0, 60) || (selector || text) };
 }
 
+// Find an editable field (input/textarea/contenteditable/role=textbox) by CSS
+// selector, else by placeholder/aria-label text, else the focused/first one.
+function findField(selector, text) {
+  const editable = (el) => el && (el.tagName === 'TEXTAREA'
+    || (el.tagName === 'INPUT' && /^(text|search|email|url|tel|)$/i.test(el.type || ''))
+    || el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox');
+  if (selector) { try { const el = document.querySelector(selector); if (el) return el; } catch {} }
+  if (text) {
+    const t = String(text).toLowerCase().trim();
+    const all = [...document.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"]')].filter(editable);
+    for (const el of all) {
+      const hint = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').toLowerCase();
+      if (hint.includes(t) && el.offsetParent !== null) return el;
+    }
+  }
+  if (editable(document.activeElement)) return document.activeElement;
+  return [...document.querySelectorAll('[role="textbox"],[contenteditable="true"],textarea,input[type="text"],input:not([type])')]
+    .find((el) => el.offsetParent !== null) || null;
+}
+
+// Type text into a field. Uses execCommand insertText (works for React-controlled
+// inputs and contenteditable), with a value-setter fallback.
+async function typeInto(selector, text, value) {
+  const el = findField(selector, text);
+  if (!el) return { ok: false, error: 'no editable field found' };
+  try { el.scrollIntoView({ block: 'center' }); } catch {}
+  el.focus();
+  await sleep(150);
+  const label = norm(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.tagName).slice(0, 50);
+  try {
+    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
+      let ok = false;
+      try { ok = document.execCommand('insertText', false, value); } catch {}
+      if (!ok) { el.textContent = value; }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    } else {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      el.focus();
+      if (setter) setter.call(el, value); else el.value = value;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return { ok: true, matched: label };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // Perform a single-element skill's action.
 async function useSkill(skill) {
   const el = resolveOne(document, skill.selectors);
@@ -1082,6 +1129,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(await clickElement(msg.selector, msg.text));
       } else if (msg?.type === 'HOVER_ELEMENT') {
         sendResponse(await hoverElement(msg.selector, msg.text));
+      } else if (msg?.type === 'TYPE_TEXT') {
+        sendResponse(await typeInto(msg.selector, msg.text, msg.value));
       } else if (msg?.type === 'EXTRACT_PAGE_INFO') {
         // Give lazy content a moment to render.
         await sleep(msg.wait || 1500);
