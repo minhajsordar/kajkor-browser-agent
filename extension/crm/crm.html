@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Leads CRM</title>
+    <link rel="stylesheet" href="crm.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Leads CRM</h1>
+      <div class="stats" id="stats"></div>
+      <div class="spacer"></div>
+      <button id="reloadBtn" class="btn">↻ Reload</button>
+      <span id="conn" class="conn"></span>
+    </header>
+
+    <main class="layout">
+      <section class="list-pane">
+        <div class="filters">
+          <input id="search" class="search" type="search" placeholder="Search name, category, phone…" />
+          <select id="statusFilter" class="select">
+            <option value="new" selected>New</option>
+            <option value="">All statuses</option>
+            <option value="welcomed">Welcomed</option>
+            <option value="proposed">Proposed</option>
+            <option value="replied">Replied</option>
+            <option value="followup">Follow-up</option>
+            <option value="won">Won</option>
+            <option value="lost">Lost</option>
+            <option value="not_lead">Not a lead</option>
+            <option value="has_website">Already Have Website</option>
+          </select>
+        </div>
+        <div id="bulkBar" class="bulk-bar"></div>
+        <ul id="leadList" class="lead-list"></ul>
+      </section>
+
+      <section class="detail-pane" id="detail">
+        <div class="empty">Select a lead to view details.</div>
+      </section>
+    </main>
+
+    <script src="templates.js"></script>
+    <script src="crm.js"></script>
+  </body>
+</html>

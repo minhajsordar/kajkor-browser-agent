@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Facebook Page Collector (legacy)</title>
+    <link rel="stylesheet" href="fb.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Facebook Page Collector</h1>
+      <p class="sub">Legacy task — scroll the feed, collect page links, open each and save details.</p>
+    </header>
+
+    <section class="controls">
+      <label class="field">
+        <span>Lead Target</span>
+        <input type="number" id="target" value="10" min="1" max="1000" />
+      </label>
+      <label class="field">
+        <span>Scroll delay (ms)</span>
+        <input type="number" id="delay" value="1200" min="300" step="100" />
+      </label>
+      <div class="row">
+        <button id="collectBtn" class="btn primary">1. Collect Links &amp; Get Details</button>
+      </div>
+      <div class="row">
+        <button id="visitBtn" class="btn">2. Visit &amp; Get Details (stored)</button>
+      </div>
+      <div class="row">
+        <button id="stopBtn" class="btn">Stop</button>
+      </div>
+      <p class="hint">Collect scrolls until it finds <b>Lead Target</b> unique pages, then auto-visits them. Stop leaves stored links for button 2.</p>
+
+      <div class="row">
+        <button id="crmBtn" class="btn primary">Open Leads CRM →</button>
+      </div>
+    </section>
+
+    <section>
+      <div id="status" class="status">Ready</div>
+      <div class="bar"><div id="progress" class="fill"></div></div>
+    </section>
+
+    <script src="fb.js"></script>
+  </body>
+</html>
