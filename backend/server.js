@@ -13,7 +13,7 @@ const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
 
 const PORT = process.env.PORT || 4000;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://minhaj:m1nh8j@mdb.softrking.com:27017/browser_agent?authSource=admin&directConnection=true';
 const DB_NAME = process.env.MONGODB_DB || 'browser_agent';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const DEBUG_DIR = path.join(__dirname, '..', 'sample', 'debug');
