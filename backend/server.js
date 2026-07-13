@@ -188,6 +188,10 @@ const TOOL_CATALOG = [
     desc: 'Click the element matching a CSS `selector` on the current page (or the first element whose visible text contains `text`). Use for buttons, links, tabs, "See more", etc.' },
   { name: 'hover', params: ['selector', 'text'],
     desc: 'Hover (mouseover) the element matching a CSS `selector` (or containing `text`) on the current page — e.g. to reveal a menu or tooltip.' },
+  { name: 'type', params: ['value', 'selector', 'text'],
+    desc: 'Type `value` into a text field / textarea / contenteditable box (e.g. a post composer, search box, comment box). Locate the field by CSS `selector`, or by its placeholder/aria-label `text`; if neither is given, types into the focused or first editable field. Does NOT submit.' },
+  { name: 'generate_text', params: ['prompt', 'selector', 'text', 'words'],
+    desc: 'Use AI to WRITE text from `prompt` (e.g. "write a Facebook post about surviving the AI era"), then type it into the target field (located by `selector` or placeholder/aria-label `text`, else the focused/first editable field). Use this when the user asks to generate/compose/write content; use `type` only when they give the exact words. Does NOT submit.' },
   { name: 'scroll_and_collect_links', params: ['target', 'delay'],
     desc: 'On a Facebook feed, scroll and collect up to `target` unique page links with names, saving them to the database.' },
   { name: 'visit_and_extract_details', params: [],
@@ -264,6 +268,9 @@ function planningSystemPrompt(schemas, skills) {
     '- "target.count" is the number the user asked for.',
     '- If the user says NOT to collect data, use the `scroll` tool and metric "scrolls". Otherwise use `scroll_and_collect_links`.',
     '- For UI interactions (clicking buttons/links/tabs, hovering to reveal menus) use the `click` and `hover` tools; if the task is only interactions (no data collected) use metric "actions" with count = number of interaction steps.',
+    '- To enter EXACT text the user gave into a field/box use the `type` tool with params.value = that text. Do NOT use use_skill for typing.',
+    '- To WRITE/GENERATE/COMPOSE text with AI (a post/message/comment about a topic) use the `generate_text` tool with params.prompt describing what to write; it generates the text and types it into the field.',
+    '- use_skill and collect_by_skill may ONLY reference a skill from the "Learned skills" list below. NEVER invent or guess a skill name. If no learned skill fits, use the generic click/type/hover tools instead.',
     '- For navigate, set params.newTab to true ONLY if the user explicitly asks to open a NEW tab; if they refer to the current/existing tab, omit newTab.',
     '- Phases run in order. Use the fewest phases needed.',
     '- If the user asks to verify/compare/correct collected fields against a fuller text, add an "ai_verify" phase LAST, with params.source set to the field holding the full text.',
@@ -277,6 +284,10 @@ function planningSystemPrompt(schemas, skills) {
     '{"target":{"metric":"scrolls","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"scroll","params":{"times":10}}]}',
     'Example — "on the current page, hover the menu then click the Settings link":',
     '{"target":{"metric":"actions","count":2},"phases":[{"tool":"hover","params":{"text":"menu"}},{"tool":"click","params":{"text":"Settings"}}]}',
+    'Example — "open the post composer and write a post, do not publish":',
+    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"type","params":{"value":"<the post text>"}}]}',
+    'Example — "open the composer and generate a post about surviving the AI era":',
+    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"generate_text","params":{"prompt":"Write a Facebook post about how we can survive in the AI era"}}]}',
     'Example — "collect the full text of 5 posts":',
     '{"target":{"metric":"texts","count":5},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"collect_text","params":{"selector":"[role=\\"article\\"]","target":5}}]}',
   ];
@@ -333,7 +344,7 @@ function normalizePlan(plan) {
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
     else {
       // Pure action task (click/hover/scroll only): target = number of such phases.
-      const acts = clean.filter((p) => ['click', 'hover', 'scroll'].includes(p.tool)).length;
+      const acts = clean.filter((p) => ['click', 'hover', 'scroll', 'type', 'generate_text'].includes(p.tool)).length;
       if (acts) target = { metric: 'actions', count: acts };
       else return null;
     }
@@ -397,7 +408,7 @@ function repairPlan(plan) {
   }
 
   // Enforce order: one navigate first, then scroll/collect/act, then extract, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, scroll_and_collect_links: 1, use_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
+  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
   const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
   const rest = phases.filter((p) => p.tool !== 'navigate')
     .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
@@ -816,6 +827,17 @@ app.post('/tasks/:id/plan', async (req, res) => {
     }
   }
 
+  // Drop phases that reference a skill the model invented (not actually taught),
+  // so the run doesn't hard-error on a missing skill. Keep the rest.
+  const knownSkills = new Set(skills.map((s) => s.name));
+  plan.phases = plan.phases.filter((p) => {
+    if ((p.tool === 'use_skill' || p.tool === 'collect_by_skill') && !knownSkills.has(p.params?.skill)) {
+      events.push({ at: nowIso(), kind: 'think', msg: `Skipped ${p.tool} for unknown skill "${p.params?.skill}" (not taught).` });
+      return false;
+    }
+    return true;
+  });
+
   // If the user asked to verify/compare/correct, guarantee an ai_verify LAST phase.
   if (/\b(verify|compare|correct|validate|cross.?check|double.?check|check if|make sure)\b/i.test(task.goal)
       && !plan.phases.some((p) => p.tool === 'ai_verify')
@@ -825,7 +847,7 @@ app.post('/tasks/:id/plan', async (req, res) => {
   }
 
   const set = { plan, status: 'running', currentPhaseIndex: 0, messages, updatedAt: nowIso() };
-  if ((!task.schemas || !task.schemas.length) && plan.target.metric !== 'scrolls') {
+  if ((!task.schemas || !task.schemas.length) && !['scrolls', 'actions'].includes(plan.target.metric)) {
     let fields = [], chosen = '', nm = '';
     // Prefer the learned skill's taught fields when collecting by skill.
     if (plan.target.metric === 'items') {
@@ -967,6 +989,28 @@ app.post('/ai/verify-record', async (req, res) => {
       }
     }
     res.json({ ok: true, corrected, changed });
+  } catch (e) {
+    res.json({ ok: false, error: 'Ollama error: ' + e.message });
+  }
+});
+
+// AI text generation — write content from a prompt (post, message, comment…).
+app.post('/ai/generate', async (req, res) => {
+  const { model, prompt, words } = req.body || {};
+  if (!model || !prompt) return res.json({ ok: false, error: 'model and prompt required' });
+  const sys = [
+    'You are a skilled writing assistant.',
+    'Write exactly what the user asks for and OUTPUT ONLY that text.',
+    'No preamble, no sign-off, no surrounding quotation marks, no markdown headings, no explanations.',
+    words ? `Keep it to roughly ${words} words.` : 'Keep it concise and natural.',
+  ].join('\n');
+  try {
+    const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, stream: false, options: { temperature: 0.7 }, messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt }] }),
+    })).json();
+    let text = (j.message?.content || '').trim().replace(/^["'\s]+|["'\s]+$/g, '');
+    res.json({ ok: !!text, text, error: text ? undefined : 'empty generation' });
   } catch (e) {
     res.json({ ok: false, error: 'Ollama error: ' + e.message });
   }
