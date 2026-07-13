@@ -1,0 +1,9 @@
+$ which systemctl
+cwd: D:\Shared\softvasion\kajkor-browser-agent\backend
+hardTimeout: 120000ms idleTimeout: off
+---
+'which' is not recognized as an internal or external command,
+operable program or batch file.
+
+---
+exit=1 timedOut=false idleTimedOut=false durationMs=83

@@ -851,10 +851,61 @@ async function collectBySkill(skill, target = 20, delay = 1200, maxScrolls = 200
   return records.slice(0, target);
 }
 
+// --- Post-by-post scanning (find_post) --------------------------------------
+// Walks feed posts ONE AT A TIME in DOM order so none are skipped: each call
+// scrolls the next unscanned post into view, lets it hydrate, expands
+// "See more", and returns its full text. Scan state lives on the elements
+// (__baScanned), so repeated calls step through the feed post by post.
+
+// Top-level feed posts only — comments render as nested [role="article"].
+function articleNodes() {
+  return [...document.querySelectorAll('[role="article"]')]
+    .filter((el) => !(el.parentElement && el.parentElement.closest('[role="article"]')));
+}
+
+// Best-effort permalink of a post (timestamp/permalink anchor inside it).
+function postPermalink(article) {
+  const a = article.querySelector(
+    'a[href*="/posts/"], a[href*="story_fbid"], a[href*="/permalink"], a[href*="/videos/"], a[href*="/reel/"]'
+  );
+  if (!a) return '';
+  try { return cleanUrl(new URL(a.getAttribute('href'), location.origin).toString()); } catch { return ''; }
+}
+
+async function scanNextPost({ settle = 700, maxLoadScrolls = 4 } = {}) {
+  const scope = getMainScope();
+  for (let attempt = 0; attempt <= maxLoadScrolls; attempt++) {
+    for (const article of articleNodes()) {
+      if (article.__baScanned) continue;
+      try { article.scrollIntoView({ block: 'center' }); } catch {}
+      await sleep(settle); // let the post hydrate in view
+      // Expand truncated text so the whole content is readable.
+      for (const btn of article.querySelectorAll('[role="button"]')) {
+        if (norm(btn.textContent).toLowerCase() === 'see more') {
+          try { btn.click(); await sleep(400); } catch {}
+          break;
+        }
+      }
+      const text = fullText(article).slice(0, 6000);
+      article.__baScanned = true;
+      if (!text) continue; // placeholder that never hydrated — move to the next
+      return { ok: true, post: { text, url: postPermalink(article) || location.href } };
+    }
+    // Every post in the DOM is scanned — nudge one small step to load more.
+    if (scope && scope.scrollHeight > scope.clientHeight + 4) scope.scrollTop += Math.round(scope.clientHeight * 0.6);
+    else window.scrollBy(0, Math.round(window.innerHeight * 0.6));
+    await sleep(1000);
+  }
+  return { ok: true, noMore: true };
+}
+
 // Scroll and collect the FULL inner text of every element matching a CSS
 // selector, de-duped by text. No learned skill needed — just a selector.
 async function collectText(selector, target = 20, delay = 1200, maxScrolls = 200) {
-  const sel = (selector || '').trim() || '[role="article"]';
+  let sel = (selector || '').trim() || '[role="article"]';
+  // Models sometimes emit invalid CSS (e.g. jQuery :contains). A broken selector
+  // used to silently collect 0 items — fall back to the article default instead.
+  try { document.querySelectorAll(sel); } catch { sel = '[role="article"]'; }
   const seen = new Set();
   const records = [];
   const scope = getMainScope();
@@ -961,6 +1012,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg?.type === 'COLLECT_TEXT') {
         const records = await collectText(msg.selector, msg.target || 20, msg.delay || 1200);
         sendResponse({ ok: true, records });
+      } else if (msg?.type === 'SCAN_NEXT_POST') {
+        sendResponse(await scanNextPost(msg || {}));
       } else if (msg?.type === 'CLICK_ELEMENT') {
         sendResponse(await clickElement(msg.selector, msg.text));
       } else if (msg?.type === 'HOVER_ELEMENT') {

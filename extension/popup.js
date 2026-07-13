@@ -16,8 +16,10 @@ const els = {
   active: $('active'),
   recent: $('recent'),
   schemaSelect: $('schemaSelect'),
+  schemaBtn: $('schemaBtn'),
   manageSchemas: $('manageSchemas'),
   skillSelect: $('skillSelect'),
+  skillBtn: $('skillBtn'),
   manageSkills2: $('manageSkills2'),
   learnBtn: $('learnBtn'),
   model: $('model'),
@@ -122,18 +124,47 @@ async function loadModels() {
   els.sendBtn.disabled = false;
 }
 
-// --- schemas ---------------------------------------------------------------
+// --- schemas & skills (multi-select dropdowns) -------------------------------
+
+function updateMsdLabel(panel, btn) {
+  const label = btn.querySelector('.msd-label');
+  const checked = [...panel.querySelectorAll('input[type=checkbox]:checked')];
+  const names = checked.map((c) => c.closest('.msd-opt').dataset.name);
+  if (!names.length) {
+    label.textContent = 'None';
+    label.classList.add('mut');
+  } else {
+    label.textContent = names.length <= 2 ? names.join(', ') : `${names.length} selected`;
+    label.classList.remove('mut');
+  }
+}
+
+function setupMsd(panel, btn) {
+  const wrap = btn.closest('.msd');
+  btn.addEventListener('click', () => {
+    panel.classList.toggle('hidden');
+    wrap.classList.toggle('open', !panel.classList.contains('hidden'));
+  });
+  panel.addEventListener('change', () => updateMsdLabel(panel, btn));
+  document.addEventListener('click', (e) => {
+    if (!wrap.contains(e.target)) {
+      panel.classList.add('hidden');
+      wrap.classList.remove('open');
+    }
+  });
+}
 
 async function loadSchemas() {
   let schemas = [];
   try { schemas = (await api('/schemas')).schemas || []; } catch {}
   if (!schemas.length) {
-    els.schemaSelect.innerHTML = '<span class="mut" style="font-size:12px">No schemas yet — click “Manage schemas” to create one. Tasks run fine without one.</span>';
-    return;
+    els.schemaSelect.innerHTML = '<span class="msd-empty">No schemas yet — click “Manage schemas” to create one. Tasks run fine without one.</span>';
+  } else {
+    els.schemaSelect.innerHTML = schemas.map((s) =>
+      `<label class="msd-opt" data-name="${escapeHtml(s.name)}"><input type="checkbox" value="${escapeHtml(s.schemaId)}"/> ${escapeHtml(s.name)} <span class="mut">(${s.fields.length})</span></label>`
+    ).join('');
   }
-  els.schemaSelect.innerHTML = schemas.map((s) =>
-    `<label class="schema-chip"><input type="checkbox" value="${escapeHtml(s.schemaId)}"/> ${escapeHtml(s.name)} <span class="mut">(${s.fields.length})</span></label>`
-  ).join('');
+  updateMsdLabel(els.schemaSelect, els.schemaBtn);
 }
 
 function selectedSchemaIds() {
@@ -145,12 +176,13 @@ async function loadSkills() {
   try { skills = (await api('/skills')).skills || []; } catch {}
   const coll = skills.filter((s) => s.kind === 'collection');
   if (!coll.length) {
-    els.skillSelect.innerHTML = '<span class="mut" style="font-size:12px">No collection skills yet — teach one with “Start learning session”.</span>';
-    return;
+    els.skillSelect.innerHTML = '<span class="msd-empty">No collection skills yet — teach one with “Start learning session”.</span>';
+  } else {
+    els.skillSelect.innerHTML = coll.map((s) =>
+      `<label class="msd-opt" data-name="${escapeHtml(s.name)}"><input type="checkbox" value="${escapeHtml(s.skillId)}"/> ${escapeHtml(s.name)} <span class="mut">(${(s.fields || []).length}f)</span></label>`
+    ).join('');
   }
-  els.skillSelect.innerHTML = coll.map((s) =>
-    `<label class="schema-chip"><input type="checkbox" value="${escapeHtml(s.skillId)}"/> ${escapeHtml(s.name)} <span class="mut">(${(s.fields || []).length}f)</span></label>`
-  ).join('');
+  updateMsdLabel(els.skillSelect, els.skillBtn);
 }
 
 function selectedSkillIds() {
@@ -339,6 +371,8 @@ els.dashLink.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.
 els.manageSchemas.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('schemas/schemas.html') }); });
 els.skillsLink.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('skills/skills.html') }); });
 els.manageSkills2.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('skills/skills.html') }); });
+setupMsd(els.schemaSelect, els.schemaBtn);
+setupMsd(els.skillSelect, els.skillBtn);
 els.learnBtn.addEventListener('click', async () => {
   const res = await chrome.runtime.sendMessage({ type: 'START_LEARN' });
   if (!res?.ok) { setModelHint(res?.error || 'Could not start learning here.'); return; }

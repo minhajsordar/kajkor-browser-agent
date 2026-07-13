@@ -1,0 +1,9 @@
+$ systemctl status mongodb
+cwd: D:\Shared\softvasion\kajkor-browser-agent\backend
+hardTimeout: 120000ms idleTimeout: off
+---
+'systemctl' is not recognized as an internal or external command,
+operable program or batch file.
+
+---
+exit=1 timedOut=false idleTimedOut=false durationMs=21

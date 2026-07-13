@@ -38,7 +38,13 @@
           <span>Use learned skill <span class="mut">(optional)</span></span>
           <a id="manageSkills2" href="#">Manage skills</a>
         </div>
-        <div id="skillSelect" class="schema-list"></div>
+        <div class="msd">
+          <button type="button" id="skillBtn" class="msd-btn">
+            <span class="msd-label">None</span>
+            <span class="msd-caret">▾</span>
+          </button>
+          <div id="skillSelect" class="msd-panel hidden"></div>
+        </div>
       </div>
 
       <div class="schema-pick">
@@ -46,7 +52,13 @@
           <span>Save into schema <span class="mut">(optional)</span></span>
           <a id="manageSchemas" href="#">Manage schemas</a>
         </div>
-        <div id="schemaSelect" class="schema-list"></div>
+        <div class="msd">
+          <button type="button" id="schemaBtn" class="msd-btn">
+            <span class="msd-label">None</span>
+            <span class="msd-caret">▾</span>
+          </button>
+          <div id="schemaSelect" class="msd-panel hidden"></div>
+        </div>
       </div>
 
       <button id="sendBtn" class="btn primary block">

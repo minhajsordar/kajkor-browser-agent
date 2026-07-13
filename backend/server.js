@@ -198,6 +198,8 @@ const TOOL_CATALOG = [
     desc: 'Use a learned "collection" skill to scroll and extract its taught fields from each repeating item (e.g. each post), saving up to `target` records.' },
   { name: 'collect_text', params: ['selector', 'target'],
     desc: 'Scroll and collect the FULL inner text of every element matching a CSS selector on the current page (e.g. "[role=article]" for posts, ".comment" for comments). Each block is saved as one record with a "text" field. Use when the user wants the whole text content of repeating elements.' },
+  { name: 'find_post', params: ['query', 'target'],
+    desc: 'FIND specific post(s): scan feed posts ONE BY ONE (scrolling post by post, skipping none) and AI-check each against `query` — a short description of the wanted post\'s topic. Saves every matching post (full text + link) and stops after `target` matches (usually 1). Use whenever the user asks to find / look for / search a post about something. It scrolls itself — never add a scroll phase with it.' },
   { name: 'ai_verify', params: ['source', 'fields', 'instruction'],
     desc: 'AI verification/correction pass AFTER collecting. For each collected record it gives the model the record\'s full source text (the `source` field, e.g. "text" or an innerText field holding the whole item) and the extracted `fields`, then checks each field against the source and rewrites wrong/badly-formatted values using ONLY what the source contains. Add this as the LAST phase when the user asks to verify/compare/correct collected fields.' },
 ];
@@ -265,7 +267,10 @@ function planningSystemPrompt(schemas, skills) {
     '- For navigate, set params.newTab to true ONLY if the user explicitly asks to open a NEW tab; if they refer to the current/existing tab, omit newTab.',
     '- Phases run in order. Use the fewest phases needed.',
     '- If the user asks to verify/compare/correct collected fields against a fuller text, add an "ai_verify" phase LAST, with params.source set to the field holding the full text.',
+    '- To FIND a post about a topic, use find_post (metric "items", count = how many posts to find, usually 1). find_post scrolls post-by-post itself — do NOT add scroll or collect_text phases with it.',
     '',
+    'Example — "find a post about baby products":',
+    '{"target":{"metric":"items","count":1},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"find_post","params":{"query":"baby products","target":1}}]}',
     'Example — "collect page link and name from 10 posts":',
     '{"target":{"metric":"links","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"scroll_and_collect_links","params":{"target":10}}]}',
     'Example — "open facebook and only scroll 10 times, do not collect":',
@@ -320,7 +325,9 @@ function normalizePlan(plan) {
     const cbs = clean.find((p) => p.tool === 'collect_by_skill');
     const ct = clean.find((p) => p.tool === 'collect_text');
     const scr = clean.find((p) => p.tool === 'scroll');
-    if (cbs && Number(cbs.params.target)) target = { metric: 'items', count: Number(cbs.params.target) };
+    const fp = clean.find((p) => p.tool === 'find_post');
+    if (fp) target = { metric: 'items', count: Number(fp.params.target) || 1 };
+    else if (cbs && Number(cbs.params.target)) target = { metric: 'items', count: Number(cbs.params.target) };
     else if (ct && Number(ct.params.target)) target = { metric: 'texts', count: Number(ct.params.target) };
     else if (sc && Number(sc.params.target)) target = { metric: 'links', count: Number(sc.params.target) };
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
@@ -352,8 +359,17 @@ function repairPlan(plan) {
     }
     for (const p of phases) if (p.tool === 'scroll' && !Number(p.params.times)) p.params.times = plan.target.count;
   } else if (metric === 'items') {
-    // Skill-based collection: collect_by_skill scrolls itself. Just fix its target.
-    for (const p of phases) if (p.tool === 'collect_by_skill' && !Number(p.params.target)) p.params.target = plan.target.count;
+    // Skill/find collection: both tools scroll themselves. Just fix their targets.
+    for (const p of phases) {
+      if ((p.tool === 'collect_by_skill' || p.tool === 'find_post') && !Number(p.params.target)) p.params.target = plan.target.count;
+    }
+    // find_post steps through posts itself — blind scroll/collect phases before
+    // it just skip past posts (and models emit broken selectors). Drop them.
+    if (phases.some((p) => p.tool === 'find_post')) {
+      const n = phases.length;
+      phases = phases.filter((p) => !['scroll', 'collect_text', 'scroll_and_collect_links'].includes(p.tool));
+      if (phases.length !== n) repaired.push('removed blind scroll/collect phases (find_post scans post-by-post itself)');
+    }
   } else if (metric === 'texts') {
     // collect_text scrolls itself; ensure the phase exists and has a target.
     if (!has('collect_text')) {
@@ -381,7 +397,7 @@ function repairPlan(plan) {
   }
 
   // Enforce order: one navigate first, then scroll/collect/act, then extract, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, scroll_and_collect_links: 1, use_skill: 1, collect_by_skill: 1, collect_text: 1, visit_and_extract_details: 2, ai_verify: 3 };
+  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, scroll_and_collect_links: 1, use_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
   const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
   const rest = phases.filter((p) => p.tool !== 'navigate')
     .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
@@ -451,8 +467,8 @@ function requestedClickFields(goal, skillFields, wantedReads) {
 // a number, or null if the goal names no specific amount.
 function requestedCount(goal) {
   const g = ' ' + (goal || '').toLowerCase() + ' ';
-  // explicit "one/single/first" or caps like "don't do more than one"
-  if (/\b(first|single|one|1)\s+(post|item|row|page|element|comment|result|link)\b/.test(g)) return 1;
+  // explicit "one/single/first/a" (with an optional adjective: "a facebook post")
+  if (/\b(?:a|an|first|single|one|1)\s+(?:[a-z]+\s+)?(?:post|item|row|page|element|comment|result|link)\b/.test(g)) return 1;
   if (/\b(only|just)\s+(one|1|a single|the first)\b/.test(g)) return 1;
   if (/\b(do\s?n'?t|do not|no|not)\s+(do\s+)?(more than|over)\s+(a\s+)?(one|1)\b/.test(g)) return 1;
   if (/\b(at most|no more than|maximum of|max)\s+(a\s+)?(one|1)\b/.test(g)) return 1;
@@ -741,11 +757,27 @@ app.post('/tasks/:id/plan', async (req, res) => {
   const events = [...modelEvents, { at: nowIso(), kind: 'obs', msg: `Planned ${plan.phases.length} phases, target ${plan.target.count} ${plan.target.metric}.` }];
   if (fixed.repaired.length) events.push({ at: nowIso(), kind: 'think', msg: 'Plan completed: ' + fixed.repaired.join(', ') + '.' });
 
+  // Deterministic find routing: "find/search a post about X" MUST use find_post.
+  // Small models mangle this into scroll + collect_text with invalid selectors
+  // and a "scrolls" target, which finishes without ever finding anything.
+  const findIntent = /\b(find|look\s+for|search(?:\s+for)?|locate)\b[\s\S]{0,80}\bposts?\b/i.test(task.goal);
+  if (findIntent && !plan.phases.some((p) => p.tool === 'find_post')) {
+    const quoted = task.goal.match(/["“']([^"”']{2,80})["”']/);
+    const about = task.goal.match(/\b(?:about|discuss(?:es|ing|ed)?(?:\s+about)?|regarding|related\s+to|selling)\s+["“']?([^."”'\n]{2,80})/i);
+    const query = ((quoted && quoted[1]) || (about && about[1]) || task.goal).trim();
+    const n = wantCount != null ? wantCount : 1;
+    plan.target = { metric: 'items', count: n };
+    plan.phases = plan.phases.filter((p) =>
+      !['scroll', 'collect_text', 'scroll_and_collect_links', 'visit_and_extract_details', 'collect_by_skill', 'ai_verify'].includes(p.tool));
+    plan.phases.push({ tool: 'find_post', params: { query, target: n } });
+    events.push({ at: nowIso(), kind: 'think', msg: `Find task → scanning posts one by one for "${query}" (find_post, target ${n}).` });
+  }
+
   // If the user picked no schema and the task collects data, create a
   // task-owned schema now — from the model's suggestion, else defaults.
   // Deterministic skill routing. Prefer a skill the user explicitly picked;
   // else fall back to matching a taught collection skill named in the goal.
-  if (plan.target.metric !== 'scrolls') {
+  if (plan.target.metric !== 'scrolls' && !plan.phases.some((p) => p.tool === 'find_post')) {
     let routeSkill = (task.useSkills || []).find((s) => s.kind === 'collection') || null;
     if (!routeSkill && plan.target.metric !== 'items' && skills.length) {
       const g = task.goal.toLowerCase();
@@ -800,6 +832,15 @@ app.post('/tasks/:id/plan', async (req, res) => {
         chosen = `from skill "${skill.name}"`; nm = `Data: ${skill.name}`;
       }
     }
+    // find_post yields the matching post's text, link, and why it matched.
+    if (!fields.length && plan.phases.some((p) => p.tool === 'find_post')) {
+      fields = normFields([
+        { key: 'text', label: 'Post text', type: 'text' },
+        { key: 'url', label: 'URL', type: 'url' },
+        { key: 'match_reason', label: 'Why it matched', type: 'text' },
+      ]);
+      chosen = 'found posts'; nm = 'Found posts';
+    }
     // collect_text always yields a text block + its source url.
     if (!fields.length && plan.target.metric === 'texts') {
       fields = normFields([{ key: 'text', label: 'Text', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
@@ -834,6 +875,41 @@ app.post('/tasks/:id/plan', async (req, res) => {
     { returnDocument: 'after', projection: { _id: 0 } }
   );
   res.json({ ok: true, task: doc?.value || doc });
+});
+
+// AI judge for find_post: does this ONE post's text discuss the wanted topic?
+// Stateless — the extension loops posts and calls this per post, so scanning
+// stays post-by-post, resumable, and observable in the task log.
+app.post('/ai/match-post', async (req, res) => {
+  const { model, query, text } = req.body || {};
+  if (!model || !query) return res.json({ ok: false, error: 'model and query required' });
+  const t = String(text || '').slice(0, 6000);
+  if (!t) return res.json({ ok: true, match: false, reason: 'empty post' });
+  // Cheap deterministic hit first — the exact phrase appears in the post.
+  if (t.toLowerCase().includes(String(query).toLowerCase())) {
+    return res.json({ ok: true, match: true, reason: 'post contains the phrase' });
+  }
+  try {
+    const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: false, options: { temperature: 0 },
+        format: { type: 'object', properties: { match: { type: 'boolean' }, reason: { type: 'string' } }, required: ['match', 'reason'] },
+        messages: [
+          { role: 'system', content: [
+            'You judge whether a social-media post is about a given topic.',
+            'match=true only if the post genuinely discusses, sells, promotes, or asks about the topic (same meaning counts, exact words are NOT required).',
+            'Reply STRICT JSON: {"match":true|false,"reason":"<one short sentence>"}.',
+          ].join('\n') },
+          { role: 'user', content: `TOPIC: ${query}\n\nPOST:\n"""\n${t}\n"""` },
+        ],
+      }),
+    })).json();
+    const out = JSON.parse(j.message?.content || '{}');
+    res.json({ ok: true, match: !!out.match, reason: out.reason || '' });
+  } catch (e) {
+    res.json({ ok: false, error: 'Ollama error: ' + e.message });
+  }
 });
 
 // AI verify/correct ONE record's fields against its full source text. Stateless:

@@ -484,6 +484,43 @@ async function runTool(base, taskId, phase) {
     return;
   }
 
+  if (phase.tool === 'find_post') {
+    const tabId = await currentTab(taskId);
+    const t0 = await getTask(base, taskId);
+    const query = p.query || t0?.goal || '';
+    const target = Number(p.target) || 1;
+    const maxPosts = Number(p.maxPosts) || 40;   // per pass; the repeat loop can extend
+    let found = (t0?.collected || []).length;    // resume-safe: matches already saved
+    let checked = 0;
+    await taskEvent(base, taskId, 'act', `Scanning posts one by one for: "${query}"…`);
+    while (found < target && checked < maxPosts) {
+      if (!AGENT[taskId]?.running) break;
+      const r = await msgTab(tabId, { type: 'SCAN_NEXT_POST' });
+      if (!r || !r.ok) throw new Error((r && r.error) || 'post scan failed');
+      if (r.noMore) { await taskEvent(base, taskId, 'obs', 'No more posts to scan on this page.'); break; }
+      checked++;
+      const post = r.post || {};
+      const preview = (post.text || '').slice(0, 70).replace(/\s+/g, ' ');
+      const m = await jf(`${base}/ai/match-post`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: t0.model, query, text: post.text }),
+      }).catch(() => null);
+      if (m && m.ok === false && m.error) throw new Error(m.error);
+      if (m && m.match) {
+        found++;
+        const rec = { text: (post.text || '').slice(0, 4000), url: post.url || '', match_reason: m.reason || '' };
+        await mergeRecords(base, taskId, [rec]);
+        const t = await getTask(base, taskId);
+        if (t?.schemas?.length) await saveToSchemas(base, taskId, t.schemas, [rec]);
+        await taskEvent(base, taskId, 'ok', `Post ${checked} MATCHES (${found}/${target}): ${preview}…`);
+      } else {
+        await taskEvent(base, taskId, 'obs', `Post ${checked}: no match — ${preview}…`);
+      }
+    }
+    await taskEvent(base, taskId, 'obs', `Scanned ${checked} post(s) this pass, found ${found}/${target}.`);
+    return;
+  }
+
   if (phase.tool === 'ai_verify') {
     const t = await getTask(base, taskId);
     const records = t?.collected || [];

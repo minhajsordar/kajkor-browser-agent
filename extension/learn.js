@@ -140,7 +140,7 @@
     :root{color-scheme:dark}
     *{box-sizing:border-box}
     body{margin:0;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#16181f;color:#e7e9ee;border:1px solid #2a2f3a;border-radius:12px;overflow:hidden}
-    .hd{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#1d2029;border-bottom:1px solid #2a2f3a;font-weight:600}
+    .hd{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#1d2029;border-bottom:1px solid #2a2f3a;font-weight:600;cursor:move;user-select:none;touch-action:none}
     .hd .host{color:#8b90a0;font-weight:400;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .hd .x{cursor:pointer;background:none;border:none;color:#8b90a0;font-size:15px}
     .body{padding:12px;max-height:calc(92vh - 44px);overflow:auto}
@@ -163,7 +163,7 @@
     .msg{display:block;margin-top:8px;font-size:12px;color:#8b90a0}
     .hidden{display:none!important}
   </style></head><body>
-    <div class="hd">🎓 Learning <span class="host">${host}</span><button class="x" title="Exit">✕</button></div>
+    <div class="hd" title="Drag to move">🎓 Learning <span class="host">${host}</span><button class="x" title="Exit">✕</button></div>
     <div class="body">
       <div class="hint" id="hint">Click any element on the page to teach it.</div>
       <div class="sel hidden" id="sel">
@@ -384,8 +384,37 @@
     window.__BA_LEARN = null;
   }
 
+  // Drag the panel by its header. The header lives inside the same-origin
+  // iframe, so its pointer coords are frame-relative; applying the delta to the
+  // frame's viewport position each move keeps the pointer pinned to the grab
+  // point, and pointer capture keeps events flowing while the frame moves.
+  function makeDraggable() {
+    const hd = idoc.querySelector('.hd');
+    let start = null;
+    hd.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.x')) return;   // ✕ stays a plain click
+      const r = frame.getBoundingClientRect();
+      frame.style.left = r.left + 'px'; frame.style.top = r.top + 'px';
+      frame.style.right = 'auto'; frame.style.bottom = 'auto';
+      start = { x: e.clientX, y: e.clientY };
+      hd.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    hd.addEventListener('pointermove', (e) => {
+      if (!start) return;
+      const r = frame.getBoundingClientRect();
+      // keep at least the header on screen so the panel can't be lost
+      const left = Math.min(Math.max(r.left + (e.clientX - start.x), 44 - r.width), window.innerWidth - 44);
+      const top = Math.min(Math.max(r.top + (e.clientY - start.y), 0), window.innerHeight - 44);
+      frame.style.left = left + 'px'; frame.style.top = top + 'px';
+    });
+    hd.addEventListener('pointerup', () => { start = null; });
+    hd.addEventListener('pointercancel', () => { start = null; });
+  }
+
   frame.addEventListener('load', () => {
     idoc = frame.contentDocument;
+    makeDraggable();
     idoc.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener('change', (e) => { kind = e.target.value; toggleKind(); }));
     $('#addField').addEventListener('click', () => { capturingField = !capturingField; $('#addField').textContent = capturingField ? 'Now click the field element…' : '+ Tag a field (click one inside an item)'; });
     $('#save').addEventListener('click', runValidate);

@@ -6,9 +6,12 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "dump": "node backup.js dump",
+    "restore": "node backup.js restore"
   },
   "dependencies": {
+    "adm-zip": "^0.6.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "mongodb": "^7.5.0"
