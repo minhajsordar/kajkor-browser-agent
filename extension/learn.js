@@ -1,9 +1,8 @@
 // Browser Agent — learning overlay (injected on demand by the background).
-// Point-and-click teaching. Two-step model (docs/skill-redesign-plan.md):
+// Point-and-click teaching, two-step model (docs/skill-redesign-plan.md):
 //   1. INTRODUCE elements — name one thing on the page (type, action/attr,
 //      parent element, route pattern). Repointable when the site changes.
 //   2. COMPOSE skills — bundle introduced elements into a named skill (v2).
-// The CLASSIC tab keeps the original one-shot skill flow.
 //
 // Selectors are computed DETERMINISTICALLY from stable anchors (aria-label /
 // role / text / href / data-*). The control panel lives in an IFRAME (not a
@@ -15,45 +14,11 @@
 
   const BACKEND = 'http://localhost:4000';
   const host = location.hostname.replace(/^www\./, '');
-  const firstSeg = location.pathname.split('/').filter(Boolean)[0];
-  const defaultPattern = `${host}/${firstSeg ? firstSeg + '/*' : '*'}`;
 
   const cssEsc = (v) => String(v).replace(/["\\]/g, '\\$&');
   const cssId = (v) => (window.CSS && CSS.escape ? CSS.escape(v) : v);
   const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  // Link URL: own href, else child <a>, else nearest ancestor <a> (FB text lives
-  // in a deep span whose clickable link is an ancestor anchor).
-  const hrefOf = (el) => {
-    if (!el) return '';
-    if (el.getAttribute && el.getAttribute('href')) return el.getAttribute('href');
-    const anc = el.closest && el.closest('a[href]');       // nearest ancestor link
-    if (anc) return anc.getAttribute('href');
-    const child = el.querySelector && el.querySelector('a[href]'); // nearest child link
-    return child ? child.getAttribute('href') : '';
-  };
-  // Full visible text of an element + everything inside it, keeping line breaks.
-  const fullText = (el) => {
-    if (!el) return '';
-    const t = (el.innerText != null && el.innerText !== '') ? el.innerText : (el.textContent || '');
-    return t.replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  };
-  // Image URL from either an HTML <img> (src) or an SVG <image> (xlink:href/href).
-  const imageUrlOf = (el) => {
-    if (!el) return '';
-    const svgHref = (im) => im.getAttribute('xlink:href') ||
-      im.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || im.getAttribute('href') || '';
-    const tag = (el.tagName || '').toLowerCase();
-    if (tag === 'img') return el.getAttribute('src') || '';
-    if (tag === 'image') return svgHref(el);
-    const img = el.querySelector && el.querySelector('img');
-    if (img && img.getAttribute('src')) return img.getAttribute('src');
-    const svgImg = el.querySelector && el.querySelector('image');
-    if (svgImg) return svgHref(svgImg);
-    const bg = el.style && el.style.backgroundImage;
-    const m = bg && bg.match(/url\(["']?(.*?)["']?\)/);
-    return m ? m[1] : '';
-  };
 
   function indexOfType(n) { let i = 1, s = n; while ((s = s.previousElementSibling)) if (s.tagName === n.tagName) i++; return i; }
   function cssPath(el) {
@@ -153,7 +118,8 @@
   hi.style.cssText = 'position:fixed;z-index:2147483646;border:2px solid #6d8bff;background:rgba(109,139,255,.15);pointer-events:none;display:none;border-radius:4px;';
   document.documentElement.appendChild(hi);
   const matchStyle = document.createElement('style');
-  matchStyle.textContent = '.__ba_match{outline:2px solid #34d399 !important;outline-offset:-2px;}';
+  matchStyle.textContent = '.__ba_match{outline:2px solid #34d399 !important;outline-offset:-2px;}'
+    + '.__ba_selected{outline:3px dashed #f6c453 !important;outline-offset:-3px;}';
   document.documentElement.appendChild(matchStyle);
 
   // ---- panel in an iframe (isolates keystrokes from the page) ----
@@ -174,20 +140,13 @@
     .hint{color:#8b90a0}
     .preview{font:11px ui-monospace,monospace;background:#0e0f13;border:1px solid #2a2f3a;border-radius:7px;padding:7px;margin-bottom:10px;word-break:break-word;max-height:70px;overflow:auto}
     label{display:block;font-size:12px;color:#c7ccd8;margin:8px 0 4px}
-    input,select,textarea{width:100%;padding:6px 8px;background:#1d2029;color:#e7e9ee;border:1px solid #2a2f3a;border-radius:7px;font:inherit}
-    input:focus,select:focus,textarea:focus{outline:none;border-color:#6d8bff}
+    input,select{width:100%;padding:6px 8px;background:#1d2029;color:#e7e9ee;border:1px solid #2a2f3a;border-radius:7px;font:inherit}
+    input:focus,select:focus{outline:none;border-color:#6d8bff}
     input:disabled,select:disabled{opacity:.5}
     .row-inline{display:flex;gap:6px;align-items:flex-end}
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-    .kinds{display:flex;gap:12px;margin:10px 0 4px}
-    .kinds label{display:inline-flex;align-items:center;gap:5px;margin:0}
-    .kinds input{width:auto}
     button.btn{width:100%;padding:8px;margin-top:12px;background:#5570e6;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer}
     button.btn.ghost{background:#1d2029;color:#e7e9ee;border:1px solid #2a2f3a}
-    .fields{margin-top:8px;display:flex;flex-direction:column;gap:6px}
-    .frow{display:grid;grid-template-columns:1fr 74px 24px;gap:5px}
-    .frow input,.frow select{padding:4px 6px;font-size:12px}
-    .frow .del{background:none;border:1px solid #2a2f3a;color:#8b90a0;border-radius:6px;cursor:pointer}
     .matches{display:block;color:#f6c453;font-size:12px;margin:6px 0}
     .msg{display:block;margin-top:8px;font-size:12px;color:#8b90a0}
     .hidden{display:none!important}
@@ -200,14 +159,13 @@
     .crow{display:flex;gap:6px;align-items:center;padding:4px 7px;border:1px solid #2a2f3a;border-radius:7px;font-size:12px;margin-bottom:4px}
     .crow input{width:auto}
     .crow .nm{flex:1}
-    .rt{color:#8b90a0;font-size:11px;margin:8px 0 2px;text-transform:none}
+    .rt{color:#8b90a0;font-size:11px;margin:8px 0 2px}
     .section-lbl{font-size:11px;color:#8b90a0;letter-spacing:.4px;text-transform:uppercase;margin:12px 0 4px}
   </style></head><body>
     <div class="hd" title="Drag to move">🎓 Learning <span class="host">${host}</span><button class="x" title="Exit">✕</button></div>
     <div class="tabs">
-      <button class="tab on" data-tab="intro">1 · Introduce</button>
+      <button class="tab on" data-tab="intro">1 · Introduce element</button>
       <button class="tab" data-tab="compose">2 · Compose skill</button>
-      <button class="tab" data-tab="classic">Classic</button>
     </div>
     <div class="body">
 
@@ -216,6 +174,10 @@
         <div class="hint" id="ihint">Click any element on the page to introduce it.</div>
         <div class="hidden" id="iform">
           <div class="preview" id="ipreview"></div>
+          <div class="row-inline" style="margin-bottom:6px">
+            <button class="btn ghost" id="iup" style="margin:0;flex:1" title="Select the parent/ancestor — use when the UI is too narrow to click the exact element">⬆ Select parent</button>
+            <button class="btn ghost" id="idown" style="margin:0;flex:1" title="Back down to the previous (inner) selection" disabled>⬇ Back to child</button>
+          </div>
           <div class="row-inline">
             <div style="flex:1"><label>Name</label><input id="iname" placeholder="e.g. post_item" /></div>
             <button class="btn ghost" id="isuggest" title="Suggest name" style="margin:0;width:auto;padding:6px 9px">✨</button>
@@ -230,9 +192,11 @@
                 <option value="container">container</option>
               </select></div>
             <div id="iactWrap"><label>Action</label>
-              <select id="iact"><option>click</option><option>type</option><option>read</option><option>hover</option><option>scroll</option></select></div>
+              <select id="iact"><option>click</option><option>type</option><option>press</option><option>read</option><option>hover</option><option>scroll</option></select></div>
             <div id="iattrWrap" class="hidden"><label>Reads</label>
               <select id="iattr"><option>text</option><option>innerText</option><option>href</option><option>src</option></select></div>
+            <div id="ikeyWrap" class="hidden"><label>Key</label>
+              <select id="ikey"><option>Enter</option><option>Tab</option><option>Escape</option><option>ArrowDown</option><option>ArrowUp</option><option>Space</option></select></div>
           </div>
           <label>Parent element <span style="color:#8b90a0">(auto-detected)</span></label>
           <select id="iparent"><option value="">(none — whole page)</option></select>
@@ -262,43 +226,6 @@
         <span class="msg" id="smsg"></span>
       </div>
 
-      <!-- ============ TAB: CLASSIC (one-shot skill) ============ -->
-      <div id="tab-classic" class="hidden">
-        <div class="hint" id="hint">Click any element on the page to teach it.</div>
-        <div class="sel hidden" id="sel">
-          <div class="preview" id="preview"></div>
-          <div class="row-inline">
-            <div style="flex:1"><label>Name</label><input id="name" placeholder="e.g. like_button" /></div>
-            <button class="btn ghost" id="suggest" title="Suggest name" style="margin:0;width:auto;padding:6px 9px">✨</button>
-          </div>
-          <div class="kinds">
-            <label><input type="radio" name="kind" value="action" checked/> Action</label>
-            <label><input type="radio" name="kind" value="collection"/> Collection</label>
-          </div>
-          <div id="actionRow"><label>Action</label>
-            <select id="act"><option>click</option><option>scroll</option><option>type</option><option>read</option><option>hover</option></select>
-          </div>
-          <div id="collRow" class="hidden">
-            <span class="matches" id="matches"></span>
-            <button class="btn ghost" id="addField" style="margin-top:0">+ Tag a field (click one inside an item)</button>
-            <div class="fields" id="fieldList"></div>
-          </div>
-          <label>Save under URL pattern</label>
-          <input id="pat" value="${defaultPattern}" />
-          <button class="btn ghost" id="test" style="margin-top:8px">🧪 Test on this page</button>
-          <div id="testOut" class="msg" style="white-space:pre-wrap"></div>
-          <button class="btn" id="save">Validate &amp; review</button>
-          <div id="review" class="hidden" style="margin-top:10px">
-            <div id="reviewOut" class="preview" style="max-height:150px"></div>
-            <div style="display:flex;gap:8px">
-              <button class="btn" id="confirmSave" style="margin-top:0">Confirm &amp; Save</button>
-              <button class="btn ghost" id="cancelSave" style="margin-top:0">Cancel</button>
-            </div>
-          </div>
-          <span class="msg" id="msg"></span>
-        </div>
-      </div>
-
     </div>
   </body></html>`;
   document.documentElement.appendChild(frame);
@@ -306,7 +233,7 @@
   // ---- session state ----
   let idoc = null;
   let tab = 'intro';
-  let selectedEl = null, kind = 'action', itemSelector = null, fields = [], capturingField = false, hoverEl = null;
+  let hoverEl = null;
   let ELEMENTS = [];                 // introduced elements for this host
   let elemById = new Map();
   let iSel = null;                   // node selected in the Introduce tab
@@ -416,6 +343,7 @@
     const t = $('#itype').value;
     $('#iactWrap').classList.toggle('hidden', !(t === 'action' || t === 'input'));
     $('#iattrWrap').classList.toggle('hidden', t !== 'field');
+    $('#ikeyWrap').classList.toggle('hidden', !((t === 'action' || t === 'input') && $('#iact').value === 'press'));
     const m = $('#imatches');
     if (t === 'item' && iSel) {
       const r = computeItemSelector(iSel);
@@ -474,17 +402,20 @@
             details: $('#idetails').value.trim(),
             action: (type === 'action' || type === 'input') ? $('#iact').value : null,
             attr: type === 'field' ? $('#iattr').value : null,
+            key: (type === 'action' || type === 'input') && $('#iact').value === 'press' ? $('#ikey').value : null,
             parentId, selectors, sample, sampleHtml,
           }),
         }).then((x) => x.json());
         msg.textContent = r.ok ? `Saved element “${r.element.name}” ✓ — introduce more or compose a skill.` : (r.error || 'Failed.');
       }
       if (r.ok) {
+        const keepMsg = msg.textContent;
         $('#iname').value = ''; $('#idetails').value = ''; $('#irepoint').value = '';
+        toggleRepointLock();
         iSel = null; $('#iform').classList.add('hidden'); $('#ihint').classList.remove('hidden');
         clearOutlines();
         await loadElements();
-        $('#imsg').textContent = msg.textContent; // keep the confirmation visible after re-render
+        $('#imsg').textContent = keepMsg; // keep the confirmation visible after re-render
       }
     } catch { msg.textContent = 'Backend not reachable.'; }
   }
@@ -498,6 +429,20 @@
       if (e) { $('#iname').value = e.name; $('#itype').value = e.type; $('#iroute').value = e.route; $('#idetails').value = e.details || ''; }
       $('#imsg').textContent = 'Repointing replaces the selectors only; name/type/route stay.';
     } else { $('#imsg').textContent = ''; }
+  }
+
+  // AI name suggestion for the element being introduced.
+  async function suggestName() {
+    if (!iSel) return;
+    const msg = $('#imsg');
+    let model = ''; try { model = (await new Promise((r) => chrome.storage.local.get(['ba_model'], (o) => r(o.ba_model)))) || ''; } catch {}
+    if (!model) { msg.textContent = 'No model set (pick one in the popup).'; return; }
+    msg.textContent = 'Thinking…';
+    try {
+      const r = await fetch(`${BACKEND}/skills/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ signature: signatureOf(iSel), model }) }).then((x) => x.json());
+      if (r.ok && r.name) { $('#iname').value = r.name; msg.textContent = ''; }
+      else msg.textContent = r.error || 'No suggestion.';
+    } catch { msg.textContent = 'Suggest failed.'; }
   }
 
   // ---- Compose tab ----
@@ -538,175 +483,16 @@
 
   // ---- page pointer handling ----
   function onMove(e) {
-    if (e.target === frame || tab === 'compose') { hi.style.display = 'none'; return; }
+    if (e.target === frame || tab !== 'intro') { hi.style.display = 'none'; return; }
     hoverEl = e.target;
     const r = e.target.getBoundingClientRect();
     hi.style.display = 'block'; hi.style.left = r.left + 'px'; hi.style.top = r.top + 'px'; hi.style.width = r.width + 'px'; hi.style.height = r.height + 'px';
   }
   function onClick(e) {
     if (e.target === frame) return;      // clicks inside the panel never reach here anyway
-    if (tab === 'compose') return;       // compose only uses the panel
+    if (tab !== 'intro') return;         // only the Introduce tab picks from the page
     e.preventDefault(); e.stopImmediatePropagation();
-    const el = hoverEl || e.target;
-    if (tab === 'intro') { introSelect(el); return; }
-    if (capturingField) { addField(el); return; }
-    selectElement(el);
-  }
-
-  // ---- Classic tab (original one-shot skill flow, unchanged) ----
-  function selectElement(el) {
-    selectedEl = el; fields = []; renderFields();
-    $('#hint').classList.add('hidden'); $('#sel').classList.remove('hidden');
-    const sig = signatureOf(el);
-    $('#preview').textContent = `<${sig.tag}${sig.role ? ` role="${sig.role}"` : ''}${sig.aria ? ` aria-label="${sig.aria}"` : ''}> ${sig.text}`;
-    if (kind === 'collection') refreshItem();
-  }
-  function refreshItem() {
-    if (!selectedEl) return;
-    const r = computeItemSelector(selectedEl); itemSelector = r.selector;
-    $('#matches').textContent = `Matches ${r.count} similar item(s) on the page.`;
-    clearOutlines();
-    try { document.querySelectorAll(itemSelector).forEach((el) => { el.classList.add('__ba_match'); outlined.push(el); }); } catch {}
-  }
-  function addField(el) {
-    capturingField = false; $('#addField').textContent = '+ Tag a field (click one inside an item)';
-    let container = null; try { container = el.closest(itemSelector); } catch {}
-    if (!container) container = el.parentElement;
-    const tag = el.tagName.toLowerCase();
-    let hasImg = false, hasLink = false;
-    try { hasImg = !!(el.querySelector && el.querySelector('img, image')); } catch {}
-    try { hasLink = !!(el.querySelector && el.querySelector('a[href]')); } catch {}
-    const txt = norm(el.textContent);
-    const attr = tag === 'a' ? 'href'
-      : (tag === 'img' || tag === 'image') ? 'src'
-      : (hasImg && !txt) ? 'src'
-      : (hasLink && !txt) ? 'href'   // wrapper over an icon/link with no own text
-      : 'text';
-    fields.push({ name: `field${fields.length + 1}`, attr, rel: relPath(container, el), ariaSel: stableAria(el) || '' });
-    renderFields();
-  }
-  function renderFields() {
-    const box = $('#fieldList'); if (!box) return;
-    box.innerHTML = fields.map((f, i) => `<div class="frow"><input data-i="${i}" class="fname" value="${f.name}" /><select data-i="${i}" class="fattr">${['text', 'innerText', 'href', 'src', 'click'].map((a) => `<option ${a === f.attr ? 'selected' : ''}>${a}</option>`).join('')}</select><button class="del" data-i="${i}">✕</button></div>`).join('');
-    box.querySelectorAll('.fname').forEach((inp) => inp.addEventListener('input', (e) => { fields[+e.target.dataset.i].name = e.target.value; }));
-    box.querySelectorAll('.fattr').forEach((s) => s.addEventListener('change', (e) => { fields[+e.target.dataset.i].attr = e.target.value; }));
-    box.querySelectorAll('.del').forEach((b) => b.addEventListener('click', () => { fields.splice(+b.dataset.i, 1); renderFields(); }));
-  }
-
-  let pendingSkill = null;   // validated skill awaiting the user's confirmation
-
-  function buildBody() {
-    if (!selectedEl) return null;
-    const name = $('#name').value.trim();
-    if (!name) { $('#msg').textContent = 'Name required.'; return null; }
-    const body = { host, urlPattern: $('#pat').value.trim() || defaultPattern, name, kind, sample: signatureOf(selectedEl) };
-    if (kind === 'action') { body.action = $('#act').value; body.selectors = computeSelectors(selectedEl); }
-    else {
-      body.item = { selectors: [{ strategy: 'css', value: itemSelector, score: 60 }] };
-      body.fields = fields.map((f) => ({ name: f.name, attr: f.attr, selectors: [{ strategy: 'css', value: f.rel, score: 50 }, ...(f.ariaSel ? [{ strategy: 'css', value: f.ariaSel, score: 55 }] : [])] }));
-      let sample = null; try { sample = selectedEl.closest(itemSelector) || document.querySelector(itemSelector); } catch {}
-      body.sampleHtml = (sample && sample.outerHTML || '').slice(0, 60000);
-    }
-    return body;
-  }
-
-  // Step 1: validate + clean, then SHOW what changed and ask for confirmation.
-  async function runValidate() {
-    const body = buildBody();
-    if (!body) return;
-    $('#msg').textContent = 'Validating…';
-    let model = ''; try { model = (await new Promise((r) => chrome.storage.local.get(['ba_model'], (o) => r(o.ba_model)))) || ''; } catch {}
-    let skill = body, notes = [];
-    try {
-      const v = await fetch(`${BACKEND}/skills/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, model }) }).then((x) => x.json());
-      if (v.ok && v.skill) { skill = v.skill; notes = v.changes || []; }
-    } catch { $('#msg').textContent = 'Backend not reachable.'; return; }
-    pendingSkill = skill;
-    const lines = skill.kind === 'collection'
-      ? (skill.fields || []).map((f) => `  • ${f.name} [${f.attr}]`).join('\n')
-      : `  action: ${skill.action}`;
-    $('#reviewOut').textContent =
-      (notes.length ? '✦ AI cleaned:\n' + notes.map((n) => '  - ' + n).join('\n') + '\n\n' : '✓ No issues found.\n\n') +
-      `Will save “${skill.name}” (${skill.kind}):\n` + lines;
-    $('#review').classList.remove('hidden');
-    $('#save').classList.add('hidden');
-    $('#msg').textContent = '';
-  }
-
-  // Step 2: user confirmed — persist the validated skill.
-  async function confirmSave() {
-    if (!pendingSkill) return;
-    $('#msg').textContent = 'Saving…';
-    try {
-      const r = await fetch(`${BACKEND}/skills`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pendingSkill) }).then((x) => x.json());
-      if (r.ok) {
-        $('#msg').textContent = `Saved “${pendingSkill.name}” ✓ — keep teaching or exit.`;
-        pendingSkill = null;
-        $('#name').value = ''; selectedEl = null; fields = [];
-        $('#sel').classList.add('hidden'); $('#hint').classList.remove('hidden');
-        $('#review').classList.add('hidden'); $('#save').classList.remove('hidden');
-        $('#reviewOut').textContent = ''; $('#testOut').textContent = '';
-        clearOutlines();
-      } else { $('#msg').textContent = r.error || 'Failed.'; }
-    } catch { $('#msg').textContent = 'Backend not reachable.'; }
-  }
-
-  function cancelSave() {
-    pendingSkill = null;
-    $('#review').classList.add('hidden');
-    $('#save').classList.remove('hidden');
-  }
-  // AI name suggestion (shared by both tabs; writes into the given input).
-  async function suggestName(targetInput, node, applyKind) {
-    if (!node) return;
-    let model = ''; try { model = (await new Promise((r) => chrome.storage.local.get(['ba_model'], (o) => r(o.ba_model)))) || ''; } catch {}
-    const msg = tab === 'intro' ? $('#imsg') : $('#msg');
-    if (!model) { msg.textContent = 'No model set (pick one in the popup).'; return; }
-    msg.textContent = 'Thinking…';
-    try {
-      const r = await fetch(`${BACKEND}/skills/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ signature: signatureOf(node), model }) }).then((x) => x.json());
-      if (r.ok && r.name) {
-        targetInput.value = r.name;
-        if (applyKind && (r.kind === 'action' || r.kind === 'collection')) { kind = r.kind; $(`input[value="${kind}"]`).checked = true; toggleKind(); }
-        msg.textContent = '';
-      } else msg.textContent = r.error || 'No suggestion.';
-    } catch { msg.textContent = 'Suggest failed.'; }
-  }
-  function toggleKind() {
-    $('#actionRow').classList.toggle('hidden', kind !== 'action');
-    $('#collRow').classList.toggle('hidden', kind !== 'collection');
-    if (kind === 'collection' && selectedEl) refreshItem(); else clearOutlines();
-  }
-
-  // Dry-run the in-progress skill against the live page before saving.
-  function testReadField(item, f) {
-    let el = null;
-    try { el = item.querySelector(f.rel); } catch {}
-    if (!el && f.ariaSel) { try { el = item.querySelector(f.ariaSel); } catch {} }
-    if (f.attr === 'click') return el ? '(click target found ✓)' : '(click target NOT found)';
-    if (!el) return '(not found)';
-    if (f.attr === 'href') return hrefOf(el) || '(no link)';
-    if (f.attr === 'src') return imageUrlOf(el) || '(no image url)';
-    if (f.attr === 'innerText') return fullText(el).slice(0, 200) || '(empty)';
-    return norm(el.textContent).slice(0, 60);
-  }
-  function runTest() {
-    const out = $('#testOut');
-    if (!selectedEl) { out.textContent = 'Select an element first.'; return; }
-    if (kind === 'collection') {
-      let items = []; try { items = [...document.querySelectorAll(itemSelector)]; } catch {}
-      if (!items.length) { out.textContent = `⚠ Matches 0 items. Pick a repeating post/row (aim for many matches).`; return; }
-      if (!fields.length) { out.textContent = `Matches ${items.length} items, but you tagged 0 fields. Use “+ Tag a field”.`; return; }
-      const sample = {};
-      for (const f of fields) sample[f.name] = testReadField(items[0], f);
-      const empties = Object.values(sample).filter((v) => !v || v === '(not found)').length;
-      out.textContent = `Matches ${items.length} items.\nSample (1st item):\n` +
-        Object.entries(sample).map(([k, v]) => `  ${k}: ${v || '—'}`).join('\n') +
-        (empties ? `\n⚠ ${empties} field(s) empty — re-tag them inside a post.` : '\n✓ looks good.');
-    } else {
-      const el = document.querySelector((computeSelectors(selectedEl)[0] || {}).value || '*');
-      out.textContent = el ? `✓ Found. Text: "${norm(el.textContent).slice(0, 60)}"` : '⚠ Not found with the top selector.';
-    }
+    introSelect(hoverEl || e.target);
   }
 
   function teardown() {
@@ -747,7 +533,6 @@
     idoc.querySelectorAll('.tab').forEach((b) => b.classList.toggle('on', b.getAttribute('data-tab') === next));
     $('#tab-intro').classList.toggle('hidden', next !== 'intro');
     $('#tab-compose').classList.toggle('hidden', next !== 'compose');
-    $('#tab-classic').classList.toggle('hidden', next !== 'classic');
     if (next === 'compose') renderCompose();
     if (next === 'intro') renderElemList();
   }
@@ -759,23 +544,15 @@
 
     // Introduce tab
     $('#itype').addEventListener('change', toggleIntroType);
+    $('#iact').addEventListener('change', toggleIntroType);
     $('#irepoint').addEventListener('change', toggleRepointLock);
     $('#isave').addEventListener('click', saveElement);
-    $('#isuggest').addEventListener('click', () => suggestName($('#iname'), iSel, false));
+    $('#isuggest').addEventListener('click', suggestName);
 
     // Compose tab
     $('#ssave').addEventListener('click', saveSkill);
 
-    // Classic tab
-    idoc.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener('change', (e) => { kind = e.target.value; toggleKind(); }));
-    $('#addField').addEventListener('click', () => { capturingField = !capturingField; $('#addField').textContent = capturingField ? 'Now click the field element…' : '+ Tag a field (click one inside an item)'; });
-    $('#save').addEventListener('click', runValidate);
-    $('#confirmSave').addEventListener('click', confirmSave);
-    $('#cancelSave').addEventListener('click', cancelSave);
-    $('#test').addEventListener('click', runTest);
-    $('#suggest').addEventListener('click', () => suggestName($('#name'), selectedEl, true));
     $('.x').addEventListener('click', teardown);
-
     document.addEventListener('mousemove', onMove, true);
     document.addEventListener('click', onClick, true);
     loadElements();

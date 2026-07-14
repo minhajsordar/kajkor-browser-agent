@@ -21,6 +21,8 @@ const els = {
   skillSelect: $('skillSelect'),
   skillBtn: $('skillBtn'),
   manageSkills2: $('manageSkills2'),
+  promptSelect: $('promptSelect'),
+  managePrompts: $('managePrompts'),
   learnBtn: $('learnBtn'),
   model: $('model'),
   modelRefresh: $('modelRefresh'),
@@ -32,6 +34,10 @@ const els = {
   sessSteps: $('sessSteps'),
   sessMode: $('sessMode'),
   log: $('log'),
+  question: $('question'),
+  questionText: $('questionText'),
+  qYes: $('qYes'),
+  qNo: $('qNo'),
   backBtn: $('backBtn'),
   continueBtn: $('continueBtn'),
   stopBtn: $('stopBtn'),
@@ -43,7 +49,7 @@ const els = {
 const KEYS = { recent: 'ba_recent', model: 'ba_model' };
 const MAX_RECENT = 5;
 const TERMINAL = new Set(['done', 'error', 'stopped']);
-const BADGE = { planning: 'waiting', running: 'running', checking: 'waiting', done: 'done', error: 'error', stopped: 'stopped' };
+const BADGE = { planning: 'waiting', running: 'running', checking: 'waiting', waiting: 'waiting', done: 'done', error: 'error', stopped: 'stopped' };
 
 let viewTaskId = null;      // task currently shown in the session view (or null on home)
 let sessionPoll = null;     // polls the viewed task
@@ -173,13 +179,17 @@ function selectedSchemaIds() {
 
 async function loadSkills() {
   let skills = [];
-  try { skills = (await api('/skills')).skills || []; } catch {}
-  const coll = skills.filter((s) => s.kind === 'collection');
-  if (!coll.length) {
-    els.skillSelect.innerHTML = '<span class="msd-empty">No collection skills yet — teach one with “Start learning session”.</span>';
+  // resolve=1 hydrates v2 skills (element refs) so their kind/fields/steps are
+  // known — without it v2 skills have kind:null and never showed up here.
+  try { skills = (await api('/skills?resolve=1')).skills || []; } catch {}
+  if (!skills.length) {
+    els.skillSelect.innerHTML = '<span class="msd-empty">No skills yet — teach one with “Start learning session”.</span>';
   } else {
-    els.skillSelect.innerHTML = coll.map((s) =>
-      `<label class="msd-opt" data-name="${escapeHtml(s.name)}"><input type="checkbox" value="${escapeHtml(s.skillId)}"/> ${escapeHtml(s.name)} <span class="mut">(${(s.fields || []).length}f)</span></label>`
+    const tag = (s) => s.kind === 'collection' ? `${(s.fields || []).length} fields`
+      : (Array.isArray(s.steps) && s.steps.length > 1) ? `${s.steps.length}-step workflow`
+      : (s.action || 'action');
+    els.skillSelect.innerHTML = skills.map((s) =>
+      `<label class="msd-opt" data-name="${escapeHtml(s.name)}"><input type="checkbox" value="${escapeHtml(s.skillId)}"/> ${escapeHtml(s.name)} <span class="mut">(${escapeHtml(tag(s))})</span></label>`
     ).join('');
   }
   updateMsdLabel(els.skillSelect, els.skillBtn);
@@ -187,6 +197,13 @@ async function loadSkills() {
 
 function selectedSkillIds() {
   return [...els.skillSelect.querySelectorAll('input[type=checkbox]:checked')].map((c) => c.value);
+}
+
+async function loadPrompts() {
+  let prompts = [];
+  try { prompts = (await api('/prompts')).prompts || []; } catch {}
+  els.promptSelect.innerHTML = '<option value="">None</option>' +
+    prompts.map((p) => `<option value="${escapeHtml(p.promptId)}">${escapeHtml(p.name)}</option>`).join('');
 }
 
 // --- views -----------------------------------------------------------------
@@ -277,9 +294,22 @@ function renderTask(t) {
 
   renderLog(t.events || []);
 
+  // Pending ask_user confirmation — show Approve / Decline.
+  const q = t.pendingQuestion && !t.pendingQuestion.answer ? t.pendingQuestion : null;
+  els.question.classList.toggle('hidden', !q);
+  if (q) els.questionText.textContent = q.question;
+
   const terminal = TERMINAL.has(t.status);
   els.stopBtn.disabled = terminal;
   els.continueBtn.disabled = !terminal;
+}
+
+async function answerQuestion(answer) {
+  if (!viewTaskId) return;
+  els.qYes.disabled = els.qNo.disabled = true;
+  try { await api(`/tasks/${viewTaskId}/answer`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer }) }); } catch {}
+  els.qYes.disabled = els.qNo.disabled = false;
+  els.question.classList.add('hidden');
 }
 
 function renderLog(events) {
@@ -327,7 +357,7 @@ async function startTask() {
   try {
     created = await api('/tasks', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ goal, model, mode, schemas: selectedSchemaIds(), useSkills: selectedSkillIds() }),
+      body: JSON.stringify({ goal, model, mode, schemas: selectedSchemaIds(), useSkills: selectedSkillIds(), promptId: els.promptSelect.value || undefined }),
     });
   } catch {
     setModelHint('Backend not reachable — start it in /backend.');
@@ -358,6 +388,8 @@ function continueTask() {
 // --- wiring ----------------------------------------------------------------
 
 els.sendBtn.addEventListener('click', startTask);
+els.qYes.addEventListener('click', () => answerQuestion('yes'));
+els.qNo.addEventListener('click', () => answerQuestion('no'));
 els.backBtn.addEventListener('click', showComposer);
 els.stopBtn.addEventListener('click', stopTask);
 els.continueBtn.addEventListener('click', continueTask);
@@ -371,6 +403,7 @@ els.dashLink.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.
 els.manageSchemas.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('schemas/schemas.html') }); });
 els.skillsLink.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('skills/skills.html') }); });
 els.manageSkills2.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('skills/skills.html') }); });
+els.managePrompts.addEventListener('click', (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('skills/skills.html') }); });
 setupMsd(els.schemaSelect, els.schemaBtn);
 setupMsd(els.skillSelect, els.skillBtn);
 els.learnBtn.addEventListener('click', async () => {
@@ -382,6 +415,6 @@ els.learnBtn.addEventListener('click', async () => {
 // --- boot ------------------------------------------------------------------
 
 (async function boot() {
-  await Promise.all([loadModels(), loadSchemas(), loadSkills()]);
+  await Promise.all([loadModels(), loadSchemas(), loadSkills(), loadPrompts()]);
   showComposer(); // always land on home; live tasks are listed and clickable
 })();

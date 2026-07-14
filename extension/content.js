@@ -1016,6 +1016,21 @@ async function collectText(selector, target = 20, delay = 1200, maxScrolls = 200
   return records.slice(0, target);
 }
 
+// RETRY RULE (see CLAUDE.md): every tool that locates a page element MUST
+// resolve it through this helper — exponential backoff 1s, 2s, 4s, 8s (4
+// retries). Stepped forms/dialogs render late, so a first miss is not a
+// failure. Only lookups are retried: nothing has been acted on while the
+// element is missing, so retrying is always safe. NEW TOOLS: never call
+// findTarget/findField/resolveOne bare.
+async function withBackoff(find, retries = 4) {
+  let el = find();
+  for (let i = 0; i < retries && !el; i++) {
+    await sleep(1000 * Math.pow(2, i));
+    el = find();
+  }
+  return el;
+}
+
 // Find an element by CSS selector, else the first VISIBLE clickable whose text
 // (or aria-label) contains `text`. Used by the click/hover tools.
 function findTarget(selector, text) {
@@ -1042,7 +1057,7 @@ function findTarget(selector, text) {
 }
 
 async function clickElement(selector, text) {
-  const el = findTarget(selector, text);
+  const el = await withBackoff(() => findTarget(selector, text));
   if (!el) return { ok: false, error: `no element for ${selector || text}` };
   try { el.scrollIntoView({ block: 'center' }); } catch {}
   await sleep(120);
@@ -1051,7 +1066,7 @@ async function clickElement(selector, text) {
 }
 
 async function hoverElement(selector, text) {
-  const el = findTarget(selector, text);
+  const el = await withBackoff(() => findTarget(selector, text));
   if (!el) return { ok: false, error: `no element for ${selector || text}` };
   try { el.scrollIntoView({ block: 'center' }); } catch {}
   await sleep(120);
@@ -1089,7 +1104,7 @@ function findField(selector, text) {
 // method at a time, verifying between attempts — inserting and then also
 // dispatching a synthetic input event makes Lexical insert the text TWICE.
 async function typeInto(selector, text, value) {
-  const el = findField(selector, text);
+  const el = await withBackoff(() => findField(selector, text));
   if (!el) return { ok: false, error: 'no editable field found' };
   try { el.scrollIntoView({ block: 'center' }); } catch {}
   el.focus();
@@ -1111,14 +1126,49 @@ async function typeInto(selector, text, value) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+// --- key pressing ------------------------------------------------------------
+// Dispatch a real key sequence (keydown → keypress → keyup) on an element —
+// for fields that submit on Enter and have no button. Synthetic events don't
+// trigger the browser's native form submit, so if no page handler consumed the
+// Enter (dispatchEvent returned true) and the field sits in a <form>, submit it
+// explicitly. If a handler DID consume it, we must not also submit (double-post).
+const KEY_CODES = { Enter: 13, Tab: 9, Escape: 27, ' ': 32, Space: 32, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, PageUp: 33, PageDown: 34, Home: 36, End: 35, Backspace: 8, Delete: 46 };
+function pressKeyOn(el, key = 'Enter') {
+  const k = key === 'Space' ? ' ' : key;
+  const keyCode = KEY_CODES[key] || (k.length === 1 ? k.toUpperCase().charCodeAt(0) : 0);
+  const code = k === ' ' ? 'Space' : (k.length === 1 ? 'Key' + k.toUpperCase() : key);
+  const opts = { key: k, code, keyCode, which: keyCode, bubbles: true, cancelable: true, view: window };
+  try { el.focus(); } catch {}
+  const unhandled = el.dispatchEvent(new KeyboardEvent('keydown', opts));
+  el.dispatchEvent(new KeyboardEvent('keypress', opts));
+  el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  if (k === 'Enter' && unhandled && el.form && typeof el.form.requestSubmit === 'function') {
+    try { el.form.requestSubmit(); } catch {}
+  }
+}
+
+// press_key tool: press a key on a field found by selector/label — or on the
+// currently focused element when no target is given (e.g. right after typing).
+async function pressKey(selector, text, key = 'Enter') {
+  let el = null;
+  if (selector || text) el = await withBackoff(() => findField(selector, text) || findTarget(selector, text));
+  if (!el && document.activeElement && document.activeElement !== document.body) el = document.activeElement;
+  if (!el) return { ok: false, error: 'no element to press key on (no field found)' };
+  try { el.scrollIntoView({ block: 'center' }); } catch {}
+  await sleep(100);
+  pressKeyOn(el, key);
+  return { ok: true, key, matched: norm(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.tagName).slice(0, 50) };
+}
+
 // Perform a single-element skill's action.
 async function useSkill(skill) {
-  const el = resolveOne(document, skill.selectors);
+  const el = await withBackoff(() => resolveOne(document, skill.selectors));
   if (!el) return { ok: false, error: 'element not found for skill ' + skill.name };
   const act = skill.action || 'click';
   try {
     if (act === 'click') el.click();
     else if (act === 'hover') el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    else if (act === 'press') pressKeyOn(el, skill.key || 'Enter');
     else if (act === 'scroll') { if (el.scrollHeight > el.clientHeight + 4) el.scrollTop += Math.round(el.clientHeight * 0.8); else el.scrollIntoView({ block: 'center' }); }
     else if (act === 'read') return { ok: true, value: norm(el.textContent) };
   } catch (e) { return { ok: false, error: e.message }; }
@@ -1129,7 +1179,7 @@ async function useSkill(skill) {
 // perform its action. "type" inserts the provided value (composer-safe via
 // insertIntoLexical for contenteditables).
 async function runStep(step, value) {
-  const el = resolveOne(document, step.selectors);
+  const el = await withBackoff(() => resolveOne(document, step.selectors));
   if (!el) return { ok: false, error: 'element not found for step ' + (step.name || '?') };
   try { el.scrollIntoView({ block: 'center' }); } catch {}
   await sleep(150);
@@ -1137,6 +1187,7 @@ async function runStep(step, value) {
   try {
     if (act === 'click') el.click();
     else if (act === 'hover') { for (const t of ['pointerover', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); }
+    else if (act === 'press') pressKeyOn(el, step.key || 'Enter');
     else if (act === 'scroll') { if (el.scrollHeight > el.clientHeight + 4) el.scrollTop += Math.round(el.clientHeight * 0.8); else el.scrollIntoView({ block: 'center' }); }
     else if (act === 'read') return { ok: true, value: norm(el.textContent) };
     else if (act === 'type') {
@@ -1216,6 +1267,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(await hoverElement(msg.selector, msg.text));
       } else if (msg?.type === 'TYPE_TEXT') {
         sendResponse(await typeInto(msg.selector, msg.text, msg.value));
+      } else if (msg?.type === 'PRESS_KEY') {
+        sendResponse(await pressKey(msg.selector, msg.text, msg.key || 'Enter'));
+      } else if (msg?.type === 'WAIT_FOR') {
+        // Poll until the element appears (clickables, fields, or any matching
+        // node), up to `timeout` ms. Phrased so a timeout is NOT auto-retried
+        // by the phase loop — this tool already IS the wait.
+        {
+          const deadline = Date.now() + Math.min(Number(msg.timeout) || 30000, 120000);
+          let el = null;
+          while (!el && Date.now() < deadline) {
+            el = findTarget(msg.selector, msg.text) || findField(msg.selector, msg.text);
+            if (!el) await sleep(500);
+          }
+          sendResponse(el
+            ? { ok: true, matched: norm(el.getAttribute && (el.getAttribute('aria-label') || el.innerText || el.textContent) || el.tagName).slice(0, 60) }
+            : { ok: false, error: `wait timeout: "${msg.selector || msg.text}" did not appear` });
+        }
       } else if (msg?.type === 'EXTRACT_PAGE_INFO') {
         // Give lazy content a moment to render.
         await sleep(msg.wait || 1500);

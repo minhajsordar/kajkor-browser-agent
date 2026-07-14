@@ -1,6 +1,7 @@
 # Skill creation redesign — Elements + Skills (two-step)
 
-Status: PLANNED (not yet implemented)
+Status: phases 1–4 IMPLEMENTED (2026-07-14). Phase 5 (self-healing) deferred.
+Migration is opt-in: `node backend/migrate-skills-v2.js --apply` (dry run without the flag).
 Owner idea: TODO.md (two-step skill creation)
 
 ## Problem with the current design

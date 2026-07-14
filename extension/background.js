@@ -401,6 +401,75 @@ async function runTool(base, taskId, phase) {
     return;
   }
 
+  if (phase.tool === 'wait') {
+    const t = await getTask(base, taskId);
+    if (p.selector || p.text) {
+      const tabId = await currentTab(taskId);
+      const res = await msgTab(tabId, { type: 'WAIT_FOR', selector: p.selector || '', text: p.text || '', timeout: (Number(p.seconds) || 30) * 1000 });
+      const okMsg = res && res.ok ? `Waited — "${res.matched}" appeared.` : `wait failed: ${(res && res.error) || 'timeout'}`;
+      await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
+      if (res && !res.ok) throw new Error(okMsg);
+    } else {
+      const secs = Math.min(Number(p.seconds) || 3, 300);
+      await taskEvent(base, taskId, 'obs', `Waiting ${secs}s…`);
+      await new Promise((r) => setTimeout(r, secs * 1000));
+    }
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    return;
+  }
+
+  if (phase.tool === 'screenshot') {
+    const tabId = await currentTab(taskId);
+    const tab = await chrome.tabs.get(tabId);
+    // captureVisibleTab shoots the ACTIVE tab of the window — focus ours first.
+    await chrome.tabs.update(tabId, { active: true });
+    await new Promise((r) => setTimeout(r, 400));
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
+    if (!dataUrl) throw new Error('screenshot failed: nothing captured');
+    await jf(`${base}/tasks/${taskId}/screenshot`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dataUrl, url: tab.url || '' }),
+    });
+    const t = await getTask(base, taskId);
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    await taskEvent(base, taskId, 'ok', 'Screenshot captured — view it in the dashboard.');
+    return;
+  }
+
+  if (phase.tool === 'ask_user') {
+    const t0 = await getTask(base, taskId);
+    const question = p.question || 'Continue with the next step?';
+    await patchTask(base, taskId, { pendingQuestion: { question, askedAt: new Date().toISOString() }, status: 'waiting' });
+    await taskEvent(base, taskId, 'think', `⏸ Waiting for your confirmation: ${question}`);
+    // Poll until answered (popup/dashboard call POST /tasks/:id/answer).
+    const deadline = Date.now() + 10 * 60 * 1000; // 10 minutes
+    let answer = null;
+    while (Date.now() < deadline) {
+      if (!AGENT[taskId]?.running) return;
+      await new Promise((r) => setTimeout(r, 2000));
+      const t = await getTask(base, taskId);
+      if (t?.pendingQuestion?.answer) { answer = t.pendingQuestion.answer; break; }
+      if (t && ['stopped', 'error'].includes(t.status)) return;
+    }
+    await patchTask(base, taskId, { pendingQuestion: null, status: 'running', actions: (t0?.actions || 0) + 1 });
+    if (!answer) throw new Error('ask_user timed out — no answer within 10 minutes');
+    if (/^(no|n|cancel|stop|decline)/i.test(answer)) throw new Error('User declined the confirmation');
+    await taskEvent(base, taskId, 'ok', `Confirmed (“${answer}”) — continuing.`);
+    return;
+  }
+
+  if (phase.tool === 'press_key') {
+    const tabId = await currentTab(taskId);
+    const key = p.key || 'Enter';
+    const res = await msgTab(tabId, { type: 'PRESS_KEY', selector: p.selector || '', text: p.text || '', key });
+    const t = await getTask(base, taskId);
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    const okMsg = res && res.ok ? `Pressed ${key} on ${res.matched || 'field'}` : `press_key failed: ${(res && res.error) || 'no field'}`;
+    await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
+    if (res && !res.ok) throw new Error(okMsg);
+    return;
+  }
+
   if (phase.tool === 'type') {
     const tabId = await currentTab(taskId);
     const t = await getTask(base, taskId);
@@ -700,13 +769,35 @@ async function executeLoop(base, taskId) {
       }
       const phase = task.plan.phases[i];
       await taskEvent(base, taskId, 'act', `Phase ${i + 1}/${task.plan.phases.length}: ${phase.tool}`);
-      try {
-        await runTool(base, taskId, phase);
-      } catch (e) {
-        await taskError(base, taskId, phase.tool, e?.message || String(e));
+      // Transient failures (element/dialog not rendered yet, content script not
+      // attached) retry with exponential backoff — 1s, 2s, 4s, 8s — before the
+      // task is failed. These errors mean NOTHING happened, so retrying is safe.
+      const TRANSIENT = /not found|no element|no editable field|no field|did not open|Receiving end|Could not establish|scan failed|No page to act on/i;
+      let lastErr = null;
+      for (let attempt = 0; attempt <= 4; attempt++) {
+        if (attempt) {
+          const wait = 1000 * Math.pow(2, attempt - 1);
+          await taskEvent(base, taskId, 'think', `Element not ready — retry ${attempt}/4 for ${phase.tool} in ${wait / 1000}s…`);
+          await new Promise((r) => setTimeout(r, wait));
+        }
+        if (!AGENT[taskId]?.running) { lastErr = null; break; }
+        try { await runTool(base, taskId, phase); lastErr = null; break; }
+        catch (e) {
+          lastErr = e;
+          if (!TRANSIENT.test(e?.message || '')) break; // real failure — don't retry blindly
+        }
+      }
+      if (lastErr) {
+        // A declined confirmation is a clean stop, not a failure.
+        if (/User declined/i.test(lastErr?.message || '')) {
+          await patchTask(base, taskId, { status: 'stopped', finishedAt: new Date().toISOString() });
+          await taskEvent(base, taskId, 'err', 'Stopped — you declined the confirmation.');
+          return;
+        }
+        await taskError(base, taskId, phase.tool, lastErr?.message || String(lastErr));
         await patchTask(base, taskId, { status: 'error' });
-        await taskEvent(base, taskId, 'err', `${phase.tool} failed: ${e?.message || e}`);
-        return; // stop on any error, per design
+        await taskEvent(base, taskId, 'err', `${phase.tool} failed: ${lastErr?.message || lastErr}`);
+        return; // stop on unrecoverable error, per design
       }
       await patchTask(base, taskId, { currentPhaseIndex: i + 1 });
     }
@@ -778,7 +869,7 @@ async function resumeUnfinished(base = BACKEND_URL) {
   try {
     const j = await jf(`${base}/tasks`);
     for (const t of (j?.tasks || [])) {
-      if (['running', 'checking', 'planning'].includes(t.status)) {
+      if (['running', 'checking', 'planning', 'waiting'].includes(t.status)) {
         active++;
         if (!AGENT[t.taskId]?.running) runAgentTask(t.taskId); // orphaned -> revive
       }

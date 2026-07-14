@@ -103,6 +103,15 @@ table.kv .dk { color: var(--mut); width: 160px; font-weight: 600; }
 .imgcell img { width: 46px; height: 46px; object-fit: cover; border-radius: 7px; border: 1px solid var(--line); background: var(--panel2); }
 .linkcell { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; }
 .linkcell a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- ask_user confirmation bar --- */
+.qbar { display: flex; align-items: center; gap: 10px; border-color: var(--amber) !important; }
+.qbar .q-text { flex: 1; font-weight: 600; }
+
+/* --- screenshots --- */
+.shot { display: inline-block; margin: 6px 10px 6px 0; vertical-align: top; }
+.shot img { max-width: 320px; max-height: 200px; border: 1px solid var(--line); border-radius: 8px; display: block; }
+.shot figcaption { font-size: 11px; margin-top: 3px; }
 .copybtn { flex-shrink: 0; padding: 2px 6px; font-size: 12px; line-height: 1; color: var(--mut); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
 .copybtn:hover { border-color: var(--accent); color: var(--accent); }
 .copybtn.ok { color: var(--green); border-color: var(--green); }

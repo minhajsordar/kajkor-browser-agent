@@ -14,21 +14,27 @@ const api = (path, opts) => fetch(`${BACKEND_URL}${path}`, opts).then((r) => r.j
 
 let SKILLS = [];
 let ELEMENTS = [];
+let PROMPTS = [];
 let COLLECTIONS = [];   // legacy collection skills, for the clone-target dropdown
 let HEALTH = {};        // elementId -> match count from the last live check
 const elemById = () => new Map(ELEMENTS.map((e) => [e.elementId, e]));
 
 async function load() {
   try {
-    const [sk, el] = await Promise.all([api('/skills'), api('/elements').catch(() => ({ elements: [] }))]);
+    const [sk, el, pr] = await Promise.all([
+      api('/skills'),
+      api('/elements').catch(() => ({ elements: [] })),
+      api('/prompts').catch(() => ({ prompts: [] })),
+    ]);
     SKILLS = sk.skills || [];
     ELEMENTS = el.elements || [];
-    $('#conn').textContent = `${SKILLS.length} skills · ${ELEMENTS.length} elements`;
+    PROMPTS = pr.prompts || [];
+    $('#conn').textContent = `${SKILLS.length} skills · ${ELEMENTS.length} elements · ${PROMPTS.length} prompts`;
     $('#conn').style.color = 'var(--mut)';
   } catch {
     $('#conn').textContent = 'Backend offline';
     $('#conn').style.color = 'var(--red)';
-    SKILLS = []; ELEMENTS = [];
+    SKILLS = []; ELEMENTS = []; PROMPTS = [];
   }
   render();
 }
@@ -46,8 +52,52 @@ function filteredElements() {
 
 function render() {
   COLLECTIONS = SKILLS.filter((s) => s.kind === 'collection' && !isV2(s));
+  renderPrompts();
   renderElements();
   renderSkills();
+}
+
+// ========================== SYSTEM PROMPTS panel =============================
+// Standing instructions attachable to tasks. A prompt bundles skills — picking
+// the prompt in the popup selects those skills too.
+
+function renderPrompts() {
+  const box = $('#prompts');
+  if (!PROMPTS.length) { box.innerHTML = '<div class="empty">No system prompts yet — click “＋ New prompt”.</div>'; return; }
+  box.innerHTML = PROMPTS.map((p) => `
+    <div class="card prompt-card" data-id="${esc(p.promptId)}">
+      <div class="row">
+        <input class="input pname" value="${esc(p.name)}" placeholder="Prompt name" />
+        <button class="btn xs save-prompt">Save</button>
+        <button class="btn xs danger del-prompt">Delete</button>
+      </div>
+      <label class="pat-lbl">Instructions (sent to the planner with every task using this prompt)</label>
+      <textarea class="pcontent" rows="4" placeholder="e.g. Always work on facebook.com. Prefer the collect_feed_posts skill. Never open new tabs.">${esc(p.content || '')}</textarea>
+      <label class="pat-lbl">Bundled skills (auto-selected when this prompt is used)</label>
+      <div class="pskills">
+        ${SKILLS.map((s) => `<label class="pskill"><input type="checkbox" value="${esc(s.skillId)}" ${(p.skillIds || []).includes(s.skillId) ? 'checked' : ''}/> ${esc(s.name)}</label>`).join('') || '<span class="mut">No skills yet.</span>'}
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('.save-prompt').forEach((b) => b.addEventListener('click', () => savePrompt(b.closest('.prompt-card'))));
+  box.querySelectorAll('.del-prompt').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Delete this system prompt?')) return;
+    await api(`/prompts/${b.closest('.prompt-card').getAttribute('data-id')}`, { method: 'DELETE' });
+    load();
+  }));
+}
+
+async function savePrompt(card) {
+  const id = card.getAttribute('data-id');
+  const patch = {
+    name: card.querySelector('.pname').value.trim() || 'Untitled prompt',
+    content: card.querySelector('.pcontent').value,
+    skillIds: [...card.querySelectorAll('.pskills input:checked')].map((c) => c.value),
+  };
+  const btn = card.querySelector('.save-prompt');
+  btn.textContent = 'Saving…';
+  await api(`/prompts/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+  btn.textContent = 'Saved ✓';
+  setTimeout(load, 500);
 }
 
 // ============================ ELEMENTS panel =================================
@@ -65,7 +115,7 @@ function elementCard(e) {
   const extra = (e.type === 'field')
     ? `<select class="eattr">${['text', 'innerText', 'href', 'src'].map((a) => `<option ${a === e.attr ? 'selected' : ''}>${a}</option>`).join('')}</select>`
     : (e.type === 'action' || e.type === 'input')
-      ? `<select class="eact">${['click', 'type', 'read', 'hover', 'scroll'].map((a) => `<option ${a === e.action ? 'selected' : ''}>${a}</option>`).join('')}</select>`
+      ? `<select class="eact">${['click', 'type', 'press', 'read', 'hover', 'scroll'].map((a) => `<option ${a === e.action ? 'selected' : ''}>${a}</option>`).join('')}</select>`
       : '';
   return `
     <div class="card el-card" data-id="${esc(e.elementId)}">
@@ -307,7 +357,7 @@ function skillCard(s) {
       <button class="btn xs addfield">+ Add field</button>`
     : `
       <label class="pat-lbl">Action</label>
-      <select class="act">${['click', 'scroll', 'type', 'read', 'hover'].map((a) => `<option ${a === s.action ? 'selected' : ''}>${a}</option>`).join('')}</select>
+      <select class="act">${['click', 'scroll', 'type', 'press', 'read', 'hover'].map((a) => `<option ${a === s.action ? 'selected' : ''}>${a}</option>`).join('')}</select>
       <div class="sel mut">${(s.selectors || []).slice(0, 2).map((x) => `<code>${esc(x.strategy === 'css' ? x.value : x.strategy + ':' + (x.text || x.role || ''))}</code>`).join(' · ')}</div>`;
   return `
     <div class="card" data-id="${esc(s.skillId)}">
@@ -330,4 +380,8 @@ function skillCard(s) {
 }
 
 $('#search').addEventListener('input', render);
+$('#newPrompt').addEventListener('click', async () => {
+  await api('/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'New prompt', content: '', skillIds: [] }) });
+  load();
+});
 load();

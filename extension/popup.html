@@ -35,6 +35,16 @@
 
       <div class="schema-pick">
         <div class="schema-head">
+          <span>System prompt <span class="mut">(optional)</span></span>
+          <a id="managePrompts" href="#">Manage prompts</a>
+        </div>
+        <select id="promptSelect" class="msd-btn">
+          <option value="">None</option>
+        </select>
+      </div>
+
+      <div class="schema-pick">
+        <div class="schema-head">
           <span>Use learned skill <span class="mut">(optional)</span></span>
           <a id="manageSkills2" href="#">Manage skills</a>
         </div>
@@ -90,6 +100,14 @@
       </div>
 
       <div id="log" class="log" aria-live="polite"></div>
+
+      <div id="question" class="question hidden">
+        <div id="questionText" class="q-text"></div>
+        <div class="q-actions">
+          <button id="qYes" class="btn sm primary">✔ Approve</button>
+          <button id="qNo" class="btn sm warn">✘ Decline</button>
+        </div>
+      </div>
 
       <div class="sess-controls">
         <button id="backBtn" class="btn sm">← Tasks</button>

@@ -6,7 +6,7 @@
 const BACKEND_URL = 'http://localhost:4000';
 const $ = (s) => document.querySelector(s);
 
-const BADGE = { planning: 'waiting', running: 'running', checking: 'waiting', done: 'done', error: 'error', stopped: 'stopped' };
+const BADGE = { planning: 'waiting', running: 'running', checking: 'waiting', waiting: 'waiting', done: 'done', error: 'error', stopped: 'stopped' };
 const TERMINAL = new Set(['done', 'error', 'stopped']);
 
 let TASKS = [];
@@ -173,8 +173,15 @@ function buildPreview(t) {
           </div>
         </div>
         <span id="pBadge"></span>
+        <button id="rerunBtn" class="btn sm" title="Run this task again — same plan, data accumulates in the same schema">⟳ Run again</button>
         <button id="deleteBtn" class="btn sm danger">Delete</button>
       </div>
+    </div>
+
+    <div class="card qbar" id="qBar" style="display:none">
+      <span id="qText" class="q-text"></span>
+      <button id="qApprove" class="btn sm">✔ Approve</button>
+      <button id="qDecline" class="btn sm danger">✘ Decline</button>
     </div>
 
     <div class="card">
@@ -193,6 +200,15 @@ function buildPreview(t) {
     </div>
 
     ${dataCard}
+
+    <div class="card" id="shotsCard">
+      <div class="data-head">
+        <p class="section-title">Screenshots</p>
+        <span class="grow"></span>
+        <button id="shotsToggle" class="btn sm">Load</button>
+      </div>
+      <div id="shotsData"><span class="mut">Captured by the screenshot tool. Click Load.</span></div>
+    </div>
 
     <div class="card" id="debugCard">
       <div class="data-head">
@@ -213,7 +229,45 @@ function buildPreview(t) {
     if (useSchema) loadSchemaData(cur); else renderGenericTable(cur);
   });
   $('#deleteBtn').addEventListener('click', () => deleteTask(t.taskId));
+  $('#rerunBtn').addEventListener('click', () => rerunTask(t.taskId));
   $('#debugToggle').addEventListener('click', () => loadDebugItems(t.taskId));
+  $('#shotsToggle').addEventListener('click', () => loadShots(t.taskId));
+  $('#qApprove').addEventListener('click', () => answerQuestion(t.taskId, 'yes'));
+  $('#qDecline').addEventListener('click', () => answerQuestion(t.taskId, 'no'));
+}
+
+async function answerQuestion(taskId, answer) {
+  try { await api(`/tasks/${taskId}/answer`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer }) }); } catch {}
+  $('#qBar').style.display = 'none';
+  loadTasks();
+}
+
+async function loadShots(taskId) {
+  const el = $('#shotsData');
+  el.innerHTML = '<span class="mut">Loading…</span>';
+  let shots = [];
+  try { shots = (await api(`/tasks/${taskId}/screenshots`)).shots || []; } catch { el.innerHTML = '<span class="err-txt">Failed to load.</span>'; return; }
+  if (!shots.length) { el.innerHTML = '<span class="mut">No screenshots — add a screenshot phase or ask the agent to capture one.</span>'; return; }
+  el.innerHTML = shots.map((s) => `
+    <figure class="shot">
+      <a href="${esc(s.dataUrl)}" target="_blank" title="Open full size"><img src="${esc(s.dataUrl)}" alt="screenshot" /></a>
+      <figcaption class="mut">${timeOf(s.at)}${s.url ? ' · ' + esc(s.url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60)) : ''}</figcaption>
+    </figure>`).join('');
+}
+
+// Re-run a task. Empty extra instruction = clone with the SAME proven plan (no
+// replanning); non-empty = the goal changed, so the new run replans.
+async function rerunTask(id) {
+  const extra = prompt('Optional additional instruction for this run.\nLeave empty to repeat the task exactly (reuses its plan):', '');
+  if (extra === null) return; // cancelled
+  const j = await api(`/tasks/${id}/rerun`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ extra: extra.trim() }),
+  }).catch(() => null);
+  if (!j || !j.ok) { alert((j && j.error) || 'Re-run failed — is the backend running?'); return; }
+  try { chrome.runtime.sendMessage({ type: 'START_AGENT_TASK', taskId: j.task.taskId }); } catch {}
+  await loadTasks();
+  selectTask(j.task.taskId);
 }
 
 const setText = (sel, txt) => { const el = $(sel); if (el && el.textContent !== txt) el.textContent = txt; };
@@ -229,6 +283,8 @@ function updatePreview(t) {
     const badge = $('#pBadge');
     badge.className = badgeClass(t.status);
     badge.textContent = t.status;
+    const rb = $('#rerunBtn');
+    if (rb) rb.disabled = !TERMINAL.has(t.status); // re-run finished tasks only
     scheduleRefresh(t); // stops the poll once the task reaches a terminal state
   }
 
@@ -253,6 +309,11 @@ function updatePreview(t) {
     ui.events = evs.length;
     if (atBottom) ul.scrollTop = ul.scrollHeight;
   }
+
+  // Pending ask_user confirmation bar.
+  const q = t.pendingQuestion && !t.pendingQuestion.answer ? t.pendingQuestion : null;
+  $('#qBar').style.display = q ? '' : 'none';
+  if (q) setText('#qText', q.question);
 
   const errs = t.errors || [];
   if (errs.length !== ui.errors) {

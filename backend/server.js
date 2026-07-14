@@ -39,11 +39,13 @@ async function connectDb() {
   await collFor('tasks').createIndex({ createdAt: -1 });
   await collFor('elements').createIndex({ elementId: 1 }, { unique: true });
   await collFor('elements').createIndex({ host: 1 });
+  await collFor('prompts').createIndex({ promptId: 1 }, { unique: true });
   await collFor('schemas').createIndex({ schemaId: 1 }, { unique: true });
   await collFor('schemas').createIndex({ slug: 1 }, { unique: true });
   await collFor('skills').createIndex({ skillId: 1 }, { unique: true });
   await collFor('skills').createIndex({ host: 1 });
   await collFor('debug_items').createIndex({ taskId: 1 });
+  await collFor('task_shots').createIndex({ taskId: 1 });
   console.log(`Mongo connected: ${MONGODB_URI} / ${DB_NAME}`);
 }
 
@@ -190,6 +192,14 @@ const TOOL_CATALOG = [
     desc: 'Click the element matching a CSS `selector` on the current page (or the first element whose visible text contains `text`). Use for buttons, links, tabs, "See more", etc.' },
   { name: 'hover', params: ['selector', 'text'],
     desc: 'Hover (mouseover) the element matching a CSS `selector` (or containing `text`) on the current page — e.g. to reveal a menu or tooltip.' },
+  { name: 'wait', params: ['seconds', 'selector', 'text'],
+    desc: 'Wait. With `selector`/`text`: wait until that element APPEARS on the page (up to 30s) — use between steps of slow multi-step dialogs. With only `seconds`: pause that long.' },
+  { name: 'screenshot', params: [],
+    desc: 'Capture the visible area of the current tab and attach it to the task as evidence (viewable in the dashboard). Use when the user asks to see/verify what happened.' },
+  { name: 'ask_user', params: ['question'],
+    desc: 'PAUSE the task and ask the user to confirm before continuing (Approve/Decline in the popup or dashboard). ALWAYS add this right before irreversible outward actions the user asked to confirm — publishing a post, sending a message.' },
+  { name: 'press_key', params: ['key', 'selector', 'text'],
+    desc: 'Press a keyboard key (default "Enter") on the field matching `selector`/`text`, or on the currently focused field when omitted. Use AFTER typing when a field submits on Enter and has NO submit button (search boxes, chat inputs, comment boxes). Other keys: Tab, Escape, ArrowDown, ArrowUp, Space.' },
   { name: 'type', params: ['value', 'selector', 'text'],
     desc: 'Type `value` into a text field / textarea / contenteditable box (e.g. a post composer, search box, comment box). Locate the field by CSS `selector`, or by its placeholder/aria-label `text`; if neither is given, types into the focused or first editable field. Does NOT submit.' },
   { name: 'generate_text', params: ['prompt', 'selector', 'text', 'words'],
@@ -350,7 +360,7 @@ function normalizePlan(plan) {
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
     else {
       // Pure action task (click/hover/scroll only): target = number of such phases.
-      const acts = clean.filter((p) => ['click', 'hover', 'scroll', 'type', 'generate_text', 'use_skill', 'run_skill'].includes(p.tool)).length;
+      const acts = clean.filter((p) => ['click', 'hover', 'scroll', 'type', 'press_key', 'generate_text', 'use_skill', 'run_skill', 'wait', 'screenshot', 'ask_user'].includes(p.tool)).length;
       if (acts) target = { metric: 'actions', count: acts };
       else return null;
     }
@@ -414,7 +424,7 @@ function repairPlan(plan) {
   }
 
   // Enforce order: one navigate first, then scroll/collect/act, then extract, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
+  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, press_key: 1, wait: 1, screenshot: 1, ask_user: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
   const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
   const rest = phases.filter((p) => p.tool !== 'navigate')
     .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
@@ -595,8 +605,16 @@ app.get('/tasks/:id', async (req, res) => {
 });
 
 app.post('/tasks', async (req, res) => {
-  const { goal, model, mode, schemas, useSkills } = req.body || {};
+  const { goal, model, mode, schemas, useSkills, promptId } = req.body || {};
   if (!goal || !model) return res.status(400).json({ ok: false, error: 'goal and model required' });
+
+  // Snapshot the chosen system prompt; its bundled skills join the task's skills.
+  let systemPrompt = null;
+  const extraSkillIds = [];
+  if (promptId) {
+    const p = await promptsColl().findOne({ promptId }, { projection: { _id: 0 } });
+    if (p) { systemPrompt = { promptId: p.promptId, name: p.name, content: p.content }; extraSkillIds.push(...(p.skillIds || [])); }
+  }
 
   // Snapshot the chosen schemas onto the task so tools + resume stay stable
   // even if the schema is later edited or deleted.
@@ -609,10 +627,10 @@ app.post('/tasks', async (req, res) => {
 
   // Snapshot explicitly chosen learned skills so planning routes to them.
   let taskUseSkills = [];
-  const skIds = Array.isArray(useSkills) ? useSkills : [];
+  const skIds = [...new Set([...(Array.isArray(useSkills) ? useSkills : []), ...extraSkillIds])];
   if (skIds.length) {
     const docs = await resolveSkills(await collFor('skills').find({ skillId: { $in: skIds } }, { projection: { _id: 0 } }).toArray());
-    taskUseSkills = docs.map((s) => ({ skillId: s.skillId, name: s.name, kind: s.kind, action: s.action, fields: s.fields, urlPattern: s.urlPattern }));
+    taskUseSkills = docs.map((s) => ({ skillId: s.skillId, name: s.name, kind: s.kind, action: s.action, fields: s.fields, steps: s.steps || null, urlPattern: s.urlPattern }));
   }
 
   const task = {
@@ -620,6 +638,7 @@ app.post('/tasks', async (req, res) => {
     goal, model, mode: mode || 'once',
     schemas: taskSchemas,        // schemas this task saves collected data into
     useSkills: taskUseSkills,    // learned skills the task should use
+    systemPrompt,                // standing instructions attached to this task
     status: 'planning',          // planning|running|checking|done|error|stopped
     plan: null,
     currentPhaseIndex: 0,
@@ -641,8 +660,41 @@ app.post('/tasks', async (req, res) => {
   res.json({ ok: true, task });
 });
 
+// Re-run a task (daily/repetitive workflows). Without `extra` the PROVEN plan
+// is reused — no replanning: it's deterministic, instant, and the stored plan
+// already worked; only execution state is reset. With an `extra` instruction
+// the goal changes, so the planner runs again. Schema snapshots are copied, so
+// collected data accumulates in the SAME collection(s) across runs.
+app.post('/tasks/:id/rerun', async (req, res) => {
+  const src = await tasksColl().findOne({ taskId: req.params.id });
+  if (!src) return res.status(404).json({ ok: false, error: 'not found' });
+  const extra = String(req.body?.extra || '').trim();
+  const task = {
+    taskId: crypto.randomUUID(),
+    goal: extra ? `${src.goal}\nAdditional instruction for this run: ${extra}` : src.goal,
+    model: src.model,
+    mode: src.mode || 'once',
+    schemas: src.schemas || [],
+    useSkills: src.useSkills || [],
+    systemPrompt: src.systemPrompt || null,
+    rerunOf: src.taskId,
+    status: extra ? 'planning' : 'running',
+    plan: extra ? null : src.plan,     // reuse the proven plan unless the goal changed
+    currentPhaseIndex: 0,
+    collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0, repeats: 0,
+    maxRepeats: src.maxRepeats || 3,
+    messages: [],
+    events: [{ at: nowIso(), kind: 'think', msg: `Re-run of task ${src.taskId.slice(0, 8)}… ${extra ? '(extra instruction — replanning)' : '(reusing its proven plan)'}` }],
+    errors: [],
+    createdAt: nowIso(), updatedAt: nowIso(), finishedAt: null,
+  };
+  await tasksColl().insertOne({ ...task });
+  delete task._id;
+  res.json({ ok: true, task });
+});
+
 // Whitelisted field updates (the extension persists progress through here).
-const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'repeats', 'plan', 'finishedAt', 'messages']);
+const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'pendingQuestion', 'repeats', 'plan', 'finishedAt', 'messages']);
 app.patch('/tasks/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (PATCHABLE.has(k)) set[k] = v;
@@ -656,6 +708,8 @@ app.patch('/tasks/:id', async (req, res) => {
 
 app.delete('/tasks/:id', async (req, res) => {
   await tasksColl().deleteOne({ taskId: req.params.id });
+  await collFor('task_shots').deleteMany({ taskId: req.params.id });
+  await collFor('debug_items').deleteMany({ taskId: req.params.id });
   res.json({ ok: true });
 });
 
@@ -676,6 +730,34 @@ app.post('/tasks/:id/debug-items', async (req, res) => {
 app.get('/tasks/:id/debug-items', async (req, res) => {
   const items = await collFor('debug_items').find({ taskId: req.params.id }, { projection: { _id: 0 } }).sort({ index: 1 }).toArray();
   res.json({ ok: true, items });
+});
+
+// Answer a pending ask_user confirmation. The extension's tool loop polls the
+// task and resumes (or stops) based on the answer.
+app.post('/tasks/:id/answer', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  if (!task.pendingQuestion || task.pendingQuestion.answer) return res.json({ ok: false, error: 'nothing to answer' });
+  const answer = String(req.body?.answer || '').trim() || 'no';
+  await tasksColl().updateOne({ taskId: req.params.id }, {
+    $set: { 'pendingQuestion.answer': answer, 'pendingQuestion.answeredAt': nowIso(), updatedAt: nowIso() },
+    $push: { events: { at: nowIso(), kind: 'obs', msg: `You answered: ${answer}` } },
+  });
+  res.json({ ok: true });
+});
+
+// Screenshots captured by the screenshot tool (kept out of the task doc — data
+// URLs are large). Loaded on demand by the dashboard.
+app.post('/tasks/:id/screenshot', async (req, res) => {
+  const dataUrl = String(req.body?.dataUrl || '');
+  if (!dataUrl.startsWith('data:image/')) return res.status(400).json({ ok: false, error: 'dataUrl required' });
+  await collFor('task_shots').insertOne({ taskId: req.params.id, at: nowIso(), url: String(req.body?.url || ''), dataUrl: dataUrl.slice(0, 3_000_000) });
+  res.json({ ok: true });
+});
+
+app.get('/tasks/:id/screenshots', async (req, res) => {
+  const shots = await collFor('task_shots').find({ taskId: req.params.id }, { projection: { _id: 0 } }).sort({ at: 1 }).toArray();
+  res.json({ ok: true, shots });
 });
 
 app.post('/tasks/:id/event', async (req, res) => {
@@ -714,8 +796,18 @@ app.post('/tasks/:id/plan', async (req, res) => {
   // Hydrate v2 skills (element refs) into runtime shape so planning, routing
   // and field-subset logic see real field lists.
   const skills = await resolveSkills(await skillsColl().find({}, { projection: { _id: 0 } }).toArray());
+  // Standing instructions from the task's system prompt ride along with every plan.
+  let sysExtra = task.systemPrompt?.content
+    ? `\n\nSTANDING USER INSTRUCTIONS (system prompt "${task.systemPrompt.name}") — honor these when planning:\n${task.systemPrompt.content}`
+    : '';
+  // Skills the user explicitly attached to THIS task — the planner should
+  // prefer them over guessing selectors.
+  if (task.useSkills && task.useSkills.length) {
+    sysExtra += '\n\nThe user ATTACHED these skills to this task — prefer them: ' +
+      task.useSkills.map((s) => `"${s.name}" (${s.kind === 'collection' ? 'collect_by_skill' : (s.steps && s.steps.length > 1 ? 'run_skill workflow' : 'use_skill ' + (s.action || ''))})`).join(', ') + '.';
+  }
   const messages = [
-    { role: 'system', content: planningSystemPrompt(task.schemas, skills) },
+    { role: 'system', content: planningSystemPrompt(task.schemas, skills) + sysExtra },
     { role: 'user', content: task.goal },
   ];
 
@@ -903,11 +995,16 @@ app.post('/tasks/:id/plan', async (req, res) => {
     }
 
     if (!nm) nm = (parsed?.schema?.name && String(parsed.schema.name).trim()) || task.goal.slice(0, 40);
-    const created = await createSchemaDoc(nm, fields);
+    // Reuse an existing schema with the same name — re-running the same kind of
+    // task must accumulate into ONE collection, not mint "-xxxx" duplicates.
+    let created = await schemasColl().findOne({ name: nm }, { projection: { _id: 0 } });
     if (created) {
-      set.schemas = [schemaSnapshot(created)];
-      events.push({ at: nowIso(), kind: 'think', msg: `Created schema "${created.name}" (${chosen}): ${created.fields.map((f) => f.key).join(', ')}.` });
+      events.push({ at: nowIso(), kind: 'think', msg: `Reusing existing schema "${created.name}" — data accumulates there.` });
+    } else {
+      created = await createSchemaDoc(nm, fields);
+      if (created) events.push({ at: nowIso(), kind: 'think', msg: `Created schema "${created.name}" (${chosen}): ${created.fields.map((f) => f.key).join(', ')}.` });
     }
+    if (created) set.schemas = [schemaSnapshot(created)];
   }
 
   const doc = await tasksColl().findOneAndUpdate(
@@ -1142,6 +1239,47 @@ app.post('/schemas/:id/records', async (req, res) => {
   res.json({ ok: true, added, updated, total });
 });
 
+// ============================ System Prompts ================================
+// Named standing instructions the user attaches to tasks. A prompt can bundle
+// skills (skillIds); picking the prompt when starting a task selects them too.
+
+const promptsColl = () => collFor('prompts');
+const PROMPT_PATCHABLE = new Set(['name', 'content', 'skillIds']);
+
+app.get('/prompts', async (req, res) => {
+  const prompts = await promptsColl().find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray();
+  res.json({ ok: true, prompts });
+});
+
+app.post('/prompts', async (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ ok: false, error: 'name required' });
+  const prompt = {
+    promptId: crypto.randomUUID(),
+    name: String(b.name).trim(),
+    content: String(b.content || ''),
+    skillIds: Array.isArray(b.skillIds) ? b.skillIds : [],
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await promptsColl().insertOne({ ...prompt });
+  delete prompt._id;
+  res.json({ ok: true, prompt });
+});
+
+app.patch('/prompts/:id', async (req, res) => {
+  const set = {};
+  for (const [k, v] of Object.entries(req.body || {})) if (PROMPT_PATCHABLE.has(k)) set[k] = v;
+  set.updatedAt = nowIso();
+  const doc = await promptsColl().findOneAndUpdate(
+    { promptId: req.params.id }, { $set: set }, { returnDocument: 'after', projection: { _id: 0 } });
+  res.json({ ok: true, prompt: doc?.value || doc });
+});
+
+app.delete('/prompts/:id', async (req, res) => {
+  await promptsColl().deleteOne({ promptId: req.params.id });
+  res.json({ ok: true });
+});
+
 // ========================= Introduced Elements ==============================
 // Phase 1 of the two-step skill redesign (docs/skill-redesign-plan.md).
 // An ELEMENT is a named, route-bound pointer to one thing on a page. Skills
@@ -1201,7 +1339,7 @@ function generalizeRoute(path) {
 
 const elementsColl = () => collFor('elements');
 const ELEMENT_TYPES = new Set(['container', 'item', 'field', 'action', 'input']);
-const ELEMENT_PATCHABLE = new Set(['name', 'details', 'route', 'type', 'action', 'attr', 'parentId', 'selectors']);
+const ELEMENT_PATCHABLE = new Set(['name', 'details', 'route', 'type', 'action', 'attr', 'key', 'parentId', 'selectors']);
 
 // Unique snake_case name per host (suffixes _2, _3… on collision).
 async function uniqueElementName(host, wanted, ignoreId) {
@@ -1244,6 +1382,7 @@ app.post('/elements', async (req, res) => {
     type: b.type,
     action: b.action || null,
     attr: b.attr || null,
+    key: b.key || null,               // key to press when action === 'press'
     parentId: b.parentId || null,
     selectors: Array.isArray(b.selectors) ? b.selectors : [],
     sample: b.sample || null,
@@ -1358,10 +1497,11 @@ function resolveSkillDoc(skill, byId) {
     if (acts.length) {
       out.kind = 'action';
       out.action = acts[0].action || 'click';
+      out.key = acts[0].key || null;
       out.selectors = absSelectors(acts[0], byId);
       if (acts.length > 1) {
-        // Ordered bundle for the future run_skill sequence runner.
-        out.steps = acts.map((e) => ({ name: e.name, action: e.action || 'click', attr: e.attr || null, selectors: absSelectors(e, byId) }));
+        // Ordered bundle for the run_skill sequence runner.
+        out.steps = acts.map((e) => ({ name: e.name, action: e.action || 'click', attr: e.attr || null, key: e.key || null, selectors: absSelectors(e, byId) }));
       }
     }
   }
