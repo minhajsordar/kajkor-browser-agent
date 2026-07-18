@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"_sourceUrl":{"$numberInt":"1"}},"name":"_sourceUrl_1"}],"uuid":"7199d3a2f80a4871906286a15bedb924","collectionName":"data_data-fb-post-item-44ym","type":"collection"}

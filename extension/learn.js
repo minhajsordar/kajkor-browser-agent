@@ -12,7 +12,7 @@
 (() => {
   if (window.__BA_LEARN) { window.__BA_LEARN.restart(); return; }
 
-  const BACKEND = 'http://localhost:4000';
+  const BACKEND = 'http://localhost:34730';
   const host = location.hostname.replace(/^www\./, '');
 
   const cssEsc = (v) => String(v).replace(/["\\]/g, '\\$&');
@@ -117,9 +117,22 @@
   const hi = document.createElement('div');
   hi.style.cssText = 'position:fixed;z-index:2147483646;border:2px solid #6d8bff;background:rgba(109,139,255,.15);pointer-events:none;display:none;border-radius:4px;';
   document.documentElement.appendChild(hi);
+  // Persistent marker for the element picked in the Introduce tab (survives
+  // mouse movement; an overlay div, not a class, so page re-renders can't strip it).
+  const selBox = document.createElement('div');
+  selBox.style.cssText = 'position:fixed;z-index:2147483646;border:3px dashed #f6c453;background:rgba(246,196,83,.12);pointer-events:none;display:none;border-radius:4px;';
+  document.documentElement.appendChild(selBox);
+  function positionSelBox() {
+    if (!iSel || !iSel.isConnected || tab !== 'intro') { selBox.style.display = 'none'; return; }
+    const r = iSel.getBoundingClientRect();
+    selBox.style.display = 'block';
+    selBox.style.left = r.left + 'px'; selBox.style.top = r.top + 'px';
+    selBox.style.width = r.width + 'px'; selBox.style.height = r.height + 'px';
+  }
   const matchStyle = document.createElement('style');
-  matchStyle.textContent = '.__ba_match{outline:2px solid #34d399 !important;outline-offset:-2px;}'
-    + '.__ba_selected{outline:3px dashed #f6c453 !important;outline-offset:-3px;}';
+  matchStyle.textContent = '.__ba_match{outline:2px solid #34d399 !important;outline-offset:-2px;}'      // green: selector matches
+    + '.__ba_selected{outline:3px dashed #f6c453 !important;outline-offset:-3px;}'                        // amber: being edited
+    + '.__ba_hover{outline:2px solid #22d3ee !important;outline-offset:-2px;}';                           // cyan: list-row hover
   document.documentElement.appendChild(matchStyle);
 
   // ---- panel in an iframe (isolates keystrokes from the page) ----
@@ -156,6 +169,10 @@
     .erow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .erow .ty{color:#8b90a0}
     .cnt.ok{color:#34d399}.cnt.bad{color:#f87171}
+    .arow .anm{width:auto;flex:1;padding:3px 6px;font-size:12px}
+    .arow input[type="checkbox"]{width:auto}
+    .aedit{background:none;border:none;color:#8b90a0;cursor:pointer;font-size:13px;padding:0 2px}
+    .aedit:hover{color:#fff}
     .crow{display:flex;gap:6px;align-items:center;padding:4px 7px;border:1px solid #2a2f3a;border-radius:7px;font-size:12px;margin-bottom:4px}
     .crow input{width:auto}
     .crow .nm{flex:1}
@@ -174,10 +191,11 @@
         <div class="hint" id="ihint">Click any element on the page to introduce it.</div>
         <div class="hidden" id="iform">
           <div class="preview" id="ipreview"></div>
-          <div class="row-inline" style="margin-bottom:6px">
+          <div class="row-inline" id="iwalk" style="margin-bottom:6px">
             <button class="btn ghost" id="iup" style="margin:0;flex:1" title="Select the parent/ancestor — use when the UI is too narrow to click the exact element">⬆ Select parent</button>
             <button class="btn ghost" id="idown" style="margin:0;flex:1" title="Back down to the previous (inner) selection" disabled>⬇ Back to child</button>
           </div>
+          <button class="btn ghost" id="ianalyze" style="margin:0 0 6px" title="AI analyzes everything inside the selected element and proposes elements + a skill — nothing is saved until you confirm">🤖 Analyze selection with AI</button>
           <div class="row-inline">
             <div style="flex:1"><label>Name</label><input id="iname" placeholder="e.g. post_item" /></div>
             <button class="btn ghost" id="isuggest" title="Suggest name" style="margin:0;width:auto;padding:6px 9px">✨</button>
@@ -205,10 +223,26 @@
           <label>Short details <span style="color:#8b90a0">(the AI planner reads this)</span></label>
           <input id="idetails" placeholder="e.g. One post card in the home feed" />
           <span class="matches hidden" id="imatches"></span>
-          <label>Save as</label>
-          <select id="irepoint"><option value="">➕ New element</option></select>
+          <div id="irepointWrap"><label>Save as</label>
+          <select id="irepoint"><option value="">➕ New element</option></select></div>
           <button class="btn" id="isave">Save element</button>
+          <button class="btn ghost hidden" id="icancel">Cancel edit</button>
           <span class="msg" id="imsg"></span>
+        </div>
+        <button class="btn ghost" id="iauto" title="Scan the page, propose elements + a skill — nothing is saved until you confirm">🤖 Auto-learn this page</button>
+        <div id="autoBox" class="hidden">
+          <div class="section-lbl">Proposed — nothing saved yet</div>
+          <div class="elems" id="autoList"></div>
+          <div id="autoCtl">
+            <label class="crow" style="margin-top:6px"><input type="checkbox" id="autoSkillChk" checked />
+              <span class="nm">Also compose a skill</span></label>
+            <input id="autoSkillName" placeholder="skill name" />
+            <div class="row-inline">
+              <button class="btn" id="autoSave" style="flex:1">Save selected</button>
+              <button class="btn ghost" id="autoDiscard" style="flex:1;margin-top:12px">Discard</button>
+            </div>
+          </div>
+          <span class="msg" id="autoMsg"></span>
         </div>
         <div class="section-lbl">Introduced on this page</div>
         <div class="elems" id="elemList"><span class="hint">Loading…</span></div>
@@ -237,11 +271,21 @@
   let ELEMENTS = [];                 // introduced elements for this host
   let elemById = new Map();
   let iSel = null;                   // node selected in the Introduce tab
+  let editEl = null;                 // element doc being edited (from the list)
+  let editProp = -1;                 // AUTO index being edited in the full form
+  let AUTO = [];                     // auto-learn proposals (nothing saved yet)
+  let AUTO_SKILL = { name: '', details: '' };   // AI-proposed skill for the proposals
   let parentCands = [];              // [{e, node, depth}] containing iSel
   const outlined = [];
   const $ = (s) => idoc.querySelector(s);
-  const clearOutlines = () => { outlined.forEach((el) => el.classList.remove('__ba_match')); outlined.length = 0; };
-  const outline = (nodes) => { clearOutlines(); nodes.forEach((n) => { n.classList.add('__ba_match'); outlined.push(n); }); };
+  // Two independent highlight channels: `outline` is the persistent one
+  // (matches = green, editing = amber); `hoverOutline` is transient (cyan,
+  // list-row hover) and never disturbs the persistent one.
+  const clearOutlines = () => { outlined.forEach(({ el, cls }) => el.classList.remove(cls)); outlined.length = 0; };
+  const outline = (nodes, cls = '__ba_match') => { clearOutlines(); nodes.forEach((n) => { n.classList.add(cls); outlined.push({ el: n, cls }); }); };
+  const hovered = [];
+  const clearHover = () => { hovered.forEach((el) => el.classList.remove('__ba_hover')); hovered.length = 0; };
+  const hoverOutline = (nodes) => { clearHover(); nodes.forEach((n) => { n.classList.add('__ba_hover'); hovered.push(n); }); };
 
   // ---- element resolution (in-page, css candidates only) ----
   function ownNodes(elDoc, root) {
@@ -287,15 +331,17 @@
     if (!list.length) { box.innerHTML = '<span class="hint">None yet for this route.</span>'; return; }
     box.innerHTML = list.map((e) => {
       const n = resolveNodes(e).length;
-      return `<div class="erow" data-id="${esc(e.elementId)}" title="Click to highlight on the page">
+      return `<div class="erow" data-id="${esc(e.elementId)}" title="Click to edit — also highlights it on the page">
         <span class="nm">${esc(e.name)}</span><span class="ty">${esc(e.type)}</span>
         <span class="cnt ${n ? 'ok' : 'bad'}">${n ? n + '×' : 'broken'}</span>
       </div>`;
     }).join('');
-    box.querySelectorAll('.erow').forEach((row) => row.addEventListener('click', () => {
+    box.querySelectorAll('.erow').forEach((row) => {
       const e = elemById.get(row.getAttribute('data-id'));
-      outline(resolveNodes(e));
-    }));
+      row.addEventListener('mouseenter', () => { if (e) hoverOutline(resolveNodes(e)); });
+      row.addEventListener('mouseleave', clearHover);
+      row.addEventListener('click', () => { if (e) enterEdit(e); });
+    });
   }
 
   function renderRepointOptions() {
@@ -323,7 +369,9 @@
   }
 
   function introSelect(el) {
+    exitEdit();
     iSel = el;
+    positionSelBox();
     $('#ihint').classList.add('hidden'); $('#iform').classList.remove('hidden');
     $('#imsg').textContent = '';
     const sig = signatureOf(el);
@@ -372,8 +420,58 @@
   }
 
   async function saveElement() {
-    if (!iSel) return;
     const msg = $('#imsg');
+    if (editProp >= 0 && AUTO[editProp]) {  // proposal edit → rewrite the list entry only
+      const c = AUTO[editProp];
+      const name = $('#iname').value.trim();
+      if (!name) { msg.textContent = 'Name required.'; return; }
+      const type = $('#itype').value;
+      const pv = $('#iparent').value;
+      c.name = name; c.type = type;
+      c.action = (type === 'action' || type === 'input') ? $('#iact').value : null;
+      c.attr = type === 'field' ? $('#iattr').value : null;
+      c.key = (type === 'action' || type === 'input') && $('#iact').value === 'press' ? $('#ikey').value : null;
+      c.route = $('#iroute').value.trim() || '/*';
+      c.details = $('#idetails').value.trim();
+      c.parentIdx = pv.startsWith('p:') ? +pv.slice(2) : -1;
+      // recompute selectors to match the (possibly changed) type/parent;
+      // a scanned repeating item keeps its verified repeat selector
+      if (!(c.type === 'item' && c.count > 1)) {
+        const parentNode = c.parentIdx >= 0 && AUTO[c.parentIdx] ? AUTO[c.parentIdx].node : null;
+        c.selectors = buildIntroSelectors(c.node, c.type, parentNode ? { node: parentNode } : null);
+      }
+      exitEdit();
+      renderAuto();
+      $('#autoMsg').textContent = `Proposal “${c.name}” updated — still nothing saved until Save selected.`;
+      return;
+    }
+    if (editEl) {                        // edit mode → PATCH the stored element
+      const type = $('#itype').value;
+      const name = $('#iname').value.trim();
+      if (!name) { msg.textContent = 'Name required.'; return; }
+      msg.textContent = 'Updating…';
+      try {
+        const r = await fetch(`${BACKEND}/elements/${editEl.elementId}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name, type,
+            route: $('#iroute').value.trim() || '/*',
+            details: $('#idetails').value.trim(),
+            action: (type === 'action' || type === 'input') ? $('#iact').value : null,
+            attr: type === 'field' ? $('#iattr').value : null,
+            key: (type === 'action' || type === 'input') && $('#iact').value === 'press' ? $('#ikey').value : null,
+            parentId: $('#iparent').value || null,
+          }),
+        }).then((x) => x.json());
+        if (r.ok) {
+          exitEdit();
+          await loadElements();
+          $('#imsg').textContent = `Updated “${r.element.name}” ✓ — every skill using it sees the change.`;
+        } else msg.textContent = r.error || 'Failed.';
+      } catch { msg.textContent = 'Backend not reachable.'; }
+      return;
+    }
+    if (!iSel) return;
     const repointId = $('#irepoint').value;
     const type = $('#itype').value;
     const parentId = $('#iparent').value || null;
@@ -420,6 +518,74 @@
     } catch { msg.textContent = 'Backend not reachable.'; }
   }
 
+  // ---- Edit mode: pick an introduced element from the list, change any of
+  // its stored properties, PATCH on save. Selectors stay (repoint replaces those).
+  function enterEdit(e) {
+    editEl = e; iSel = null; iChildStack.length = 0;
+    positionSelBox();
+    $('#ihint').classList.add('hidden'); $('#iform').classList.remove('hidden');
+    $('#iwalk').classList.add('hidden'); $('#irepointWrap').classList.add('hidden'); $('#ianalyze').classList.add('hidden');
+    $('#icancel').classList.remove('hidden');
+    $('#idown').disabled = true;
+    $('#isave').textContent = 'Update element';
+    const s = e.sample || {};
+    $('#ipreview').textContent = `✏️ ${e.name} — <${s.tag || '?'}${s.role ? ` role="${s.role}"` : ''}${s.aria ? ` aria-label="${s.aria}"` : ''}> ${s.text || ''}`;
+    $('#iname').value = e.name; $('#itype').value = e.type;
+    $('#iact').value = e.action || 'click'; $('#iattr').value = e.attr || 'text'; $('#ikey').value = e.key || 'Enter';
+    $('#iroute').value = e.route || '/*'; $('#idetails').value = e.details || '';
+    // parent: any other element on this host (no clicked node to auto-detect from)
+    parentCands = [];
+    $('#iparent').innerHTML = '<option value="">(none — whole page)</option>' +
+      ELEMENTS.filter((x) => x.elementId !== e.elementId)
+        .map((x) => `<option value="${esc(x.elementId)}">${esc(x.name)} (${esc(x.type)})</option>`).join('');
+    $('#iparent').value = e.parentId && elemById.has(e.parentId) ? e.parentId : '';
+    ['#iname', '#itype', '#iparent', '#iroute', '#idetails', '#iact', '#iattr'].forEach((sl) => { $(sl).disabled = false; });
+    toggleIntroType();
+    outline(resolveNodes(e), '__ba_selected');
+    $('#imsg').textContent = 'Editing — Save updates this element. Selectors are untouched (use “Save as → Repoint” after clicking a new node to replace them).';
+  }
+  function exitEdit() {
+    if (!editEl && editProp < 0) return;
+    editEl = null; editProp = -1;
+    $('#iwalk').classList.remove('hidden'); $('#irepointWrap').classList.remove('hidden'); $('#ianalyze').classList.remove('hidden');
+    $('#icancel').classList.add('hidden');
+    $('#isave').textContent = 'Save element';
+    $('#iform').classList.add('hidden'); $('#ihint').classList.remove('hidden');
+    $('#iname').value = ''; $('#idetails').value = ''; $('#imsg').textContent = '';
+    clearOutlines();
+  }
+
+  // Edit an auto-learn PROPOSAL in the same full form (nothing saved to the
+  // backend here — Update rewrites the proposal list entry only).
+  function enterPropEdit(i) {
+    const c = AUTO[i]; if (!c) return;
+    exitEdit();
+    editProp = i; iSel = c.node; iChildStack.length = 0;
+    positionSelBox();
+    $('#ihint').classList.add('hidden'); $('#iform').classList.remove('hidden');
+    $('#iwalk').classList.add('hidden'); $('#irepointWrap').classList.add('hidden'); $('#ianalyze').classList.add('hidden');
+    $('#icancel').classList.remove('hidden');
+    $('#idown').disabled = true;
+    $('#isave').textContent = 'Update proposal';
+    const s = signatureOf(c.node);
+    $('#ipreview').textContent = `📝 proposal — <${s.tag}${s.role ? ` role="${s.role}"` : ''}${s.aria ? ` aria-label="${s.aria}"` : ''}> ${s.text}`;
+    $('#iname').value = c.name; $('#itype').value = c.type;
+    $('#iact').value = c.action || 'click'; $('#iattr').value = c.attr || 'text'; $('#ikey').value = c.key || 'Enter';
+    $('#iroute').value = c.route || generalizeRoute(location.pathname);
+    $('#idetails').value = c.details || '';
+    // parent: any proposed item/container (not saved yet, so no elementIds here)
+    parentCands = [];
+    $('#iparent').innerHTML = '<option value="">(none — whole page)</option>' +
+      AUTO.map((x, j) => ({ x, j }))
+        .filter(({ x, j }) => j !== i && (x.type === 'item' || x.type === 'container'))
+        .map(({ x, j }) => `<option value="p:${j}">${esc(x.name)} (${esc(x.type)}, proposed)</option>`).join('');
+    $('#iparent').value = c.parentIdx >= 0 && AUTO[c.parentIdx] ? `p:${c.parentIdx}` : '';
+    ['#iname', '#itype', '#iparent', '#iroute', '#idetails', '#iact', '#iattr'].forEach((sl) => { $(sl).disabled = false; });
+    toggleIntroType();
+    if (c.node.isConnected) outline([c.node], '__ba_selected');
+    $('#imsg').textContent = 'Editing a proposal — Update rewrites the list entry; still nothing is saved until “Save selected”.';
+  }
+
   // Repointing keeps identity — lock the identity inputs while it's selected.
   function toggleRepointLock() {
     const locked = !!$('#irepoint').value;
@@ -431,12 +597,24 @@
     } else { $('#imsg').textContent = ''; }
   }
 
+  // Model for AI features: stored preference if it's a concrete model, else the
+  // first installed Ollama model from the backend (the popup no longer has a
+  // picker — the desktop app owns settings).
+  async function pickModel() {
+    let m = ''; try { m = (await new Promise((r) => chrome.storage.local.get(['ba_model'], (o) => r(o.ba_model)))) || ''; } catch {}
+    if (m && m !== 'auto') return m;
+    try {
+      const j = await fetch(`${BACKEND}/models`).then((x) => x.json());
+      return (j.models && j.models[0] && j.models[0].name) || '';
+    } catch { return ''; }
+  }
+
   // AI name suggestion for the element being introduced.
   async function suggestName() {
     if (!iSel) return;
     const msg = $('#imsg');
-    let model = ''; try { model = (await new Promise((r) => chrome.storage.local.get(['ba_model'], (o) => r(o.ba_model)))) || ''; } catch {}
-    if (!model) { msg.textContent = 'No model set (pick one in the popup).'; return; }
+    const model = await pickModel();
+    if (!model) { msg.textContent = 'No Ollama model available — is Ollama running?'; return; }
     msg.textContent = 'Thinking…';
     try {
       const r = await fetch(`${BACKEND}/skills/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ signature: signatureOf(iSel), model }) }).then((x) => x.json());
@@ -481,6 +659,335 @@
     } catch { msg.textContent = 'Backend not reachable.'; }
   }
 
+  // ---- Auto-learn: scan the page, PROPOSE elements + a skill; the user
+  // reviews / renames / unticks, and NOTHING is saved until "Save selected".
+  function autoNameFor(node, type) {
+    const aria = node.getAttribute && node.getAttribute('aria-label');
+    const txt = norm(aria || node.textContent || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return (txt ? txt.split('_').slice(0, 3).join('_') : type).slice(0, 30) || type;
+  }
+
+  function harvestCandidates() {
+    const cands = [];
+    const existingTop = new Set(ELEMENTS.flatMap((e) => (e.selectors || []).map((s) => s.value || s.text)).filter(Boolean));
+    const seen = new Set();
+    const add = (node, type, { action = null, attr = null, name = '', parentIdx = -1, selectors = null, count = 1 } = {}) => {
+      const sels = selectors || computeSelectors(node);
+      const key = sels[0] && (sels[0].value || sels[0].text || '');
+      if (!key || seen.has(key) || existingTop.has(key)) return -1;
+      seen.add(key);
+      cands.push({ node, type, action, attr, parentIdx, count, name: name || autoNameFor(node, type), selectors: sels });
+      return cands.length - 1;
+    };
+
+    // 1) repeating item container (feed unit / article / listitem / row)
+    let itemIdx = -1, itemNode = null;
+    for (const sel of ['div[aria-posinset]', '[role="article"]', '[role="listitem"]', '[role="row"]']) {
+      let ns = []; try { ns = [...document.querySelectorAll(sel)]; } catch {}
+      ns = ns.filter((n) => n.offsetHeight > 40);
+      if (ns.length >= 2 && ns.length <= 400) {
+        itemNode = ns[0];
+        itemIdx = add(itemNode, 'item', { name: 'list_item', selectors: [{ strategy: 'css', value: sel, score: 60 }], count: ns.length });
+        break;
+      }
+    }
+    // 2) fields + stable actions inside the first item
+    if (itemNode && itemIdx >= 0) {
+      const inItem = (n, type, opts = {}) =>
+        add(n, type, { ...opts, parentIdx: itemIdx, selectors: buildIntroSelectors(n, type, { node: itemNode }) });
+      const heading = itemNode.querySelector('h1,h2,h3,h4,[role="heading"],strong,b');
+      if (heading && norm(heading.textContent)) inItem(heading, 'field', { attr: 'text', name: 'title' });
+      const link = [...itemNode.querySelectorAll('a[href]')].find((a) => norm(a.textContent));
+      if (link) inItem(link, 'field', { attr: 'href', name: 'link' });
+      const img = itemNode.querySelector('img[src]');
+      if (img) inItem(img, 'field', { attr: 'src', name: 'image' });
+      let body = null;                                   // longest text block
+      for (const d of itemNode.querySelectorAll('[dir="auto"], p')) {
+        const t = norm(d.textContent);
+        if (t.length > 40 && (!body || t.length > norm(body.textContent).length)) body = d;
+      }
+      if (body) inItem(body, 'field', { attr: 'text', name: 'body_text' });
+      let nAct = 0;
+      for (const b of itemNode.querySelectorAll('[aria-label]')) {
+        if (nAct >= 3) break;
+        if (!stableAria(b)) continue;
+        if (inItem(b, 'action', { action: 'click' }) >= 0) nAct++;
+      }
+    }
+    // 3) page-level inputs (search boxes, composers)
+    let nInp = 0;
+    for (const n of document.querySelectorAll('input[type="search"], [role="searchbox"], textarea, [contenteditable="true"][role="textbox"]')) {
+      if (nInp >= 2) break;
+      if (!n.offsetWidth) continue;
+      if (add(n, 'input', { action: 'type' }) >= 0) nInp++;
+    }
+    return cands;
+  }
+
+  // AI path: collect a broad inventory of visible candidate nodes; the model
+  // analyzes the digest and picks which ones become elements. Selectors are
+  // still computed deterministically here — the AI only chooses and names.
+  const snake = (s) => String(s || '').replace(/[^a-z0-9]+/gi, '_').toLowerCase().replace(/^_+|_+$/g, '').slice(0, 40);
+
+  function makeCollector() {
+    const cands = [];
+    const seenNode = new Set();
+    const visible = (n) => { try { const r = n.getBoundingClientRect(); return r.width > 4 && r.height > 4; } catch { return false; } };
+    const push = (node, where) => {
+      if (!node || seenNode.has(node) || cands.length >= 60) return;
+      seenNode.add(node); cands.push({ node, where });
+    };
+    const sweep = (container, cap = 45) => {   // candidate nodes inside a container
+      for (const n of container.querySelectorAll('h1,h2,h3,h4,[role="heading"],strong,b,a[href],img[src],[dir="auto"],p,time,[aria-label],[role="button"]')) {
+        if (cands.length >= cap) break;
+        if (n === container || !visible(n)) continue;
+        const t = norm(n.textContent);
+        if (!t && !n.getAttribute('aria-label') && n.tagName !== 'IMG') continue;
+        push(n, 'in-item');
+      }
+    };
+    return { cands, visible, push, sweep };
+  }
+
+  // Whole-page scan: repeating container + its insides + page-level controls.
+  // The scan scope is described as {node, type: item|container, count, selectors}.
+  function collectCandidates() {
+    const col = makeCollector();
+    let scope = null;
+    for (const sel of ['div[aria-posinset]', '[role="article"]', '[role="listitem"]', '[role="row"]']) {
+      let ns = []; try { ns = [...document.querySelectorAll(sel)]; } catch {}
+      ns = ns.filter((n) => n.offsetHeight > 40);
+      if (ns.length >= 2 && ns.length <= 400) {
+        scope = { node: ns[0], type: 'item', count: ns.length, selectors: [{ strategy: 'css', value: sel, score: 60 }] };
+        break;
+      }
+    }
+    if (scope) {
+      col.push(scope.node, 'item');
+      col.sweep(scope.node, 45);
+    }
+    // page-level inputs (search, composer) and stable-labelled controls
+    for (const n of document.querySelectorAll('input[type="search"], [role="searchbox"], textarea, [contenteditable="true"][role="textbox"]')) {
+      if (col.visible(n)) col.push(n, 'page');
+    }
+    let nBtn = 0;
+    for (const n of document.querySelectorAll('button[aria-label], [role="button"][aria-label], a[aria-label]')) {
+      if (nBtn >= 8) break;
+      if (!col.visible(n) || (scope && scope.node.contains(n)) || !stableAria(n)) continue;
+      col.push(n, 'page'); nBtn++;
+    }
+    return { scope, cands: col.cands };
+  }
+
+  // Scoped scan for "Analyze selection with AI": the selected node is the
+  // scope (a repeating item if its siblings repeat, else a container).
+  function collectScopedCandidates(scopeNode) {
+    const rep = computeItemSelector(scopeNode);
+    const scope = (rep.container === scopeNode && rep.count >= 2)
+      ? { node: scopeNode, type: 'item', count: rep.count, selectors: [{ strategy: 'css', value: rep.selector, score: 60 }] }
+      : { node: scopeNode, type: 'container', count: 1, selectors: computeSelectors(scopeNode) };
+    const col = makeCollector();
+    col.push(scopeNode, 'item');
+    col.sweep(scopeNode, 60);
+    return { scope, cands: col.cands };
+  }
+
+  function digestCandidates(scope, cands) {
+    return cands.map((c, i) => {
+      const n = c.node; const s = signatureOf(n);
+      const d = { i, where: c.where, tag: s.tag };
+      if (s.role) d.role = s.role;
+      if (s.aria) d.aria = s.aria.slice(0, 50);
+      if (s.text) d.text = s.text.slice(0, 50);
+      const href = n.getAttribute && n.getAttribute('href');
+      if (href) d.href = href.slice(0, 50);
+      if (n.tagName === 'IMG') d.img = true;
+      if (n.matches && n.matches('input,textarea,[contenteditable="true"],[role="textbox"]')) d.editable = true;
+      if (c.where === 'item' && scope) d.count = scope.count;
+      return d;
+    });
+  }
+
+  // Map the AI's picks back to nodes + deterministic selectors.
+  function buildProposalsFromPicks(r, scope, cands) {
+    const out = [];
+    const picks = (r.picks || []).filter((p) => cands[p.i]);
+    let scopeIdx = -1;
+    const scopePick = picks.find((p) => cands[p.i].where === 'item');
+    const wantsScope = scopePick || picks.some((p) => cands[p.i].where === 'in-item');
+    if (scope && wantsScope) {        // children need the container even if the AI skipped it
+      out.push({
+        node: scope.node, type: scope.type, action: null, attr: null, parentIdx: -1, count: scope.count,
+        name: (scopePick && snake(scopePick.name)) || (scope.type === 'item' ? 'list_item' : 'section'),
+        details: (scopePick && scopePick.details) || '',
+        selectors: scope.selectors,
+      });
+      scopeIdx = 0;
+    }
+    for (const p of picks) {
+      const c = cands[p.i];
+      if (c.where === 'item') continue;                       // handled above
+      const inScope = c.where === 'in-item' && scopeIdx >= 0;
+      let type = p.type;
+      if (type === 'item') type = inScope ? 'field' : 'container';  // no repeat selector for these
+      out.push({
+        node: c.node, type,
+        action: (type === 'action' || type === 'input') ? (p.action || (type === 'input' ? 'type' : 'click')) : null,
+        attr: type === 'field' ? (p.attr || 'text') : null,
+        parentIdx: inScope ? scopeIdx : -1, count: 1,
+        name: snake(p.name) || autoNameFor(c.node, type),
+        details: p.details || '',
+        selectors: inScope ? buildIntroSelectors(c.node, type, { node: scope.node }) : computeSelectors(c.node),
+      });
+    }
+    return out;
+  }
+
+  function renderAuto() {
+    const box = $('#autoList');
+    box.innerHTML = AUTO.map((c, i) => `
+      <div class="erow arow" data-i="${i}" title="${esc(c.details || 'Hover to highlight on the page')}">
+        <input type="checkbox" class="achk"${c.checked === false ? '' : ' checked'} />
+        <input class="anm" value="${esc(c.name)}" />
+        <span class="ty">${esc(c.type)}${c.attr ? ':' + esc(c.attr) : ''}${c.action ? ':' + esc(c.action) : ''}</span>
+        ${c.count > 1 ? `<span class="cnt ok">${c.count}×</span>` : ''}
+        <button class="aedit" title="Edit this proposal in the full form">✎</button>
+      </div>`).join('');
+    box.querySelectorAll('.arow').forEach((row) => {
+      const i = +row.getAttribute('data-i');
+      row.addEventListener('mouseenter', () => { const c = AUTO[i]; if (c && c.node.isConnected) hoverOutline([c.node]); });
+      row.addEventListener('mouseleave', clearHover);
+      row.querySelector('.anm').addEventListener('input', (e) => { AUTO[i].name = e.target.value; });
+      row.querySelector('.achk').addEventListener('change', (e) => { AUTO[i].checked = e.target.checked; });
+      row.querySelector('.aedit').addEventListener('click', () => enterPropEdit(i));
+    });
+    $('#autoSkillName').value = AUTO_SKILL.name
+      || 'collect_' + ((host.split('.')[0] || 'page').replace(/[^a-z0-9]+/gi, '_')) + '_items';
+    $('#autoCtl').classList.remove('hidden');
+  }
+
+  async function runAutoLearn() {
+    exitEdit();
+    iSel = null; positionSelBox();
+    $('#iform').classList.add('hidden'); $('#ihint').classList.remove('hidden');
+    AUTO = []; AUTO_SKILL = { name: '', details: '' };
+    $('#autoBox').classList.remove('hidden');
+    $('#autoList').innerHTML = ''; $('#autoCtl').classList.add('hidden');
+    $('#autoMsg').textContent = 'Scanning page…';
+
+    const { scope, cands } = collectCandidates();
+    if (!cands.length) { $('#autoMsg').textContent = 'Nothing usable found on this page.'; return; }
+
+    const model = await pickModel();
+    let note = '';
+    if (model) {
+      $('#autoMsg').textContent = `AI is analyzing ${cands.length} candidates…`;
+      try {
+        const r = await fetch(`${BACKEND}/learn/auto-detect`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, host, path: location.pathname, candidates: digestCandidates(scope, cands) }),
+        }).then((x) => x.json());
+        if (r.ok && Array.isArray(r.picks) && r.picks.length) {
+          AUTO = buildProposalsFromPicks(r, scope, cands);
+          AUTO_SKILL = { name: r.skillName || '', details: r.skillDetails || '' };
+        } else note = `AI analysis failed (${r.error || 'no picks'}) — heuristic scan instead. `;
+      } catch { note = 'Backend/AI not reachable — heuristic scan instead. '; }
+    } else note = 'No Ollama model available — heuristic scan instead. ';
+
+    if (!AUTO.length) AUTO = harvestCandidates();
+    if (!AUTO.length) {
+      $('#autoMsg').textContent = note + 'No new candidates found (already-introduced elements are skipped).';
+      return;
+    }
+    renderAuto();
+    $('#autoMsg').textContent = note + `${AUTO.length} proposal(s) — review names, untick extras, then Save selected. Nothing is saved yet.`;
+  }
+
+  // "Analyze selection with AI": same pipeline as Auto-learn, but scoped to
+  // the node currently selected in the Introduce tab (walk ⬆ to widen it).
+  async function analyzeSelected() {
+    const msg = $('#imsg');
+    if (!iSel || !iSel.isConnected) { msg.textContent = 'Select an element on the page first.'; return; }
+    const model = await pickModel();
+    if (!model) { msg.textContent = 'No Ollama model available — is Ollama running?'; return; }
+    const { scope, cands } = collectScopedCandidates(iSel);
+    if (cands.length < 2) { msg.textContent = 'Nothing inside this element to analyze — widen the selection with ⬆ Select parent.'; return; }
+    AUTO = []; AUTO_SKILL = { name: '', details: '' };
+    $('#autoBox').classList.remove('hidden');
+    $('#autoList').innerHTML = ''; $('#autoCtl').classList.add('hidden');
+    $('#autoMsg').textContent = `AI is analyzing ${cands.length} candidates inside the selected ${scope.type}…`;
+    msg.textContent = '';
+    try {
+      const r = await fetch(`${BACKEND}/learn/auto-detect`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, host, path: location.pathname, candidates: digestCandidates(scope, cands) }),
+      }).then((x) => x.json());
+      if (r.ok && Array.isArray(r.picks) && r.picks.length) {
+        AUTO = buildProposalsFromPicks(r, scope, cands);
+        AUTO_SKILL = { name: r.skillName || '', details: r.skillDetails || '' };
+        iSel = null; positionSelBox();
+        $('#iform').classList.add('hidden'); $('#ihint').classList.remove('hidden');
+        renderAuto();
+        $('#autoMsg').textContent = `${AUTO.length} proposal(s) from the selection — review, edit (✎), untick extras, then Save selected. Nothing is saved yet.`;
+      } else $('#autoMsg').textContent = `AI analysis failed (${r.error || 'no picks'}).`;
+    } catch { $('#autoMsg').textContent = 'Backend/AI not reachable.'; }
+  }
+
+  function discardAuto() {
+    exitEdit();
+    AUTO = []; AUTO_SKILL = { name: '', details: '' };
+    $('#autoBox').classList.add('hidden'); $('#autoList').innerHTML = ''; $('#autoMsg').textContent = '';
+    clearOutlines();
+  }
+
+  async function saveAuto() {
+    exitEdit();
+    const msg = $('#autoMsg');
+    const rows = [...$('#autoList').querySelectorAll('.arow')];
+    const checked = new Set(rows.filter((r) => r.querySelector('.achk').checked).map((r) => +r.getAttribute('data-i')));
+    for (const i of [...checked]) { const p = AUTO[i].parentIdx; if (p >= 0) checked.add(p); }  // children need their item parent
+    if (!checked.size) { msg.textContent = 'Nothing selected.'; return; }
+    msg.textContent = 'Saving…';
+    const route = generalizeRoute(location.pathname);
+    const idByIdx = new Map(); const createdIds = [];
+    try {
+      const order = [...checked].sort((a, b) => AUTO[a].parentIdx - AUTO[b].parentIdx);  // parents (-1) first
+      for (const i of order) {
+        const c = AUTO[i];
+        const r = await fetch(`${BACKEND}/elements`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            host, name: (c.name || '').trim() || autoNameFor(c.node, c.type), type: c.type, route: c.route || route,
+            details: c.details || ('Auto-introduced from ' + route),
+            action: (c.type === 'action' || c.type === 'input') ? (c.action || 'click') : null,
+            attr: c.type === 'field' ? (c.attr || 'text') : null,
+            key: (c.type === 'action' || c.type === 'input') && c.action === 'press' ? (c.key || 'Enter') : null,
+            parentId: c.parentIdx >= 0 ? (idByIdx.get(c.parentIdx) || null) : null,
+            selectors: c.selectors, sample: signatureOf(c.node),
+            sampleHtml: c.type === 'item' ? (c.node.outerHTML || '').slice(0, 60000) : null,
+          }),
+        }).then((x) => x.json());
+        if (!r.ok) { msg.textContent = `Failed on “${c.name}”: ${r.error || 'error'}`; return; }
+        idByIdx.set(i, r.element.elementId); createdIds.push(r.element.elementId);
+      }
+      let skillNote = '';
+      if ($('#autoSkillChk').checked && createdIds.length) {
+        const sname = $('#autoSkillName').value.trim();
+        if (sname) {
+          const sr = await fetch(`${BACKEND}/skills`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, name: sname, details: AUTO_SKILL.details || ('Auto-composed from ' + route), elements: createdIds, urlPattern: host + route }),
+          }).then((x) => x.json());
+          skillNote = sr.ok ? ` + skill “${sr.skill.name}”` : ` (skill failed: ${sr.error || 'error'})`;
+        }
+      }
+      AUTO = []; $('#autoList').innerHTML = ''; $('#autoCtl').classList.add('hidden');
+      clearOutlines();
+      await loadElements();
+      msg.textContent = `Saved ${createdIds.length} element(s)${skillNote} ✓`;
+    } catch { msg.textContent = 'Backend not reachable.'; }
+  }
+
   // ---- page pointer handling ----
   function onMove(e) {
     if (e.target === frame || tab !== 'intro') { hi.style.display = 'none'; return; }
@@ -492,13 +999,32 @@
     if (e.target === frame) return;      // clicks inside the panel never reach here anyway
     if (tab !== 'intro') return;         // only the Introduce tab picks from the page
     e.preventDefault(); e.stopImmediatePropagation();
+    iChildStack.length = 0; $('#idown').disabled = true;   // fresh pick resets ⬆/⬇ history
     introSelect(hoverEl || e.target);
+  }
+
+  // ⬆ Select parent / ⬇ Back to child — walk the ancestry of the current pick.
+  const iChildStack = [];
+  function selectParent() {
+    const p = iSel && iSel.parentElement;
+    if (!p || p === document.documentElement || p === document.body) return;
+    iChildStack.push(iSel);
+    $('#idown').disabled = false;
+    introSelect(p);
+  }
+  function backToChild() {
+    let prev;
+    while ((prev = iChildStack.pop()) && !prev.isConnected);   // skip nodes the page re-rendered away
+    $('#idown').disabled = !iChildStack.length;
+    if (prev) introSelect(prev);
   }
 
   function teardown() {
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
-    clearOutlines(); hi.remove(); frame.remove(); matchStyle.remove();
+    document.removeEventListener('scroll', positionSelBox, true);
+    window.removeEventListener('resize', positionSelBox);
+    clearOutlines(); clearHover(); hi.remove(); selBox.remove(); frame.remove(); matchStyle.remove();
     window.__BA_LEARN = null;
   }
 
@@ -530,6 +1056,7 @@
   function switchTab(next) {
     tab = next;
     clearOutlines();
+    positionSelBox();
     idoc.querySelectorAll('.tab').forEach((b) => b.classList.toggle('on', b.getAttribute('data-tab') === next));
     $('#tab-intro').classList.toggle('hidden', next !== 'intro');
     $('#tab-compose').classList.toggle('hidden', next !== 'compose');
@@ -548,6 +1075,13 @@
     $('#irepoint').addEventListener('change', toggleRepointLock);
     $('#isave').addEventListener('click', saveElement);
     $('#isuggest').addEventListener('click', suggestName);
+    $('#iup').addEventListener('click', selectParent);
+    $('#idown').addEventListener('click', backToChild);
+    $('#icancel').addEventListener('click', exitEdit);
+    $('#ianalyze').addEventListener('click', analyzeSelected);
+    $('#iauto').addEventListener('click', runAutoLearn);
+    $('#autoSave').addEventListener('click', saveAuto);
+    $('#autoDiscard').addEventListener('click', discardAuto);
 
     // Compose tab
     $('#ssave').addEventListener('click', saveSkill);
@@ -555,6 +1089,8 @@
     $('.x').addEventListener('click', teardown);
     document.addEventListener('mousemove', onMove, true);
     document.addEventListener('click', onClick, true);
+    document.addEventListener('scroll', positionSelBox, true);
+    window.addEventListener('resize', positionSelBox);
     loadElements();
   });
 

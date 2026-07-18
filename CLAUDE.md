@@ -1,8 +1,10 @@
 # Browser Agent (kajkor-browser-agent)
 
-Chrome MV3 extension + Node/Express backend (`backend/server.js`, port 4000) +
-remote MongoDB (shared). Tasks are plan-and-execute: a local Ollama model plans
-JSON phases, the extension runs each phase as a deterministic browser tool.
+Chrome MV3 extension + Node/Express backend (`backend/server.js`, fixed port
+**34730**) + remote MongoDB (shared). Tasks are plan-and-execute: a local Ollama
+model plans JSON phases, the extension runs each phase as a deterministic
+browser tool. A chat-first Electron desktop app (`desktop-app/`) is the main UI;
+it reuses this backend in dev and embeds it (same port 34730) when packaged.
 
 ## Layout
 - `backend/server.js` — API: tasks + planning, schemas, skills (v2 = element refs), elements, prompts, Ollama proxy
@@ -43,7 +45,7 @@ Elements on stepped forms/dialogs render late; a first-miss is NOT a failure.
   name so repeated runs accumulate into one collection.
 
 ## Testing
-- The user runs the backend on port 4000 — do NOT restart or kill it. For API
+- The user runs the backend on port 34730 — do NOT restart or kill it. For API
   tests boot a second instance (`PORT=4010 node backend/server.js`), clean up
   any test documents (Mongo is the real shared DB), and SHUT THE INSTANCE DOWN
   when done.

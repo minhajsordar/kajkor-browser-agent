@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"_sourceUrl":{"$numberInt":"1"}},"name":"_sourceUrl_1"}],"uuid":"087cdd0916e8451eb1860569f632624e","collectionName":"data_data-fb-post-item-lgle","type":"collection"}

@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"url":{"$numberInt":"1"}},"name":"url_1","unique":true}],"uuid":"844e0b74a49846f19dd2e7cf7c429e63","collectionName":"crm","type":"collection"}

@@ -2,7 +2,7 @@
 // Orchestrates: collect links -> open each page in a new tab ->
 // extract info -> close tab -> aggregate -> POST to backend.
 
-const BACKEND_URL = 'http://localhost:4000';
+const BACKEND_URL = 'http://localhost:34730';
 let running = false;
 
 function setStatus(patch) {
@@ -32,189 +32,6 @@ function waitForTabLoad(tabId, timeout = 30000) {
     chrome.tabs.onUpdated.addListener(listener);
     setTimeout(finish, timeout);
   });
-}
-
-// Open url in a background tab, message the content script, return the full
-// response object ({ ok, details, html, ... } or { ok:false, error }).
-async function extractFromUrl(url, msgType, wait = 5000, extra = {}) {
-  const tab = await chrome.tabs.create({ url, active: false });
-  try {
-    await waitForTabLoad(tab.id);
-    // Content script is auto-injected by manifest; give it a beat to attach.
-    await new Promise((r) => setTimeout(r, 800));
-    // Then let the content script wait for lazy sections to render.
-    const res = await chrome.tabs.sendMessage(tab.id, { type: msgType, wait, ...extra });
-    return res || { ok: false, error: 'no response' };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
-  } finally {
-    try { await chrome.tabs.remove(tab.id); } catch {}
-  }
-}
-
-// Open a page in a VISIBLE tab and run the chosen actions (follow and/or send
-// message) in that single visit. Closes the tab afterward.
-async function fbActions(url, actions) {
-  const tab = await chrome.tabs.create({ url, active: true });
-  try {
-    await waitForTabLoad(tab.id);
-    await new Promise((r) => setTimeout(r, 2000)); // let FB hydrate
-    const res = await chrome.tabs.sendMessage(tab.id, {
-      type: 'FB_ACTIONS',
-      doFollow: !!actions.doFollow,
-      doMessage: !!actions.doMessage,
-      message: actions.message
-    });
-    // Give it a moment to settle, then close the tab.
-    await new Promise((r) => setTimeout(r, 3000));
-    try { await chrome.tabs.remove(tab.id); } catch {}
-    return res || { ok: false, error: 'no response' };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
-  }
-}
-
-// Send a failed page's HTML to the backend, which saves it under sample/debug/.
-// Returns the saved relative path, or '' on failure.
-async function saveDebugHtml(base, url, name, html) {
-  try {
-    const resp = await fetch(`${base}/debug-html`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, name, html })
-    });
-    const data = await resp.json();
-    return data?.ok ? data.file : '';
-  } catch {
-    return '';
-  }
-}
-
-// POST a list of records to a backend store, returning a status suffix.
-async function postToBackend(base, path, records) {
-  try {
-    const resp = await fetch(`${base}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pages: records })
-    });
-    const data = await resp.json();
-    if (data?.ok) return ` Backend: +${data.added} new, ${data.updated} updated, ${data.total} total.`;
-    return ' Backend rejected data.';
-  } catch {
-    return ' Backend unreachable (is the server running?).';
-  }
-}
-
-// STEP 1: scroll the feed until `target` unique links are found -> /pages,
-// then AUTO-continue into visiting those links (unless stopped).
-async function runCollect(sourceTabId, options) {
-  running = true;
-  const target = options.target || 10;
-  setStatus({ running: true, phase: 'collecting', done: 0, total: target, results: [], message: `Scrolling to collect ${target} unique page links...` });
-
-  let links = [];
-  try {
-    const res = await chrome.tabs.sendMessage(sourceTabId, {
-      type: 'COLLECT_LINKS',
-      options: { target, delay: options.delay }
-    });
-    links = (res && res.ok && Array.isArray(res.links)) ? res.links : [];
-  } catch (e) {
-    setStatus({ running: false, phase: 'error', message: 'Could not read the Facebook tab: ' + (e?.message || e) });
-    running = false;
-    return;
-  }
-
-  const collected = links.map((l) => ({
-    url: l.url,
-    name: l.label || '',
-    collectedAt: new Date().toISOString()
-  }));
-  const backendMsg = await postToBackend(options.backendUrl || BACKEND_URL, '/pages', collected);
-  setStatus({ phase: 'collected', total: links.length, done: links.length, message: `Collected ${links.length} links.${backendMsg}` });
-
-  if (!running) { // stopped during collect — leave visiting to the manual button
-    setStatus({ running: false, phase: 'stopped', message: `Stopped. Collected ${links.length} links. Use "Visit & Get Details" to continue.` });
-    return;
-  }
-
-  // Auto-continue into visiting the just-collected links.
-  await runVisit(options, collected);
-}
-
-// URLs we should NOT visit again: already have details, or already checked and
-// found to be a non-page. Prevents re-visiting the same links on later runs.
-async function getVisitedSet(base) {
-  const skip = new Set();
-  try {
-    const pd = await fetch(`${base}/page-details`).then((r) => r.json());
-    (pd.pages || []).forEach((p) => skip.add(p.url)); // already scraped as a page
-  } catch {}
-  try {
-    const pg = await fetch(`${base}/pages`).then((r) => r.json());
-    (pg.pages || []).forEach((p) => { if (p.visited) skip.add(p.url); }); // already checked
-  } catch {}
-  return skip;
-}
-
-// STEP 2: visit each link (provided, or all stored in /pages), keep real Pages
-// -> /page-details. Skips links already visited so nothing is re-scraped.
-async function runVisit(options, providedLinks) {
-  running = true;
-  const base = options.backendUrl || BACKEND_URL;
-
-  let links = providedLinks;
-  if (!Array.isArray(links)) {
-    setStatus({ running: true, phase: 'loading', done: 0, total: 0, results: [], message: 'Loading collected links from backend...' });
-    try {
-      const resp = await fetch(`${base}/pages`);
-      const store = await resp.json();
-      links = Array.isArray(store?.pages) ? store.pages : [];
-    } catch (e) {
-      setStatus({ running: false, phase: 'error', message: 'Could not load links from backend: ' + (e?.message || e) });
-      running = false;
-      return;
-    }
-  }
-
-  // Drop links we've already visited (scraped or previously found non-page).
-  const visited = await getVisitedSet(base);
-  const already = links.filter((l) => visited.has(l.url)).length;
-  links = links.filter((l) => !visited.has(l.url));
-
-  if (!links || links.length === 0) {
-    setStatus({ running: false, phase: 'done', message: already ? `Nothing new to visit (${already} already done).` : 'No links to visit. Run "Collect Links" first.' });
-    running = false;
-    return;
-  }
-
-  setStatus({ phase: 'visiting', total: links.length, done: 0, results: [], message: `Visiting ${links.length} new pages${already ? ` (${already} already done)` : ''}...` });
-  const results = [];
-  let skipped = 0;
-  for (let i = 0; i < links.length; i++) {
-    if (!running) break; // stopped
-    const url = links[i].url;
-    const res = await extractFromUrl(url, 'EXTRACT_PAGE_DETAILS', options.wait || 5000);
-    const details = res && res.ok ? res.details : null;
-    if (details && details.isPage) {
-      details.listLabel = links[i].name || '';
-      if (res.html) {
-        const file = await saveDebugHtml(base, url, details.name, res.html);
-        if (file) details.debugHtml = file;
-      }
-      results.push(details);
-      await postToBackend(base, '/page-details', [details]); // incremental save
-      await postToBackend(base, '/pages', [{ url, visited: true, isPage: true }]); // mark done
-    } else {
-      skipped++;
-      await postToBackend(base, '/pages', [{ url, visited: true, isPage: false }]); // mark checked non-page
-    }
-    setStatus({ done: i + 1, total: links.length, results, message: `Visited ${i + 1}/${links.length} — ${results.length} pages, ${skipped} skipped` });
-  }
-
-  running = false;
-  setStatus({ running: false, phase: 'done', results, message: `Done. Saved ${results.length} page details (${skipped} non-pages skipped${already ? `, ${already} already done` : ''}).` });
 }
 
 // ======================= Agent orchestrator ================================
@@ -254,31 +71,6 @@ async function currentTab(taskId) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab) return tab.id;
   throw new Error('No page to act on — add a navigate phase first.');
-}
-
-// Find (or open) a Facebook feed tab for this task.
-async function ensureFacebookTab(taskId) {
-  const st = AGENT[taskId] || {};
-  if (st.tabId != null) {
-    try { const t = await chrome.tabs.get(st.tabId); if (t && /facebook\.com/.test(t.url || '')) return st.tabId; } catch {}
-  }
-  const others = ownedByOthers(taskId);
-  const tabs = await chrome.tabs.query({ url: '*://*.facebook.com/*' });
-  const free = tabs.find((t) => !others.has(t.id));
-  if (free) { AGENT[taskId] = { ...st, tabId: free.id }; return free.id; }
-  const created = await chrome.tabs.create({ url: 'https://www.facebook.com', active: true });
-  await waitForTabLoad(created.id);
-  await new Promise((r) => setTimeout(r, 1500));
-  AGENT[taskId] = { ...st, tabId: created.id };
-  return created.id;
-}
-
-// Merge collected links into the task doc (dedup by url), persisted immediately.
-async function mergeCollected(base, taskId, items) {
-  const t = await getTask(base, taskId);
-  const map = new Map((t?.collected || []).map((c) => [c.url, c]));
-  for (const it of items) if (it && it.url) map.set(it.url, { ...map.get(it.url), ...it });
-  await patchTask(base, taskId, { collected: [...map.values()] });
 }
 
 // Project a collected/extracted object onto a schema's fields, then tag it with
@@ -323,14 +115,6 @@ async function mergeRecords(base, taskId, records) {
     if (!seen.has(k)) { list.push(r); seen.add(k); }
   }
   await patchTask(base, taskId, { collected: list });
-}
-
-// Mark one url as extracted in the task doc (incremental for crash-safety).
-async function addExtracted(base, taskId, url) {
-  const t = await getTask(base, taskId);
-  const set = new Set(t?.extracted || []);
-  set.add(url);
-  await patchTask(base, taskId, { extracted: [...set] });
 }
 
 // Message a tab's content script, injecting content.js first if it isn't there
@@ -519,45 +303,6 @@ async function runTool(base, taskId, phase) {
     throw new Error(okMsg);
   }
 
-  if (phase.tool === 'scroll_and_collect_links') {
-    const tabId = await ensureFacebookTab(taskId);
-    const res = await msgTab(tabId, { type: 'COLLECT_LINKS', options: { target: p.target || 10, delay: p.delay || 1200 } });
-    const links = (res && res.ok && Array.isArray(res.links)) ? res.links : [];
-    const collected = links.map((l) => ({ url: l.url, name: l.label || '', collectedAt: new Date().toISOString() }));
-    if (collected.length) await postToBackend(base, '/pages', collected);
-    await mergeCollected(base, taskId, collected);
-    const t = await getTask(base, taskId);
-    if (t?.schemas?.length && collected.length) await saveToSchemas(base, taskId, t.schemas, collected);
-    await taskEvent(base, taskId, 'obs', `Collected ${links.length} links.`);
-    return;
-  }
-
-  if (phase.tool === 'visit_and_extract_details') {
-    const t = await getTask(base, taskId);
-    const collected = t?.collected || [];
-    const done = new Set(t?.extracted || []);
-    let n = 0;
-    for (const item of collected) {
-      if (!AGENT[taskId]?.running) break;
-      if (done.has(item.url)) continue;
-      const r = await extractFromUrl(item.url, 'EXTRACT_PAGE_DETAILS', 5000);
-      const details = r && r.ok ? r.details : null;
-      if (details && details.isPage) {
-        details.listLabel = item.name || '';
-        if (r.html) { const f = await saveDebugHtml(base, item.url, details.name, r.html); if (f) details.debugHtml = f; }
-        await postToBackend(base, '/page-details', [details]);
-        await postToBackend(base, '/pages', [{ url: item.url, visited: true, isPage: true }]);
-        if (t?.schemas?.length) await saveToSchemas(base, taskId, t.schemas, [details]);
-      } else {
-        await postToBackend(base, '/pages', [{ url: item.url, visited: true, isPage: false }]);
-      }
-      await addExtracted(base, taskId, item.url);
-      done.add(item.url); n++;
-      await taskEvent(base, taskId, 'obs', `Extracted ${n}: ${item.name || item.url}`);
-    }
-    return;
-  }
-
   if (phase.tool === 'use_skill') {
     const tabId = await currentTab(taskId);
     const tab = await chrome.tabs.get(tabId);
@@ -642,53 +387,6 @@ async function runTool(base, taskId, phase) {
     if (t?.schemas?.length && clean.length) await saveToSchemas(base, taskId, t.schemas, clean);
     await jf(`${base}/tasks/${taskId}/debug-items`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: debug }) });
     await taskEvent(base, taskId, 'obs', `Collected full text of ${clean.length} element(s).`);
-    return;
-  }
-
-  if (phase.tool === 'find_post') {
-    const tabId = await currentTab(taskId);
-    const t0 = await getTask(base, taskId);
-    const query = p.query || t0?.goal || '';
-    const target = Number(p.target) || 1;
-    const maxPosts = Number(p.maxPosts) || 40;   // per pass; the repeat loop can extend
-    let found = (t0?.collected || []).length;    // resume-safe: matches already saved
-    let checked = 0;
-    // A NEW task starts scanning from the TOP of the feed (the tab may be left
-    // scrolled by a previous task); a resumed/repeated task restores its saved
-    // scroll offset and continues from there. Both clear stale marks left in
-    // the tab by earlier tasks.
-    const startY = Number(t0?.scanY) || 0;
-    await msgTab(tabId, { type: 'RESET_SCAN', y: startY });
-    await taskEvent(base, taskId, 'obs', startY
-      ? `Resuming scan from saved scroll position (${startY}px).`
-      : 'Scrolled to the top of the feed — scanning from the first post.');
-    await taskEvent(base, taskId, 'act', `Scanning posts one by one for: "${query}"…`);
-    while (found < target && checked < maxPosts) {
-      if (!AGENT[taskId]?.running) break;
-      const r = await msgTab(tabId, { type: 'SCAN_NEXT_POST' });
-      if (!r || !r.ok) throw new Error((r && r.error) || 'post scan failed');
-      if (r.y != null) await patchTask(base, taskId, { scanY: r.y }); // persist progress
-      if (r.noMore) { await taskEvent(base, taskId, 'obs', 'No more posts to scan on this page.'); break; }
-      checked++;
-      const post = r.post || {};
-      const preview = (post.text || '').slice(0, 70).replace(/\s+/g, ' ');
-      const m = await jf(`${base}/ai/match-post`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: t0.model, query, text: post.text }),
-      }).catch(() => null);
-      if (m && m.ok === false && m.error) throw new Error(m.error);
-      if (m && m.match) {
-        found++;
-        const rec = { text: (post.text || '').slice(0, 4000), url: post.url || '', match_reason: m.reason || '' };
-        await mergeRecords(base, taskId, [rec]);
-        const t = await getTask(base, taskId);
-        if (t?.schemas?.length) await saveToSchemas(base, taskId, t.schemas, [rec]);
-        await taskEvent(base, taskId, 'ok', `Post ${checked} MATCHES (${found}/${target}): ${preview}…`);
-      } else {
-        await taskEvent(base, taskId, 'obs', `Post ${checked}: no match — ${preview}…`);
-      }
-    }
-    await taskEvent(base, taskId, 'obs', `Scanned ${checked} post(s) this pass, found ${found}/${target}.`);
     return;
   }
 
@@ -887,7 +585,11 @@ chrome.runtime.onStartup.addListener(() => resumeUnfinished());
 // when nothing is running.
 function startKeepAlive() { chrome.alarms.create('ba-keepalive', { periodInMinutes: 0.4 }); }
 function stopKeepAlive() { chrome.alarms.clear('ba-keepalive'); }
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'ba-keepalive') resumeUnfinished(); });
+// Standing poll (always on, MV3 minimum interval): external frontends — the
+// desktop app — create tasks purely through the backend API, so this is what
+// notices and starts them even when no extension UI was ever opened.
+chrome.alarms.create('ba-task-poll', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'ba-keepalive' || a.name === 'ba-task-poll') resumeUnfinished(); });
 
 // Every time the worker spins up (startup, reload, wake), revive orphaned tasks.
 resumeUnfinished();
@@ -895,27 +597,7 @@ resumeUnfinished();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === 'START_COLLECT') {
-        if (running) { sendResponse({ ok: false, error: 'Already running' }); return; }
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab || !/facebook\.com/.test(tab.url || '')) {
-          sendResponse({ ok: false, error: 'Open a Facebook tab first' });
-          return;
-        }
-        sendResponse({ ok: true });
-        runCollect(tab.id, msg.options || {});
-      } else if (msg?.type === 'START_VISIT') {
-        if (running) { sendResponse({ ok: false, error: 'Already running' }); return; }
-        sendResponse({ ok: true });
-        runVisit(msg.options || {});
-      } else if (msg?.type === 'FB_ACTIONS') {
-        const res = await fbActions(msg.url, {
-          doFollow: !!msg.doFollow,
-          doMessage: !!msg.doMessage,
-          message: msg.message
-        });
-        sendResponse(res);
-      } else if (msg?.type === 'START_AGENT_TASK') {
+      if (msg?.type === 'START_AGENT_TASK') {
         startKeepAlive();
         sendResponse({ ok: true });
         runAgentTask(msg.taskId);

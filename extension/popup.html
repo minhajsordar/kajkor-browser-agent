@@ -1,129 +1,25 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Browser Agent</title>
-    <link rel="stylesheet" href="popup.css" />
-  </head>
-  <body>
-    <header class="topbar">
-      <div class="brand">
-        <span class="dot"></span>
-        <h1>Browser Agent</h1>
-      </div>
-      <div class="model">
-        <select id="model" title="Ollama model (tool-calling only)">
-          <option value="">Loading models…</option>
-        </select>
-        <button id="modelRefresh" class="icon-btn" title="Refresh models">↻</button>
-      </div>
-    </header>
+<head>
+  <meta charset="utf-8" />
+  <title>Kajkor Agent</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">🤖</span>
+    <div>
+      <h1>Kajkor Agent</h1>
+      <p class="sub">Executor — tasks are driven from the desktop app</p>
+    </div>
+  </header>
 
-    <!-- IDLE: task composer -->
-    <section id="composer" class="view">
-      <label class="lbl" for="taskInput">What do you want the agent to do?</label>
-      <textarea
-        id="taskInput"
-        rows="4"
-        placeholder="e.g. Collect Facebook pages from my feed and save their contact info.&#10;e.g. Open my dashboard every 10 min and tell me if any job failed."></textarea>
+  <button id="learnBtn" title="Open the learning overlay on the current page: introduce elements, compose skills, or auto-learn with AI">
+    🎓 Teach this page
+  </button>
 
-      <label class="repeat">
-        <input type="checkbox" id="repeat" />
-        <span>Repetitive — keep running until the goal is met</span>
-      </label>
+  <p id="hint" class="hint hidden"></p>
 
-      <div class="schema-pick">
-        <div class="schema-head">
-          <span>System prompt <span class="mut">(optional)</span></span>
-          <a id="managePrompts" href="#">Manage prompts</a>
-        </div>
-        <select id="promptSelect" class="msd-btn">
-          <option value="">None</option>
-        </select>
-      </div>
-
-      <div class="schema-pick">
-        <div class="schema-head">
-          <span>Use learned skill <span class="mut">(optional)</span></span>
-          <a id="manageSkills2" href="#">Manage skills</a>
-        </div>
-        <div class="msd">
-          <button type="button" id="skillBtn" class="msd-btn">
-            <span class="msd-label">None</span>
-            <span class="msd-caret">▾</span>
-          </button>
-          <div id="skillSelect" class="msd-panel hidden"></div>
-        </div>
-      </div>
-
-      <div class="schema-pick">
-        <div class="schema-head">
-          <span>Save into schema <span class="mut">(optional)</span></span>
-          <a id="manageSchemas" href="#">Manage schemas</a>
-        </div>
-        <div class="msd">
-          <button type="button" id="schemaBtn" class="msd-btn">
-            <span class="msd-label">None</span>
-            <span class="msd-caret">▾</span>
-          </button>
-          <div id="schemaSelect" class="msd-panel hidden"></div>
-        </div>
-      </div>
-
-      <button id="sendBtn" class="btn primary block">
-        <span>Start task</span>
-        <kbd>⌘↵</kbd>
-      </button>
-
-      <p class="hint">The agent uses your local Ollama model to plan, act in the browser, watch the result, then decide to continue or finish.</p>
-      <p id="modelHint" class="hint warn-hint hidden"></p>
-
-      <button id="learnBtn" class="btn block" style="margin-top:6px">🎓 Start learning session — teach the current page</button>
-
-      <div id="active" class="active-list"></div>
-      <div id="recent" class="recent"></div>
-    </section>
-
-    <!-- RUNNING: task session -->
-    <section id="session" class="view hidden">
-      <div class="sess-head">
-        <div class="sess-task" id="sessTask">—</div>
-        <span class="badge" id="sessBadge">idle</span>
-      </div>
-      <div class="sess-meta">
-        <span id="sessElapsed">0s</span>
-        <span class="sep">·</span>
-        <span id="sessSteps">0 steps</span>
-        <span class="sep">·</span>
-        <span id="sessMode">once</span>
-      </div>
-
-      <div id="log" class="log" aria-live="polite"></div>
-
-      <div id="question" class="question hidden">
-        <div id="questionText" class="q-text"></div>
-        <div class="q-actions">
-          <button id="qYes" class="btn sm primary">✔ Approve</button>
-          <button id="qNo" class="btn sm warn">✘ Decline</button>
-        </div>
-      </div>
-
-      <div class="sess-controls">
-        <button id="backBtn" class="btn sm">← Tasks</button>
-        <button id="continueBtn" class="btn sm">Continue</button>
-        <button id="stopBtn" class="btn sm warn">Stop</button>
-      </div>
-    </section>
-
-    <footer class="foot">
-      <a id="dashLink" href="#">Dashboard</a>
-      <span class="foot-sep">·</span>
-      <a id="skillsLink" href="#">Skills</a>
-      <span class="foot-sep">·</span>
-      <a id="fbLink" href="#">FB (legacy)</a>
-    </footer>
-
-    <script src="popup.js"></script>
-  </body>
+  <script src="popup.js"></script>
+</body>
 </html>

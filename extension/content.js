@@ -1,98 +1,14 @@
-// Facebook Page Scraper - content script
-// Runs on *.facebook.com. Two jobs:
-//  1) On a feed/search page: scroll and collect candidate Page links.
-//  2) On a Page profile: extract page info.
+// Browser tool runtime - content script
+// Runs on all pages. Provides the generic in-page tools the agent drives
+// (scroll, click, type, collect_text, learned-skill runtime) plus the Teach
+// learning overlay's element resolver.
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- Link collection -------------------------------------------------------
-
-// Paths that are clearly NOT a page profile.
-const NON_PAGE_SEGMENTS = new Set([
-  'watch', 'reel', 'reels', 'story', 'stories', 'groups', 'events',
-  'marketplace', 'gaming', 'photo', 'photo.php', 'videos', 'video.php',
-  'permalink.php', 'posts', 'sharer', 'sharer.php', 'login', 'help',
-  'settings', 'bookmarks', 'friends', 'messages', 'notifications',
-  'search', 'hashtag', 'l.php', 'ajax', 'privacy', 'policies'
-]);
-
-function normalizePageUrl(href) {
-  let u;
-  try { u = new URL(href, location.origin); } catch { return null; }
-  if (!/(^|\.)facebook\.com$/.test(u.hostname)) return null;
-
-  // profile.php?id=... is a valid page/profile URL
-  if (u.pathname === '/profile.php' && u.searchParams.get('id')) {
-    return `${u.origin}/profile.php?id=${u.searchParams.get('id')}`;
-  }
-
-  const seg = u.pathname.split('/').filter(Boolean);
-  if (seg.length === 0) return null;
-  const first = seg[0].toLowerCase();
-  if (NON_PAGE_SEGMENTS.has(first)) return null;
-
-  // /people/Name/1000... -> keep as-is (profile)
-  // /PageSlug -> keep the slug only, drop deep post paths
-  if (first === 'people' || first === 'pages') {
-    return `${u.origin}/${seg.slice(0, 3).join('/')}`;
-  }
-  // A page slug: strip trailing sub-paths like /about, /photos
-  return `${u.origin}/${seg[0]}`;
-}
-
-// The feed lives inside <div role="main">. Page links sit inside each post's
-// header anchor, with the page name in a <span class="html-span"> child.
+// The main content region, when a page marks one; else the whole body. Used as
+// the scroll scope by the scroll/collect tools.
 function getMainScope() {
   return document.querySelector('div[role="main"]') || document.body;
-}
-
-function grabPageLinks(found) {
-  const scope = getMainScope();
-
-  // Primary: the page-name span inside a post anchor.
-  scope.querySelectorAll('a[href] span.html-span').forEach((span) => {
-    const a = span.closest('a[href]');
-    if (!a) return;
-    const url = normalizePageUrl(a.getAttribute('href'));
-    if (!url) return;
-    const name = (span.textContent || '').trim();
-    if (!name) return;
-    if (!found.has(url)) found.set(url, name);
-    else if (!found.get(url) && name) found.set(url, name);
-  });
-
-  // Fallback: any page anchor inside main that has visible text.
-  scope.querySelectorAll('a[href]').forEach((a) => {
-    const url = normalizePageUrl(a.getAttribute('href'));
-    if (!url || found.has(url)) return;
-    const name = (a.textContent || '').trim().slice(0, 120);
-    if (name) found.set(url, name);
-  });
-}
-
-// Scroll (slowly) until `target` unique page links are collected, or the feed
-// stops yielding new ones. De-duped by url via the Map.
-async function scrollAndCollectLinks({ target = 10, delay = 1200, maxScrolls = 300 } = {}) {
-  const found = new Map(); // url -> name (unique)
-  const scope = getMainScope();
-
-  grabPageLinks(found);
-  let stagnant = 0;
-  for (let i = 0; i < maxScrolls && found.size < target; i++) {
-    const before = found.size;
-    // ~80% of a viewport per step, inside main if it scrolls, else the window.
-    if (scope && scope.scrollHeight > scope.clientHeight + 4) {
-      scope.scrollTop += Math.round(scope.clientHeight * 0.8);
-    } else {
-      window.scrollBy(0, Math.round(window.innerHeight * 0.8));
-    }
-    await sleep(delay);
-    grabPageLinks(found);
-    // Stop if the feed stops producing new links (end reached / rate-limited).
-    if (found.size === before) { if (++stagnant >= 8) break; } else stagnant = 0;
-  }
-
-  return Array.from(found, ([url, label]) => ({ url, label })).slice(0, target);
 }
 
 // The largest horizontally-scrollable container currently in view — a carousel,
@@ -130,489 +46,11 @@ async function scrollPage(times = 10, delay = 1200, direction = 'vertical') {
   return done;
 }
 
-// Click the page's Follow button unless already Following. Returns the outcome.
-function clickFollowIfNeeded() {
-  if (document.querySelector('div[aria-label="Following"][role="button"]')) return 'already-following';
-  const btn = document.querySelector('div[aria-label="Follow"][role="button"]');
-  if (btn) { btn.click(); return 'followed'; }
-  return 'no-button';
-}
-
-// --- Page info extraction --------------------------------------------------
-
-function textOf(el) {
-  return el ? (el.textContent || '').trim() : '';
-}
-
-function firstMatch(regex) {
-  const m = document.body.innerText.match(regex);
-  return m ? m[0].trim() : '';
-}
-
-function extractPageInfo() {
-  const info = {
-    url: location.href,
-    name: '',
-    title: document.title || '',
-    category: '',
-    likes: '',
-    followers: '',
-    intro: '',
-    website: '',
-    phone: '',
-    email: '',
-    address: '',
-    profileImage: '',
-    collectedAt: new Date().toISOString()
-  };
-
-  // Name: prefer h1, fall back to og:title / document title
-  const h1 = document.querySelector('h1');
-  info.name = textOf(h1) ||
-    document.querySelector('meta[property="og:title"]')?.content ||
-    (document.title || '').replace(/\s*\|\s*Facebook.*/i, '').trim();
-
-  // Profile image
-  info.profileImage =
-    document.querySelector('meta[property="og:image"]')?.content || '';
-
-  // Intro / description
-  info.intro =
-    document.querySelector('meta[property="og:description"]')?.content ||
-    document.querySelector('meta[name="description"]')?.content || '';
-
-  // Followers / likes from visible text (best-effort, FB markup is unstable)
-  const followers = firstMatch(/[\d.,]+[KMB]?\s+followers/i);
-  const likes = firstMatch(/[\d.,]+[KMB]?\s+likes/i);
-  info.followers = followers;
-  info.likes = likes;
-
-  // Website / email / phone from visible links & text
-  const links = Array.from(document.querySelectorAll('a[href]'));
-  const site = links.find((a) => /l\.php\?u=/.test(a.href) || /^https?:\/\//.test(a.getAttribute('href') || ''));
-  if (site) {
-    let href = site.href;
-    const m = href.match(/l\.php\?u=([^&]+)/);
-    info.website = m ? decodeURIComponent(m[1]) : (site.getAttribute('href') || '');
-  }
-  const mail = links.find((a) => /^mailto:/.test(a.getAttribute('href') || ''));
-  if (mail) info.email = mail.getAttribute('href').replace(/^mailto:/, '');
-  const tel = links.find((a) => /^tel:/.test(a.getAttribute('href') || ''));
-  if (tel) info.phone = tel.getAttribute('href').replace(/^tel:/, '');
-
-  // Category often sits right under the name
-  info.category = firstMatch(/\b(Local business|Business|Product\/service|Company|Public figure|Community|Shopping & retail|Restaurant|Media\/news company|Education)\b/i);
-
-  return info;
-}
-
-// --- Page-details extraction (only for real Pages) -------------------------
-//
-// Facebook's class names are obfuscated and rotate, so selectors below chain
-// STABLE anchors (aria-label / role / href params / heading text) from ancestor
-// down to child. That keeps each pointer unique and resilient.
-
-// Collapse runs of whitespace/newlines so exact-text matches survive FB's
+// Collapse runs of whitespace/newlines so exact-text matches survive
 // pretty-printed / line-wrapped markup.
 function norm(t) {
   return (t || '').replace(/\s+/g, ' ').trim();
 }
-
-// Detect a Facebook Page. Primary signal is the standalone "Followers" label,
-// but layouts vary, so also accept a followers link or a "N followers" count.
-function isFacebookPage() {
-  for (const s of document.querySelectorAll('span')) {
-    if (norm(s.textContent) === 'Followers') return true;
-  }
-  if (document.querySelector('a[href*="sk=followers"], a[href*="/followers"]')) return true;
-  if (/[\d.,]+\s*[kmb]?\s*followers/i.test(norm(document.body.innerText))) return true;
-  return false;
-}
-
-// Strip Facebook tracking params (fbclid, etc.) from a URL.
-function cleanUrl(u) {
-  try {
-    const url = new URL(u);
-    ['fbclid', 'mibextid', '__tn__', '__cft__', 'eav', '_rdr', 'h', 's'].forEach((p) => url.searchParams.delete(p));
-    return url.toString().replace(/\?$/, '');
-  } catch {
-    return u;
-  }
-}
-
-// l.facebook.com/l.php?u=<encoded real url> -> real url (tracking stripped)
-function decodeFbLink(href) {
-  if (!href) return '';
-  let out = href;
-  try {
-    const u = new URL(href, location.origin);
-    if (/(^|\.)facebook\.com$/.test(u.hostname) && u.pathname === '/l.php') {
-      const real = u.searchParams.get('u');
-      if (real) out = real;
-    }
-  } catch {
-    const m = href.match(/[?&]u=([^&]+)/);
-    if (m) { try { out = decodeURIComponent(m[1]); } catch {} }
-  }
-  return cleanUrl(out);
-}
-
-function hostOf(url) {
-  try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; }
-}
-
-// True if a decoded link is a real external website (not fb/social/map/whatsapp).
-function isWebsiteLink(dec) {
-  const host = hostOf(dec);
-  if (!host || /facebook\.com$/.test(host)) return false;
-  if (/instagram\.com$|tiktok\.com$|twitter\.com$|x\.com$|youtube\.com$|linkedin\.com$/.test(host)) return false;
-  if (/whatsapp\.com$|wa\.me$/.test(host)) return false;
-  if (/bing\.com$|google\.[^/]+$/.test(host)) return false;
-  if (/\/maps\//i.test(dec) || /[?&]where1=/i.test(dec)) return false;
-  return true;
-}
-
-// The page name node sits just above the "... followers" row. Climb from the
-// followers link and pick the first real label that isn't a stat or an action.
-function domHeaderName() {
-  const fol = document.querySelector('a[href*="sk=followers"], a[href*="/followers"]');
-  let block = fol ? fol.parentElement : null;
-  for (let i = 0; i < 8 && block; i++) {
-    for (const el of block.querySelectorAll('[role="button"], a[href]')) {
-      // skip the follower/following stat links themselves
-      if (el.matches('a[href*="sk="], a[href*="/followers"], a[href*="/following"]')) continue;
-      // Drop the trailing verified-badge screen-reader text.
-      const name = norm(el.textContent).replace(/\s*Verified account$/i, '').trim();
-      if (name && name.length <= 80 &&
-          !/^[\d.,]+[kmb]?$/i.test(name) &&
-          !/follower|following/i.test(name) &&
-          !/^(follow|message|share|like|see more|more)$/i.test(name)) {
-        return name;
-      }
-    }
-    block = block.parentElement;
-  }
-  return '';
-}
-
-// Page name — prefer the DOM header (reliable even when the tab title is still
-// the generic "Facebook"); fall back to og:title / document.title.
-function findName() {
-  const dom = domHeaderName();
-  if (dom) return dom;
-  const clean = (s) => (s || '').replace(/\s*[|·\-–]\s*Facebook.*$/i, '').trim();
-  const og = clean(document.querySelector('meta[property="og:title"]')?.content);
-  if (og && og.toLowerCase() !== 'facebook') return og;
-  const t = clean(document.title);
-  if (t && t.toLowerCase() !== 'facebook') return t;
-  return og || t || '';
-}
-
-// Follower/following count. Handles all layouts:
-//  - profile.php pages: <a href="...sk=followers"><strong>35K</strong> followers</a>
-//  - vanity pages:      <a href="/PageName/followers">...</a>
-//  - plain text:        "35K followers"
-function statCount(kind) {
-  // 1) dedicated link (sk= param or /followers path)
-  const a = document.querySelector(`a[href*="sk=${kind}"], a[href*="/${kind}"]`);
-  if (a) {
-    const strong = a.querySelector('strong');
-    const t = norm(strong ? strong.textContent : a.textContent);
-    const m = t.match(/[\d.,]+\s*[kmb]?/i);
-    if (m) return m[0].replace(/\s+/g, '');
-    if (t) return t;
-  }
-  // 2) text fallback: "35K followers" / "1,234 followers"
-  const m = norm(document.body.innerText).match(new RegExp('([\\d.,]+\\s*[kmb]?)\\s*' + kind, 'i'));
-  return m ? m[1].replace(/\s+/g, '') : '';
-}
-
-// Bio — the description block rendered directly above the
-// <span aria-label="Highlighted details"> list.
-function findBio() {
-  const hd = document.querySelector('span[aria-label="Highlighted details"]');
-  if (!hd) return '';
-  let el = hd;
-  for (let up = 0; up < 10 && el; up++) {
-    let prev = el.previousElementSibling;
-    while (prev) {
-      const t = norm(prev.textContent);
-      if (t && t.length > 1 && !/follower|following|highlighted details/i.test(t)) {
-        return t;
-      }
-      prev = prev.previousElementSibling;
-    }
-    el = el.parentElement;
-  }
-  return '';
-}
-
-// All inner texts of the "Highlighted details" list. Page owners put varied
-// info here (category, social handle, phone, "Rating", "Price range"...), so
-// keep the raw list too.
-function getHighlights() {
-  const hd = document.querySelector('span[aria-label="Highlighted details"]');
-  if (!hd) return [];
-  return [...hd.querySelectorAll('[role="listitem"]')]
-    .map((it) => norm(it.textContent))
-    .filter(Boolean);
-}
-
-// Category — first Highlighted-details item that isn't a phone or a social handle.
-function findCategory() {
-  const hd = document.querySelector('span[aria-label="Highlighted details"]');
-  if (!hd) return '';
-  for (const it of hd.querySelectorAll('[role="listitem"]')) {
-    if (it.querySelector('a[href]')) continue; // social/link rows, not the category
-    const t = norm(it.textContent);
-    if (t && !/\+?\d[\d\s().\-]{6,}\d/.test(t)) return t;
-  }
-  return '';
-}
-
-// Phone can live as plain text in the Highlighted-details list.
-function highlightPhone() {
-  const hd = document.querySelector('span[aria-label="Highlighted details"]');
-  if (!hd) return '';
-  for (const it of hd.querySelectorAll('[role="listitem"]')) {
-    if (it.querySelector('a[href]')) continue;
-    const m = norm(it.textContent).match(/\+?\d[\d\s().\-]{6,}\d/);
-    if (m) return norm(m[0]);
-  }
-  return '';
-}
-
-// Locate the "Contact info" list by heading text -> its id -> aria-labelledby.
-function contactInfoList() {
-  let id = '';
-  for (const s of document.querySelectorAll('h2 span[id], span[id]')) {
-    if (norm(s.textContent) === 'Contact info') { id = s.id; break; }
-  }
-  if (!id) return null;
-  try { return document.querySelector(`[aria-labelledby="${CSS.escape(id)}"]`); } catch { return null; }
-}
-
-// Classify each row inside the Contact info list.
-function parseContactInfo() {
-  const out = { phone: '', email: '', website: '', address: '' };
-  const list = contactInfoList();
-  if (!list) return out;
-  for (const row of list.querySelectorAll('[role="listitem"]')) {
-    const mail = row.querySelector('a[href^="mailto:"]');
-    if (mail) { out.email = mail.getAttribute('href').replace(/^mailto:/, ''); continue; }
-
-    const link = row.querySelector('a[href]');
-    if (link) {
-      const raw = link.getAttribute('href') || '';
-      const dec = decodeFbLink(link.href);
-      const isMap = /bing\.com\/maps|google\.[^/]+\/maps|[?&]where1=/i.test(raw) || /\/maps\//i.test(dec);
-      if (isMap) { out.address = norm(link.textContent); continue; }
-      if (!out.website && isWebsiteLink(dec)) { out.website = dec; continue; }
-    }
-
-    const txt = norm(row.textContent);
-    const pm = txt.match(/\+?\d[\d\s().\-]{6,}\d/);
-    if (pm && !out.phone) out.phone = norm(pm[0]);
-  }
-  return out;
-}
-
-// Address can live in a separate "About" list (not always under Contact info).
-// The map link is a stable signal — Bing/Google maps or a where1= query.
-function findAddress() {
-  for (const a of document.querySelectorAll('[role="listitem"] a[href], a[href]')) {
-    const dec = decodeFbLink(a.href);
-    if (/\/maps\//i.test(dec) || /[?&]where1=/i.test(dec) || /bing\.com\/maps/i.test(dec)) {
-      const t = norm(a.textContent);
-      if (t) return t;
-    }
-  }
-  return '';
-}
-
-// Website — first external link in an info list that isn't a map/social/whatsapp.
-function findWebsite() {
-  for (const a of document.querySelectorAll('[role="listitem"] a[href]')) {
-    const dec = decodeFbLink(a.href);
-    if (isWebsiteLink(dec)) return dec;
-  }
-  return '';
-}
-
-// Email anywhere: a mailto link, else an email pattern in visible text.
-function findEmail() {
-  const a = document.querySelector('a[href^="mailto:"]');
-  if (a) return a.getAttribute('href').replace(/^mailto:/, '').split('?')[0];
-  const m = norm(document.body.innerText).match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
-  return m ? m[0] : '';
-}
-
-// Phone anywhere: a tel: link, else the WhatsApp number.
-function findPhone() {
-  const a = document.querySelector('a[href^="tel:"]');
-  if (a) return a.getAttribute('href').replace(/^tel:/, '');
-  return '';
-}
-
-// Instagram / TikTok links anywhere on the page (via l.php decode).
-function findSocials() {
-  const res = { instagram: '', tiktok: '' };
-  for (const a of document.querySelectorAll('a[href]')) {
-    const dec = decodeFbLink(a.href);
-    const host = hostOf(dec);
-    if (/instagram\.com$/.test(host) && !res.instagram) res.instagram = dec;
-    else if (/tiktok\.com$/.test(host) && !res.tiktok) res.tiktok = dec;
-  }
-  return res;
-}
-
-// Page logo — the <image> inside the profile-picture <svg> holds the real fbcdn
-// URL (xlink:href). Prefer it over og:image (often just a share card).
-function findLogo() {
-  const svgImg = document.querySelector('.x1dus1kp svg image') || document.querySelector('svg image');
-  const href = svgImg
-    ? (svgImg.getAttribute('xlink:href') ||
-       svgImg.getAttributeNS('http://www.w3.org/1999/xlink', 'href') ||
-       svgImg.getAttribute('href') || '')
-    : '';
-  return href || document.querySelector('meta[property="og:image"]')?.content || '';
-}
-
-// Page banner — the cover photo, tagged data-imgperflogname="profileCoverPhoto".
-function findCover() {
-  const el = document.querySelector('[data-imgperflogname="profileCoverPhoto"]');
-  if (!el) return '';
-  const img = el.tagName === 'IMG' ? el : el.querySelector('img');
-  if (img && img.getAttribute('src')) return img.getAttribute('src');
-  const bg = el.getAttribute('style') || '';
-  const m = bg.match(/url\(["']?(.*?)["']?\)/);
-  return m ? m[1] : '';
-}
-
-// Phone fallback from the WhatsApp CTA button, if present.
-function whatsappPhone() {
-  const a = document.querySelector('a[aria-label="WhatsApp"]');
-  if (!a) return '';
-  const dec = decodeFbLink(a.href);
-  const m = dec.match(/[?&]phone=([^&]+)/);
-  if (!m) return '';
-  try { return decodeURIComponent(m[1]).trim(); } catch { return m[1]; }
-}
-
-function extractPageDetails() {
-  const details = {
-    url: location.href,
-    name: findName(),
-    isPage: isFacebookPage(),
-    category: '',
-    followers: '',
-    following: '',
-    bio: '',
-    phone: '',
-    email: '',
-    whatsapp: '',
-    website: '',
-    address: '',
-    instagram: '',
-    tiktok: '',
-    highlights: [],
-    logo: '',
-    cover: '',
-    collectedAt: new Date().toISOString()
-  };
-
-  if (!details.isPage) return details; // caller skips non-pages
-
-  details.logo = findLogo();
-  details.cover = findCover();
-  details.highlights = getHighlights();
-  details.category = findCategory();
-  details.followers = statCount('followers'); // e.g. "35K"
-  details.following = statCount('following');
-  details.bio = findBio() ||
-    document.querySelector('meta[property="og:description"]')?.content || '';
-
-  const contact = parseContactInfo();
-  details.whatsapp = whatsappPhone();
-  details.phone = contact.phone || findPhone() || highlightPhone() || details.whatsapp;
-  details.email = contact.email || findEmail();
-  details.website = contact.website || findWebsite();
-  details.address = contact.address || findAddress();
-
-  const social = findSocials();
-  details.instagram = social.instagram;
-  details.tiktok = social.tiktok;
-
-  return details;
-}
-
-// Which fields we'd expect on a healthy Page. Used to flag partial extractions.
-const CORE_FIELDS = ['name', 'followers', 'phone', 'email', 'website', 'address', 'bio'];
-
-function missingCoreFields(details) {
-  return CORE_FIELDS.filter((f) => !details[f]);
-}
-
-// Save the HTML for debugging only on a likely FAILURE, not a page that simply
-// lacks optional info: name/followers empty, or NO contact info found at all.
-function shouldSaveDebugHtml(details) {
-  if (!details.name || !details.followers) return true;
-  if (!details.phone && !details.email && !details.website && !details.address) return true;
-  return false;
-}
-
-// Fill empty fields of `a` from `b`; keep the richer highlights list.
-function mergeDetails(a, b) {
-  const out = { ...a };
-  for (const k of Object.keys(b)) {
-    const bv = b[k];
-    if (Array.isArray(bv)) { if ((out[k]?.length || 0) < bv.length) out[k] = bv; }
-    else if (typeof bv === 'boolean') { out[k] = out[k] || bv; }
-    else if (!out[k] && bv) { out[k] = bv; }
-  }
-  return out;
-}
-
-// Step-scroll down the whole page (height grows as content lazy-loads), pausing
-// at each step so sections render, then return to the top. Used before extract.
-async function hydratePage(steps = 10, stepDelay = 1000) {
-  for (let i = 1; i <= steps; i++) {
-    window.scrollTo(0, Math.round(document.body.scrollHeight * (i / steps)));
-    await sleep(stepDelay);
-  }
-  // Sit at the very bottom a moment so the last lazy sections finish loading.
-  window.scrollTo(0, document.body.scrollHeight);
-  await sleep(1500);
-  window.scrollTo(0, 0);
-  await sleep(1500);
-}
-
-// Extract, and if fields look incomplete, wait + scroll and try again (up to
-// `attempts`). Later passes see more lazily-loaded content; results are merged.
-async function extractPageDetailsWithRetry({ wait = 5000, attempts = 3 } = {}) {
-  let best = null;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    if (attempt === 1) await sleep(wait);
-
-    // Force lazy sections (Intro / Contact info card, About, posts) to hydrate.
-    // Long pages only render a section once it's scrolled near, so step down
-    // the WHOLE page (recomputing height as it grows), then return to the top.
-    await hydratePage(7, 900);
-
-    const d = extractPageDetails();
-    best = best ? mergeDetails(best, d) : d;
-    best.isPage = best.isPage || d.isPage;
-    best.missingFields = best.isPage ? missingCoreFields(best) : [];
-
-    const incomplete = !best.isPage || shouldSaveDebugHtml(best);
-    const worthRetrying = best.isPage ||
-      document.querySelector('a[href*="sk=followers"], a[href*="/followers"]');
-    if (!incomplete || !worthRetrying) break;
-  }
-  return best;
-}
-
-// --- Messenger automation --------------------------------------------------
 
 // Poll for an element until it appears or times out.
 function waitForEl(selector, timeout = 8000, interval = 200) {
@@ -683,69 +121,6 @@ async function insertIntoLexical(editor, text) {
   if (editorText(editor)) return 'beforeinput';
 
   return '';
-}
-
-// Close every docked/open chat window (staggered clicks), then wait ~1s.
-async function closeAllChats() {
-  const closers = document.querySelectorAll('[aria-label="Close chat"]');
-  closers.forEach((b, i) => setTimeout(() => { try { b.click(); } catch {} }, i * 100));
-  await sleep((closers.length * 100) + 1000);
-}
-
-// Send a message in the page's chat composer. Returns { ok, method, sent }.
-async function sendChatMessage(message) {
-  const msgBtn = document.querySelector(
-    'div[aria-label="Message"][role="button"], div[aria-label="Send message"][role="button"]'
-  );
-  if (!msgBtn) return { ok: false, error: 'Message button not found on this page' };
-  msgBtn.click();
-
-  // The chat input is uniquely scoped inside the "Thread composer" container —
-  // this avoids the page's comment boxes (also Lexical contenteditables).
-  const CHAT_INPUT = 'div[aria-label="Thread composer"] div[contenteditable="true"][role="textbox"]';
-  const found = await waitForEl(CHAT_INPUT, 10000);
-  if (!found) return { ok: false, error: 'Chat composer did not open' };
-  await sleep(700);
-  const editor = document.querySelector(CHAT_INPUT) || found;
-
-  const method = await insertIntoLexical(editor, message || '');
-  if (!method) return { ok: false, error: 'Could not insert text into composer' };
-
-  await sleep(400);
-  const sendBtn = document.querySelector('div[aria-label="Press Enter to send"]');
-  if (!sendBtn) return { ok: true, method, sent: false, error: 'Send button not found' };
-  sendBtn.click();
-  await sleep(3000);
-  await closeAllChats();
-  return { ok: true, method, sent: true };
-}
-
-// Run the selected FB actions on this page in a SINGLE visit: optionally follow
-// and/or send a message. Both happen in one tab, not separately.
-async function fbRunActions({ doFollow, doMessage, message }) {
-  // 1) Let the page finish loading before touching anything.
-  await sleep(2500);
-  // 2) Close any docked/open chat windows, then wait ~1s.
-  await closeAllChats();
-
-  const out = { ok: true };
-
-  // 3) Follow first (quick, header button).
-  if (doFollow) {
-    out.followAction = clickFollowIfNeeded();
-    await sleep(800);
-  }
-
-  // 4) Then message.
-  if (doMessage) {
-    const r = await sendChatMessage(message);
-    out.method = r.method;
-    out.sent = !!r.sent;
-    if (!r.ok) { out.messageError = r.error; }
-    else if (!r.sent) { out.messageError = r.error; }
-  }
-
-  return out;
 }
 
 // --- Skill runtime (applying learned skills) -------------------------------
@@ -869,116 +244,27 @@ async function collectBySkill(skill, target = 20, delay = 1200, maxScrolls = 200
   return records.slice(0, target);
 }
 
-// --- Post-by-post scanning (find_post) --------------------------------------
-// Walks feed posts ONE AT A TIME in DOM order so none are skipped: each call
-// scrolls the next unscanned post into view, lets it hydrate, expands
-// "See more", and returns its full text. Scan state lives on the elements
-// (__baScanned), so repeated calls step through the feed post by post.
+// --- Collection scroll state ------------------------------------------------
 
-// Real feed posts. In Facebook's CURRENT feed DOM, posts do NOT carry
-// role="article" (only comments do), so matching articles scans comments and
-// misses the posts entirely. Feed units — regular posts AND sponsored ones —
-// are marked aria-posinset inside the role="feed" container. Layered fallbacks
-// keep older layouts and other sites working.
-function feedPostNodes() {
-  // 1) Feed units (posts + ads) in the current Facebook layout.
-  let nodes = [...document.querySelectorAll('div[aria-posinset]')];
-  if (nodes.length) return nodes;
-  // 2) Direct children of the feed container.
-  const feed = document.querySelector('div[role="feed"]');
-  if (feed) {
-    nodes = [...feed.children].filter((el) => (el.textContent || '').trim());
-    if (nodes.length) return nodes;
-  }
-  // 3) Old layout / other sites: top-level articles (excludes nested comments).
-  return [...document.querySelectorAll('[role="article"]')]
-    .filter((el) => !(el.parentElement && el.parentElement.closest('[role="article"]')));
-}
-
-// Visible message text of a feed unit. Whole-unit innerText drags in dozens of
-// hidden accessibility labels (e.g. "Facebook" repeated for every icon/link),
-// so prefer the post's message container(s), then top-most dir="auto" blocks,
-// and collapse any token that repeats 3+ times in a row.
-function postText(article) {
-  let parts = [...article.querySelectorAll('[data-ad-comet-preview="message"], [data-ad-preview="message"]')]
-    .map((el) => fullText(el)).filter(Boolean);
-  if (!parts.length) {
-    parts = [...article.querySelectorAll('div[dir="auto"]')]
-      .filter((el) => {
-        const anc = el.parentElement && el.parentElement.closest('div[dir="auto"]');
-        return !(anc && article.contains(anc)); // keep top-most blocks only (no nested dupes)
-      })
-      .map((el) => fullText(el)).filter(Boolean);
-  }
-  let text = parts.join('\n') || fullText(article);
-  text = text.replace(/(^|\s)(\S{2,40})(?:\s+\2){2,}(?=\s|$)/g, '$1$2'); // strip "Facebook Facebook Facebook…" noise
-  return text.trim();
-}
-
-// Best-effort permalink of a post (timestamp/permalink anchor inside it).
-function postPermalink(article) {
-  const a = article.querySelector(
-    'a[href*="/posts/"], a[href*="story_fbid"], a[href*="/permalink"], a[href*="/videos/"], a[href*="/reel/"]'
-  );
-  if (!a) return '';
-  try { return cleanUrl(new URL(a.getAttribute('href'), location.origin).toString()); } catch { return ''; }
-}
-
-// Current scroll offset of whatever actually scrolls (feed container or window).
+// Current scroll offset of whatever actually scrolls (main region or window).
 function scanScrollY() {
   const scope = getMainScope();
   return Math.round((scope && scope.scrollHeight > scope.clientHeight + 4) ? scope.scrollTop : window.scrollY);
 }
 
-// Reset or restore scan state. y=0 (a NEW task): forget every mark from earlier
-// tasks in this tab and scroll to the very top, so scanning starts at post 1.
-// y>0 (a resumed task): scroll back to the saved offset and mark only the posts
-// fully above it as scanned, so scanning continues where the task left off.
+// Before a fresh collection pass, forget the per-element "already collected"
+// marks left by earlier tasks in this tab and scroll to the top, so collect_text
+// / collect_by_skill start from the first item.
 async function resetScan({ y = 0 } = {}) {
   for (const el of document.getElementsByTagName('*')) {
-    if (el.__baScanned) delete el.__baScanned;
     if (el.__baCollected) delete el.__baCollected;
     if (el.__baTextGrabbed) delete el.__baTextGrabbed;
   }
   const scope = getMainScope();
   if (scope && scope.scrollHeight > scope.clientHeight + 4) scope.scrollTop = y;
   else window.scrollTo(0, y);
-  await sleep(800); // let the feed settle/re-render at this offset
-  if (y > 0) {
-    for (const a of feedPostNodes()) {
-      const r = a.getBoundingClientRect();
-      if (r.bottom < 0) a.__baScanned = true; // fully above the restored viewport
-    }
-  }
+  await sleep(800); // let the page settle/re-render at this offset
   return { ok: true, y: scanScrollY() };
-}
-
-async function scanNextPost({ settle = 700, maxLoadScrolls = 6 } = {}) {
-  const scope = getMainScope();
-  for (let attempt = 0; attempt <= maxLoadScrolls; attempt++) {
-    for (const article of feedPostNodes()) {
-      if (article.__baScanned) continue;
-      try { article.scrollIntoView({ block: 'center' }); } catch {}
-      await sleep(settle); // let the post hydrate in view
-      // Expand truncated text so the whole content is readable.
-      for (const btn of article.querySelectorAll('[role="button"]')) {
-        if (norm(btn.textContent).toLowerCase() === 'see more') {
-          try { btn.click(); await sleep(400); } catch {}
-          break;
-        }
-      }
-      const text = postText(article).slice(0, 6000);
-      article.__baScanned = true;
-      if (!text) continue; // placeholder that never hydrated — move to the next
-      return { ok: true, post: { text, url: postPermalink(article) || location.href }, y: scanScrollY() };
-    }
-    // Every post in the DOM is scanned — nudge one small step to load more
-    // (feed batches can take a moment to arrive, hence the generous wait).
-    if (scope && scope.scrollHeight > scope.clientHeight + 4) scope.scrollTop += Math.round(scope.clientHeight * 0.6);
-    else window.scrollBy(0, Math.round(window.innerHeight * 0.6));
-    await sleep(1300);
-  }
-  return { ok: true, noMore: true, y: scanScrollY() };
 }
 
 // Scroll and collect the FULL inner text of every element matching a CSS
@@ -1239,10 +525,7 @@ function resolveElementCounts(elements) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === 'COLLECT_LINKS') {
-        const links = await scrollAndCollectLinks(msg.options || {});
-        sendResponse({ ok: true, links });
-      } else if (msg?.type === 'SCROLL_PAGE') {
+      if (msg?.type === 'SCROLL_PAGE') {
         const scrolled = await scrollPage(msg.times || 10, msg.delay || 1200, msg.direction || 'vertical');
         sendResponse({ ok: true, scrolled });
       } else if (msg?.type === 'USE_SKILL') {
@@ -1253,8 +536,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg?.type === 'COLLECT_TEXT') {
         const records = await collectText(msg.selector, msg.target || 20, msg.delay || 1200);
         sendResponse({ ok: true, records });
-      } else if (msg?.type === 'SCAN_NEXT_POST') {
-        sendResponse(await scanNextPost(msg || {}));
       } else if (msg?.type === 'RESET_SCAN') {
         sendResponse(await resetScan({ y: Number(msg.y) || 0 }));
       } else if (msg?.type === 'RESOLVE_ELEMENTS') {
@@ -1284,27 +565,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             ? { ok: true, matched: norm(el.getAttribute && (el.getAttribute('aria-label') || el.innerText || el.textContent) || el.tagName).slice(0, 60) }
             : { ok: false, error: `wait timeout: "${msg.selector || msg.text}" did not appear` });
         }
-      } else if (msg?.type === 'EXTRACT_PAGE_INFO') {
-        // Give lazy content a moment to render.
-        await sleep(msg.wait || 1500);
-        sendResponse({ ok: true, info: extractPageInfo() });
-      } else if (msg?.type === 'EXTRACT_PAGE_DETAILS') {
-        const details = await extractPageDetailsWithRetry({
-          wait: msg.wait || 5000,
-          attempts: msg.attempts || 3
-        });
-        // Attach full HTML only when it still looks like extraction failed after
-        // all retries, so the backend can save it for later debugging.
-        const html = (details.isPage && shouldSaveDebugHtml(details))
-          ? document.documentElement.outerHTML : '';
-        sendResponse({ ok: true, details, html });
-      } else if (msg?.type === 'FB_ACTIONS') {
-        const res = await fbRunActions({
-          doFollow: !!msg.doFollow,
-          doMessage: !!msg.doMessage,
-          message: msg.message
-        });
-        sendResponse(res);
       } else {
         sendResponse({ ok: false, error: 'UNKNOWN_MESSAGE' });
       }

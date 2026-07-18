@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"_sourceUrl":{"$numberInt":"1"}},"name":"_sourceUrl_1"}],"uuid":"48019482c40647bebc917de2599a1fcc","collectionName":"data_data-message-list-panel-svtw","type":"collection"}

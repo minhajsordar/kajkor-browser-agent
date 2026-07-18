@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"taskId":{"$numberInt":"1"}},"name":"taskId_1","unique":true},{"v":{"$numberInt":"2"},"key":{"createdAt":{"$numberInt":"-1"}},"name":"createdAt_-1"}],"uuid":"1c482ee765fb4038b4a0f67e09873f3b","collectionName":"tasks","type":"collection"}

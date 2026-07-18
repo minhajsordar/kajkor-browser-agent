@@ -10,9 +10,11 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const { MongoClient } = require('mongodb');
 
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 34730;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://minhaj:m1nh8j@mdb.softrking.com:27017/browser_agent?authSource=admin&directConnection=true';
 const DB_NAME = process.env.MONGODB_DB || 'browser_agent';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -21,6 +23,72 @@ const DEBUG_DIR = path.join(__dirname, '..', 'sample', 'debug');
 const app = express();
 app.use(cors()); // allow the extension (any origin) to POST
 app.use(express.json({ limit: '25mb' })); // large HTML payloads for debug saves
+
+// --- authentication (JWT) ----------------------------------------------------
+// Trust model: LOOPBACK requests (the extension and the desktop app on this
+// machine) pass without a token, so local workflows are unchanged. Anything
+// arriving over the network needs `Authorization: Bearer <jwt>` from
+// /auth/login. Set AUTH_ENFORCE_LOCAL=1 to require tokens locally too.
+const AUTH_SECRET = process.env.AUTH_SECRET || 'browser-agent-dev-secret';
+const AUTH_ENFORCE_LOCAL = process.env.AUTH_ENFORCE_LOCAL === '1';
+if (AUTH_SECRET === 'browser-agent-dev-secret') {
+  console.warn('[auth] Using the built-in dev secret — set AUTH_SECRET before exposing this backend beyond localhost.');
+}
+const usersColl = () => collFor('users');
+const isLoopback = (req) => /^(::1$|::ffff:127\.|127\.)/.test(String(req.ip || ''));
+const AUTH_EXEMPT = [/^\/health$/, /^\/auth\/(login|register)$/];
+const publicUser = (u) => ({ userId: u.userId, name: u.name, email: u.email, role: u.role });
+
+app.use((req, res, next) => {
+  if (AUTH_EXEMPT.some((rx) => rx.test(req.path))) return next();
+  if (isLoopback(req) && !AUTH_ENFORCE_LOCAL) return next();
+  const m = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ ok: false, error: 'auth required' });
+  try { req.user = jwt.verify(m[1], AUTH_SECRET); next(); }
+  catch { res.status(401).json({ ok: false, error: 'invalid or expired token' }); }
+});
+
+// First user ever registered becomes admin. After that, only an admin (or a
+// trusted local caller) can create accounts — no open signup.
+app.post('/auth/register', async (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password required' });
+  if (String(password).length < 6) return res.status(400).json({ ok: false, error: 'password must be at least 6 characters' });
+  const count = await usersColl().countDocuments();
+  if (count) {
+    let caller = null;
+    const m = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+    if (m) { try { caller = jwt.verify(m[1], AUTH_SECRET); } catch {} }
+    const trustedLocal = isLoopback(req) && !AUTH_ENFORCE_LOCAL;
+    if (!trustedLocal && caller?.role !== 'admin') return res.status(403).json({ ok: false, error: 'only an admin can create accounts' });
+  }
+  const user = {
+    userId: crypto.randomUUID(),
+    name: String(name || '').trim() || String(email).split('@')[0],
+    email: String(email).trim().toLowerCase(),
+    passwordHash: await bcrypt.hash(String(password), 10),
+    role: count ? 'user' : 'admin',
+    createdAt: nowIso(),
+  };
+  try { await usersColl().insertOne({ ...user }); }
+  catch { return res.status(409).json({ ok: false, error: 'email already registered' }); }
+  res.json({ ok: true, user: publicUser(user) });
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  const user = await usersColl().findOne({ email: String(email || '').trim().toLowerCase() });
+  if (!user || !(await bcrypt.compare(String(password || ''), user.passwordHash))) {
+    return res.status(401).json({ ok: false, error: 'invalid email or password' });
+  }
+  const token = jwt.sign({ userId: user.userId, email: user.email, role: user.role }, AUTH_SECRET, { expiresIn: '30d' });
+  res.json({ ok: true, token, user: publicUser(user) });
+});
+
+app.get('/auth/me', async (req, res) => {
+  if (req.user) return res.json({ ok: true, user: req.user });
+  res.json({ ok: true, user: null, local: true }); // trusted loopback caller
+});
 
 // --- database --------------------------------------------------------------
 
@@ -46,6 +114,7 @@ async function connectDb() {
   await collFor('skills').createIndex({ host: 1 });
   await collFor('debug_items').createIndex({ taskId: 1 });
   await collFor('task_shots').createIndex({ taskId: 1 });
+  await collFor('users').createIndex({ email: 1 }, { unique: true });
   console.log(`Mongo connected: ${MONGODB_URI} / ${DB_NAME}`);
 }
 
@@ -204,10 +273,6 @@ const TOOL_CATALOG = [
     desc: 'Type `value` into a text field / textarea / contenteditable box (e.g. a post composer, search box, comment box). Locate the field by CSS `selector`, or by its placeholder/aria-label `text`; if neither is given, types into the focused or first editable field. Does NOT submit.' },
   { name: 'generate_text', params: ['prompt', 'selector', 'text', 'words'],
     desc: 'Use AI to WRITE text from `prompt` (e.g. "write a Facebook post about surviving the AI era"), then type it into the target field (located by `selector` or placeholder/aria-label `text`, else the focused/first editable field). Use this when the user asks to generate/compose/write content; use `type` only when they give the exact words. Does NOT submit.' },
-  { name: 'scroll_and_collect_links', params: ['target', 'delay'],
-    desc: 'On a Facebook feed, scroll and collect up to `target` unique page links with names, saving them to the database.' },
-  { name: 'visit_and_extract_details', params: [],
-    desc: 'Open each collected page and extract full details (name, phone, email, website, address, followers), saving them to the database.' },
   { name: 'use_skill', params: ['skill'],
     desc: 'Perform a learned single-element skill (click/scroll/read…) by its name on the current page.' },
   { name: 'run_skill', params: ['skill', 'text'],
@@ -216,8 +281,6 @@ const TOOL_CATALOG = [
     desc: 'Use a learned "collection" skill to scroll and extract its taught fields from each repeating item (e.g. each post), saving up to `target` records.' },
   { name: 'collect_text', params: ['selector', 'target'],
     desc: 'Scroll and collect the FULL inner text of every element matching a CSS selector on the current page (e.g. "[role=article]" for posts, ".comment" for comments). Each block is saved as one record with a "text" field. Use when the user wants the whole text content of repeating elements.' },
-  { name: 'find_post', params: ['query', 'target'],
-    desc: 'FIND specific post(s): scan feed posts ONE BY ONE (scrolling post by post, skipping none) and AI-check each against `query` — a short description of the wanted post\'s topic. Saves every matching post (full text + link) and stops after `target` matches (usually 1). Use whenever the user asks to find / look for / search a post about something. It scrolls itself — never add a scroll phase with it.' },
   { name: 'ai_verify', params: ['source', 'fields', 'instruction'],
     desc: 'AI verification/correction pass AFTER collecting. For each collected record it gives the model the record\'s full source text (the `source` field, e.g. "text" or an innerText field holding the whole item) and the extracted `fields`, then checks each field against the source and rewrites wrong/badly-formatted values using ONLY what the source contains. Add this as the LAST phase when the user asks to verify/compare/correct collected fields.' },
 ];
@@ -232,7 +295,7 @@ function planSchema() {
       target: {
         type: 'object',
         properties: {
-          metric: { type: 'string', enum: ['links', 'details', 'scrolls', 'items', 'texts', 'actions'] },
+          metric: { type: 'string', enum: ['scrolls', 'items', 'texts', 'actions'] },
           count: { type: 'integer' },
         },
         required: ['metric', 'count'],
@@ -278,30 +341,27 @@ function planningSystemPrompt(schemas, skills) {
     '',
     'Rules:',
     '- Output STRICT JSON only. No prose, no markdown, no code fences.',
-    '- "target.metric" is one of: "links" (collecting page links), "details" (extracting page details), "scrolls" (only scrolling, no data collection), or "texts" (collecting full inner text of elements via collect_text).',
+    '- "target.metric" is one of: "scrolls" (only scrolling, no data collection), "texts" (collecting the full inner text of matching elements via collect_text), "items" (collecting taught fields from each repeating item via a learned collection skill), or "actions" (UI interactions only — clicks/typing/etc.).',
     '- "target.count" is the number the user asked for.',
-    '- If the user says NOT to collect data, use the `scroll` tool and metric "scrolls". Otherwise use `scroll_and_collect_links`.',
+    '- Always start with a `navigate` phase using the URL implied by the task. Only omit navigate when the task clearly acts on the page already open.',
+    '- If the user says only to scroll (no data), use the `scroll` tool and metric "scrolls".',
+    '- To collect the text content of repeating elements (posts, results, rows, comments), use `collect_text` with a CSS `selector` and metric "texts".',
     '- For UI interactions (clicking buttons/links/tabs, hovering to reveal menus) use the `click` and `hover` tools; if the task is only interactions (no data collected) use metric "actions" with count = number of interaction steps.',
     '- To enter EXACT text the user gave into a field/box use the `type` tool with params.value = that text. Do NOT use use_skill for typing.',
     '- To WRITE/GENERATE/COMPOSE text with AI (a post/message/comment about a topic) use the `generate_text` tool with params.prompt describing what to write; it generates the text and types it into the field.',
-    '- use_skill and collect_by_skill may ONLY reference a skill from the "Learned skills" list below. NEVER invent or guess a skill name. If no learned skill fits, use the generic click/type/hover tools instead.',
+    '- use_skill, run_skill and collect_by_skill may ONLY reference a skill from the "Learned skills" list below. NEVER invent or guess a skill name. If no learned skill fits, use the generic click/type/hover/collect_text tools instead.',
     '- For navigate, set params.newTab to true ONLY if the user explicitly asks to open a NEW tab; if they refer to the current/existing tab, omit newTab.',
     '- Phases run in order. Use the fewest phases needed.',
     '- If the user asks to verify/compare/correct collected fields against a fuller text, add an "ai_verify" phase LAST, with params.source set to the field holding the full text.',
-    '- To FIND a post about a topic, use find_post (metric "items", count = how many posts to find, usually 1). find_post scrolls post-by-post itself — do NOT add scroll or collect_text phases with it.',
     '',
-    'Example — "find a post about baby products":',
-    '{"target":{"metric":"items","count":1},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"find_post","params":{"query":"baby products","target":1}}]}',
-    'Example — "collect page link and name from 10 posts":',
-    '{"target":{"metric":"links","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"scroll_and_collect_links","params":{"target":10}}]}',
-    'Example — "open facebook and only scroll 10 times, do not collect":',
-    '{"target":{"metric":"scrolls","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"scroll","params":{"times":10}}]}',
+    'Example — "open example.com and only scroll 10 times, do not collect":',
+    '{"target":{"metric":"scrolls","count":10},"phases":[{"tool":"navigate","params":{"url":"https://example.com"}},{"tool":"scroll","params":{"times":10}}]}',
     'Example — "on the current page, hover the menu then click the Settings link":',
     '{"target":{"metric":"actions","count":2},"phases":[{"tool":"hover","params":{"text":"menu"}},{"tool":"click","params":{"text":"Settings"}}]}',
-    'Example — "open the post composer and write a post, do not publish":',
+    'Example — "open the composer and write a post, do not publish":',
     '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"type","params":{"value":"<the post text>"}}]}',
     'Example — "open the composer and generate a post about surviving the AI era":',
-    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"generate_text","params":{"prompt":"Write a Facebook post about how we can survive in the AI era"}}]}',
+    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"generate_text","params":{"prompt":"Write a post about how we can survive in the AI era"}}]}',
     'Example — "collect the full text of 5 posts":',
     '{"target":{"metric":"texts","count":5},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"collect_text","params":{"selector":"[role=\\"article\\"]","target":5}}]}',
   ];
@@ -321,16 +381,14 @@ function planningSystemPrompt(schemas, skills) {
   } else {
     base.push(
       '',
-      'No schema was provided. If the task collects data (metric "links" or "details"),',
+      'No schema was provided. If the task collects data (metric "texts" or "items"),',
       'ALSO output a "schema" object defining the data table to save into:',
-      '  "schema": {"name": "<short name>", "fields": [{"key":"name","label":"Name","type":"text"}, ...]}',
+      '  "schema": {"name": "<short name>", "fields": [{"key":"text","label":"Text","type":"text"}, ...]}',
       '- Infer the fields from what the user describes wanting to collect.',
       '- If the user does not describe fields, choose sensible ones for the data.',
       '- Choose field "key" names freely to fit the data — this is a general agent.',
-      '- Hint: the current Facebook tools fill these keys, so prefer them when collecting',
-      '  Facebook page data (otherwise values stay empty): name, url, category, followers,',
-      '  phone, email, website, address, bio, instagram, tiktok.',
-      '- Omit "schema" only for scroll-only tasks (metric "scrolls").',
+      '- For collect_text (metric "texts"), a single "text" field holding each element\'s full text is usually right.',
+      '- Omit "schema" only for scroll-only (metric "scrolls") or interaction-only (metric "actions") tasks.',
     );
   }
   return base.join('\n');
@@ -348,15 +406,11 @@ function normalizePlan(plan) {
   }
   let target = plan.target;
   if (!target || typeof target !== 'object' || !Number(target.count)) {
-    const sc = clean.find((p) => p.tool === 'scroll_and_collect_links');
     const cbs = clean.find((p) => p.tool === 'collect_by_skill');
     const ct = clean.find((p) => p.tool === 'collect_text');
     const scr = clean.find((p) => p.tool === 'scroll');
-    const fp = clean.find((p) => p.tool === 'find_post');
-    if (fp) target = { metric: 'items', count: Number(fp.params.target) || 1 };
-    else if (cbs && Number(cbs.params.target)) target = { metric: 'items', count: Number(cbs.params.target) };
+    if (cbs && Number(cbs.params.target)) target = { metric: 'items', count: Number(cbs.params.target) };
     else if (ct && Number(ct.params.target)) target = { metric: 'texts', count: Number(ct.params.target) };
-    else if (sc && Number(sc.params.target)) target = { metric: 'links', count: Number(sc.params.target) };
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
     else {
       // Pure action task (click/hover/scroll only): target = number of such phases.
@@ -365,7 +419,7 @@ function normalizePlan(plan) {
       else return null;
     }
   }
-  const metric = ['links', 'details', 'scrolls', 'items', 'texts', 'actions'].includes(target.metric) ? target.metric : 'links';
+  const metric = ['scrolls', 'items', 'texts', 'actions'].includes(target.metric) ? target.metric : 'texts';
   return { target: { metric, count: Number(target.count) }, phases: clean };
 }
 
@@ -386,16 +440,9 @@ function repairPlan(plan) {
     }
     for (const p of phases) if (p.tool === 'scroll' && !Number(p.params.times)) p.params.times = plan.target.count;
   } else if (metric === 'items') {
-    // Skill/find collection: both tools scroll themselves. Just fix their targets.
+    // Learned collection skill scrolls itself. Just fix its target.
     for (const p of phases) {
-      if ((p.tool === 'collect_by_skill' || p.tool === 'find_post') && !Number(p.params.target)) p.params.target = plan.target.count;
-    }
-    // find_post steps through posts itself — blind scroll/collect phases before
-    // it just skip past posts (and models emit broken selectors). Drop them.
-    if (phases.some((p) => p.tool === 'find_post')) {
-      const n = phases.length;
-      phases = phases.filter((p) => !['scroll', 'collect_text', 'scroll_and_collect_links'].includes(p.tool));
-      if (phases.length !== n) repaired.push('removed blind scroll/collect phases (find_post scans post-by-post itself)');
+      if (p.tool === 'collect_by_skill' && !Number(p.params.target)) p.params.target = plan.target.count;
     }
   } else if (metric === 'texts') {
     // collect_text scrolls itself; ensure the phase exists and has a target.
@@ -406,25 +453,10 @@ function repairPlan(plan) {
     for (const p of phases) if (p.tool === 'collect_text' && !Number(p.params.target)) p.params.target = plan.target.count;
   } else if (metric === 'actions') {
     // Pure click/hover/scroll task — nothing to auto-complete.
-  } else {
-    if (!has('scroll_and_collect_links')) {
-      phases.push({ tool: 'scroll_and_collect_links', params: { target: plan.target.count } });
-      repaired.push('added scroll_and_collect_links');
-    }
-    for (const p of phases) if (p.tool === 'scroll_and_collect_links' && !Number(p.params.target)) p.params.target = plan.target.count;
-    if (metric === 'details' && !has('visit_and_extract_details')) {
-      phases.push({ tool: 'visit_and_extract_details', params: {} });
-      repaired.push('added visit_and_extract_details');
-    }
-  }
-  // Pure action tasks act on the CURRENT tab — don't force a Facebook navigate.
-  if (!has('navigate') && metric !== 'actions') {
-    phases.unshift({ tool: 'navigate', params: { url: 'https://www.facebook.com' } });
-    repaired.push('added navigate');
   }
 
-  // Enforce order: one navigate first, then scroll/collect/act, then extract, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, press_key: 1, wait: 1, screenshot: 1, ask_user: 1, generate_text: 1, scroll_and_collect_links: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, find_post: 1, visit_and_extract_details: 2, ai_verify: 3 };
+  // Enforce order: one navigate first, then scroll/collect/act, then verify.
+  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, press_key: 1, wait: 1, screenshot: 1, ask_user: 1, generate_text: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, ai_verify: 3 };
   const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
   const rest = phases.filter((p) => p.tool !== 'navigate')
     .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
@@ -605,8 +637,54 @@ app.get('/tasks/:id', async (req, res) => {
 });
 
 app.post('/tasks', async (req, res) => {
-  const { goal, model, mode, schemas, useSkills, promptId } = req.body || {};
+  const { goal, model, mode, schemas, useSkills, promptId, project } = req.body || {};
   if (!goal || !model) return res.status(400).json({ ok: false, error: 'goal and model required' });
+
+  // Optional project grouping (desktop app): {name, dir}. dir doubles as the
+  // default working directory for /run commands in this session.
+  const taskProject = project && typeof project === 'object' && project.name
+    ? { name: String(project.name).slice(0, 120), dir: String(project.dir || '') }
+    : null;
+
+  // Host-command session (goal starts with /run|/sh|/host): do NOT browser-plan.
+  // Create an IDLE session (status 'done' so the extension never runs phases)
+  // and propose the command for confirmation, like the /run chat path.
+  const hostGoalMatch = String(goal).match(HOST_PREFIX_RX);
+  if (hostGoalMatch) {
+    const instruction = String(goal).slice(hostGoalMatch[0].length).trim();
+    const resolved = await resolveModel(model, instruction);
+    const useModel = resolved.name || model;
+    const base = {
+      taskId: crypto.randomUUID(),
+      goal: String(goal), model: useModel, mode: 'once', project: taskProject,
+      schemas: [], useSkills: [], systemPrompt: null,
+      status: 'done', plan: null, currentPhaseIndex: 0,
+      collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+      repeats: 0, maxRepeats: 3, messages: [],
+      chat: [], sessionSummary: '', currentInstruction: null,
+      round: 0,                  // server-stamped round index (per user turn)
+      events: [{ at: nowIso(), kind: 'think', msg: 'Host-command session.', round: 0 }],
+      errors: [], createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
+    };
+    if (!instruction) {
+      await tasksColl().insertOne({ ...base });
+      return res.json({ ok: false, task: base, error: 'Say what to run after /run.' });
+    }
+    let proposal;
+    try {
+      proposal = await proposeHostCommand(useModel, instruction, String(req.body?.platform || process.platform));
+    } catch (e) {
+      base.chat.push({ role: 'assistant', text: 'Could not propose a command (is the model running?). ' + (e.message || ''), at: nowIso() });
+      await tasksColl().insertOne({ ...base });
+      return res.json({ ok: false, task: base, error: 'proposal failed' });
+    }
+    const desc = `🖥️ Proposed command: \`${proposal.argv.join(' ')}\``
+      + (proposal.cwd ? ` (in ${proposal.cwd})` : '')
+      + `\n${proposal.explanation}${proposal.danger ? ' ⚠️ destructive' : ''}`;
+    base.chat.push({ role: 'assistant', text: desc, at: nowIso() });
+    await tasksColl().insertOne({ ...base });
+    return res.json({ ok: true, task: base, mode: 'host', proposal });
+  }
 
   // Snapshot the chosen system prompt; its bundled skills join the task's skills.
   let systemPrompt = null;
@@ -636,6 +714,7 @@ app.post('/tasks', async (req, res) => {
   const task = {
     taskId: crypto.randomUUID(),
     goal, model, mode: mode || 'once',
+    project: taskProject,        // desktop-app folder grouping {name, dir}
     schemas: taskSchemas,        // schemas this task saves collected data into
     useSkills: taskUseSkills,    // learned skills the task should use
     systemPrompt,                // standing instructions attached to this task
@@ -650,7 +729,11 @@ app.post('/tasks', async (req, res) => {
     repeats: 0,
     maxRepeats: 3,
     messages: [],                // LLM planning transcript (audit/resume)
-    events: [{ at: nowIso(), kind: 'think', msg: 'Task created.' }],
+    chat: [],                    // conversational session turns [{role,text,at}]
+    sessionSummary: '',          // compacted context of earlier session rounds
+    currentInstruction: null,    // latest chat instruction being planned/executed
+    round: 0,                    // server-stamped round index (bumped per user turn)
+    events: [{ at: nowIso(), kind: 'think', msg: 'Task created.', round: 0 }],
     errors: [],
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -674,6 +757,7 @@ app.post('/tasks/:id/rerun', async (req, res) => {
     goal: extra ? `${src.goal}\nAdditional instruction for this run: ${extra}` : src.goal,
     model: src.model,
     mode: src.mode || 'once',
+    project: src.project || null,
     schemas: src.schemas || [],
     useSkills: src.useSkills || [],
     systemPrompt: src.systemPrompt || null,
@@ -684,7 +768,9 @@ app.post('/tasks/:id/rerun', async (req, res) => {
     collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0, repeats: 0,
     maxRepeats: src.maxRepeats || 3,
     messages: [],
-    events: [{ at: nowIso(), kind: 'think', msg: `Re-run of task ${src.taskId.slice(0, 8)}… ${extra ? '(extra instruction — replanning)' : '(reusing its proven plan)'}` }],
+    chat: [], sessionSummary: '', currentInstruction: null,
+    round: 0,
+    events: [{ at: nowIso(), kind: 'think', msg: `Re-run of task ${src.taskId.slice(0, 8)}… ${extra ? '(extra instruction — replanning)' : '(reusing its proven plan)'}`, round: 0 }],
     errors: [],
     createdAt: nowIso(), updatedAt: nowIso(), finishedAt: null,
   };
@@ -694,7 +780,7 @@ app.post('/tasks/:id/rerun', async (req, res) => {
 });
 
 // Whitelisted field updates (the extension persists progress through here).
-const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'pendingQuestion', 'repeats', 'plan', 'finishedAt', 'messages']);
+const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'pendingQuestion', 'repeats', 'plan', 'finishedAt', 'messages', 'model', 'project', 'round']);
 app.patch('/tasks/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (PATCHABLE.has(k)) set[k] = v;
@@ -741,9 +827,258 @@ app.post('/tasks/:id/answer', async (req, res) => {
   const answer = String(req.body?.answer || '').trim() || 'no';
   await tasksColl().updateOne({ taskId: req.params.id }, {
     $set: { 'pendingQuestion.answer': answer, 'pendingQuestion.answeredAt': nowIso(), updatedAt: nowIso() },
-    $push: { events: { at: nowIso(), kind: 'obs', msg: `You answered: ${answer}` } },
+    $push: { events: { at: nowIso(), kind: 'obs', msg: `You answered: ${answer}`, round: task.round || 0 } },
   });
   res.json({ ok: true });
+});
+
+// ======================= Conversational task sessions =======================
+// Continue chatting inside one task (like Codex/coworker sessions): follow-up
+// messages either trigger a NEW browsing round on the same task (data keeps
+// accumulating in the same schema) or are ANSWERED directly from the session's
+// collected data. When the transcript grows too big for a local model it is
+// compacted into `sessionSummary` (auto, or manually via /compact).
+
+const BUSY_STATUSES = new Set(['planning', 'running', 'checking', 'waiting']);
+
+async function askChat(model, messages, opts = {}) {
+  const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: false, options: { temperature: opts.temperature ?? 0 }, ...(opts.format ? { format: opts.format } : {}) }),
+  })).json();
+  return j.message?.content || '';
+}
+
+// All records this session produced: schema records (tagged _taskId) + the
+// task-scoped generic `collected` list. Capped for small-model context.
+async function sessionRecords(task, max = 60) {
+  const rows = [];
+  for (const s of (task.schemas || [])) {
+    try {
+      const recs = await collFor(s.dataCollection)
+        .find({ _taskId: task.taskId }, { projection: { _id: 0, _taskId: 0 } }).limit(max).toArray();
+      rows.push(...recs);
+    } catch {}
+    if (rows.length >= max) break;
+  }
+  if (rows.length < max) rows.push(...(task.collected || []).slice(0, max - rows.length));
+  return rows.slice(0, max);
+}
+
+// Decide what a chat message wants: browser work or an answer over collected
+// data. Clear cases are decided deterministically; ambiguity goes to the LLM.
+// NOTE: prefix alternatives ("summar", "analy[sz]") — no trailing \b, so
+// "summary" / "Analyze" / "collected" still match.
+const BROWSE_RX = /\b(navigate|go to|open|visit|reload|refresh|scroll|click|type|post|comment|like|follow|send|search|find|collect|extract|scrape|grab|capture|screenshot|fill|submit|log ?in|press|hover|download|new tab|next page)/i;
+const ANSWER_RX = /\b(summar|analy[sz]|report|explain|insight|overview|how many|what did|what is|which of|list the|tell me|compare|conclusion|takeaway|clean ?up|translate)/i;
+async function routeChat(task, message) {
+  const b = BROWSE_RX.test(message), a = ANSWER_RX.test(message);
+  if (a && !b) return 'answer';
+  if (b && !a) return 'browse';
+  try {
+    const out = JSON.parse(await askChat(task.model, [
+      { role: 'system', content: 'Classify the user\'s follow-up message for a browser-automation task session. "browse" = it needs the browser to DO something (navigate, scroll, collect, click, post…). "answer" = it can be answered from the data already collected (summaries, analysis, questions). Reply STRICT JSON {"mode":"browse"|"answer"}.' },
+      { role: 'user', content: message },
+    ], { format: { type: 'object', properties: { mode: { type: 'string', enum: ['browse', 'answer'] } }, required: ['mode'] } }));
+    if (out.mode === 'answer' || out.mode === 'browse') return out.mode;
+  } catch {}
+  return a ? 'answer' : 'browse';   // model unreachable — heuristic decides
+}
+
+// Host commands are EXPLICIT (message starts with /run, /sh or /host) — never
+// auto-routed from natural language, so an ordinary browse/answer message can
+// never trigger shell execution. The backend only PROPOSES a command (as an
+// argv array — no shell string, no operators); the desktop app confirms and
+// runs it in its own process. The backend never executes anything on a host.
+const HOST_PREFIX_RX = /^\/(run|sh|host)(?:\s+|$)/i;
+
+async function proposeHostCommand(model, instruction, platform) {
+  const sys =
+    `Translate the request into ONE safe host command for a ${platform} machine, to be run WITHOUT a shell. `
+    + 'Output an argv array: the first item is the executable, the rest are arguments. '
+    + 'NO pipes, redirects, &&, ;, glob expansion, or quoting-as-operator — those do not work without a shell. '
+    + 'Fields: title (short label), argv (string array), cwd (absolute working dir or "" for home), '
+    + 'explanation (one line), danger (true if it deletes/overwrites/moves data, installs software, or is otherwise destructive). Reply STRICT JSON.';
+  const format = {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      argv: { type: 'array', items: { type: 'string' } },
+      cwd: { type: 'string' },
+      explanation: { type: 'string' },
+      danger: { type: 'boolean' },
+    },
+    required: ['title', 'argv', 'explanation'],
+  };
+  const out = JSON.parse(await askChat(model, [
+    { role: 'system', content: sys },
+    { role: 'user', content: instruction },
+  ], { format }));
+  const argv = Array.isArray(out.argv) ? out.argv.map((x) => String(x)).filter(Boolean) : [];
+  if (!argv.length) throw new Error('model produced no command');
+  return {
+    title: String(out.title || argv.join(' ')).slice(0, 80),
+    argv,
+    cwd: String(out.cwd || ''),
+    explanation: String(out.explanation || '').slice(0, 200),
+    danger: !!out.danger,
+  };
+}
+
+// Record the outcome of a host command (run by the desktop app, or denied) as
+// an assistant chat turn + event, so the transcript is complete.
+app.post('/tasks/:id/host-result', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const b = req.body || {};
+  const argvStr = Array.isArray(b.argv) && b.argv.length ? b.argv.join(' ') : String(b.title || 'command');
+  let text, kind;
+  if (b.denied) {
+    text = `🚫 Command denied: \`${argvStr}\``;
+    kind = 'obs';
+  } else if (b.error && b.exitCode == null && !b.stdout && !b.stderr) {
+    text = `❌ \`${argvStr}\` — ${b.error}`;
+    kind = 'err';
+  } else {
+    const code = Number.isInteger(b.exitCode) ? b.exitCode : null;
+    const okRun = code === 0 && !b.timedOut;
+    const out = String(b.stdout || '').slice(0, 4000);
+    const err = String(b.stderr || '').slice(0, 2000);
+    text = `${okRun ? '✅' : '❌'} \`${argvStr}\` ${b.timedOut ? 'timed out' : `exited ${code}`}`
+      + (out ? `\n\n${out}` : '') + (err ? `\n\n[stderr]\n${err}` : '');
+    kind = okRun ? 'ok' : 'err';
+  }
+  const rn = task.round || 0;
+  const hostMeta = { host: true, denied: !!b.denied, exitCode: Number.isInteger(b.exitCode) ? b.exitCode : null, timedOut: !!b.timedOut, argv: argvStr.slice(0, 120) };
+  await tasksColl().updateOne({ taskId: req.params.id }, {
+    $push: {
+      chat: { role: 'assistant', text: text.slice(0, 8000), at: nowIso(), round: rn },
+      events: { at: nowIso(), kind, msg: `Host: ${argvStr}`.slice(0, 200), round: rn, meta: hostMeta },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  res.json({ ok: true });
+});
+
+// Compact the session: everything so far → a short summary; keep the last two
+// turns verbatim. Falls back to a deterministic digest if the model is down.
+async function compactSession(task) {
+  const chat = task.chat || [];
+  const transcript = [
+    task.sessionSummary ? `Previous summary: ${task.sessionSummary}` : '',
+    ...chat.map((m) => `${m.role}: ${m.text}`),
+  ].filter(Boolean).join('\n').slice(0, 12000);
+  const stats = `${(task.collected || []).length} collected, ${(task.extracted || []).length} extracted, ${task.scrolls || 0} scrolls, ${task.actions || 0} actions`;
+  let summary = '';
+  try {
+    summary = (await askChat(task.model, [
+      { role: 'system', content: 'Compact this browser-task session into <=120 words of plain text: the original goal, what has been done so far, key results/numbers, and any user preferences to remember. No preamble.' },
+      { role: 'user', content: `Original goal: ${task.goal}\nProgress: ${stats}\nTranscript:\n${transcript}` },
+    ], { temperature: 0.2 })).trim();
+  } catch {}
+  if (!summary) summary = `${task.goal} — ${stats}. ${chat.length} chat turns compacted (model offline; details in the event log).`;
+  const keep = chat.slice(-2);
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $set: { sessionSummary: summary.slice(0, 2000), chat: keep, updatedAt: nowIso() },
+    $push: { events: { at: nowIso(), kind: 'think', msg: `Session compacted: ${chat.length} → ${keep.length} turns kept + summary.`, round: task.round || 0 } },
+  });
+  task.sessionSummary = summary; task.chat = keep;
+  return summary;
+}
+
+app.post('/tasks/:id/compact', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'Task is busy — wait for it to finish.' });
+  if (!(task.chat || []).length && !task.sessionSummary) return res.json({ ok: false, error: 'Nothing to compact yet.' });
+  const summary = await compactSession(task);
+  res.json({ ok: true, summary });
+});
+
+app.post('/tasks/:id/chat', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const message = String(req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ ok: false, error: 'message required' });
+  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'Task is busy — wait for it to finish, or stop it first.' });
+
+  // Each user turn opens a new round; everything the backend/extension records
+  // until the next user turn is stamped with this index (exact client grouping).
+  const round = (task.round || 0) + 1;
+  task.round = round;
+  const userTurn = { role: 'user', text: message, at: nowIso(), round };
+  await tasksColl().updateOne({ taskId: task.taskId }, { $push: { chat: userTurn }, $set: { round, updatedAt: nowIso() } });
+  task.chat = [...(task.chat || []), userTurn];
+
+  // Keep the transcript small enough for a local model — compact automatically.
+  if (task.chat.length > 24 || JSON.stringify(task.chat).length > 9000) await compactSession(task);
+
+  // Explicit host command (/run …): PROPOSE only — the desktop app confirms and
+  // executes. Never touches browser state; never auto-triggered.
+  const hostMatch = message.match(HOST_PREFIX_RX);
+  if (hostMatch) {
+    const instruction = message.slice(hostMatch[0].length).trim();
+    if (!instruction) return res.json({ ok: false, error: 'Say what to run after /run.' });
+    let proposal;
+    try {
+      proposal = await proposeHostCommand(task.model, instruction, String(req.body?.platform || process.platform));
+    } catch (e) {
+      const msg = 'Could not propose a command (is the model running?). ' + (e.message || '');
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: { chat: { role: 'assistant', text: msg, at: nowIso(), round } }, $set: { updatedAt: nowIso() },
+      });
+      return res.json({ ok: false, error: msg });
+    }
+    const desc = `🖥️ Proposed command: \`${proposal.argv.join(' ')}\``
+      + (proposal.cwd ? ` (in ${proposal.cwd})` : '')
+      + `\n${proposal.explanation}${proposal.danger ? ' ⚠️ destructive' : ''}`;
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: desc, at: nowIso(), round },
+        events: { at: nowIso(), kind: 'think', msg: 'Proposed host command (awaiting your confirmation).', round },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return res.json({ ok: true, mode: 'host', proposal });
+  }
+
+  const mode = await routeChat(task, message);
+
+  if (mode === 'answer') {
+    const rows = await sessionRecords(task, 60);
+    let reply = '';
+    try {
+      reply = (await askChat(task.model, [
+        { role: 'system', content:
+          'You are the assistant inside a browser-automation task session. Answer the user using ONLY the session context and collected data below. Be concise and concrete; use numbers from the data. If the data cannot answer it, say so and suggest what to collect.\n\n'
+          + `Original goal: ${task.goal}\n`
+          + (task.sessionSummary ? `Session summary: ${task.sessionSummary}\n` : '')
+          + `Collected records this session: ${rows.length}\n`
+          + (rows.length ? `Data (JSON):\n${JSON.stringify(rows).slice(0, 9000)}` : 'No data collected yet.') },
+        ...task.chat.slice(-11, -1).map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text })),
+        { role: 'user', content: message },
+      ], { temperature: 0.2 })).trim();
+    } catch {}
+    if (!reply) reply = 'I could not reach the model to analyze the data — is Ollama running?';
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: { chat: { role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round }, events: { at: nowIso(), kind: 'obs', msg: 'Chat: answered from session data.', round } },
+      $set: { updatedAt: nowIso() },
+    });
+    return res.json({ ok: true, mode: 'answer', reply });
+  }
+
+  // browse: this becomes the task's next round — replan against session context.
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $set: {
+      currentInstruction: message, plan: null, status: 'planning',
+      currentPhaseIndex: 0, repeats: 0, scanY: 0, pendingQuestion: null, updatedAt: nowIso(),
+    },
+    $push: {
+      chat: { role: 'assistant', text: '🛠️ On it — planning this step…', at: nowIso(), round },
+      events: { at: nowIso(), kind: 'act', msg: `New round from chat: ${message}`, round },
+    },
+  });
+  res.json({ ok: true, mode: 'browse' });
 });
 
 // Screenshots captured by the screenshot tool (kept out of the task doc — data
@@ -761,10 +1096,16 @@ app.get('/tasks/:id/screenshots', async (req, res) => {
 });
 
 app.post('/tasks/:id/event', async (req, res) => {
-  const { kind, msg } = req.body || {};
+  const { kind, msg, meta } = req.body || {};
+  // Stamp the task's CURRENT round so the extension's execution events group
+  // under the user turn that started them — no round tracking needed client-side
+  // (round only changes on /chat, which is blocked while a task is running).
+  const t = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1 } });
+  const ev = { at: nowIso(), kind: kind || 'obs', msg: msg || '', round: t?.round || 0 };
+  if (meta && typeof meta === 'object') ev.meta = meta;
   await tasksColl().updateOne(
     { taskId: req.params.id },
-    { $push: { events: { at: nowIso(), kind: kind || 'obs', msg: msg || '' } }, $set: { updatedAt: nowIso() } }
+    { $push: { events: ev }, $set: { updatedAt: nowIso() } }
   );
   res.json({ ok: true });
 });
@@ -782,6 +1123,10 @@ app.post('/tasks/:id/error', async (req, res) => {
 app.post('/tasks/:id/plan', async (req, res) => {
   const task = await tasksColl().findOne({ taskId: req.params.id });
   if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+
+  // Chat sessions: plan the LATEST instruction (goal heuristics run against it);
+  // the original goal + summary + recent turns ride along as context.
+  const instr = String(task.currentInstruction || '').trim() || task.goal;
 
   // Resolve 'auto' (or empty) model → a size-appropriate installed model, and
   // persist it so every phase (planning, ai_verify) uses the same one.
@@ -806,9 +1151,21 @@ app.post('/tasks/:id/plan', async (req, res) => {
     sysExtra += '\n\nThe user ATTACHED these skills to this task — prefer them: ' +
       task.useSkills.map((s) => `"${s.name}" (${s.kind === 'collection' ? 'collect_by_skill' : (s.steps && s.steps.length > 1 ? 'run_skill workflow' : 'use_skill ' + (s.action || ''))})`).join(', ') + '.';
   }
+  const sessionContext = task.currentInstruction
+    ? [
+        'This is a CONTINUING task session — earlier rounds already ran.',
+        `Original goal: ${task.goal}`,
+        task.sessionSummary ? `Session summary: ${task.sessionSummary}` : '',
+        (task.chat || []).length > 1
+          ? 'Recent conversation:\n' + (task.chat || []).slice(-6, -1).map((m) => `${m.role}: ${m.text}`).join('\n')
+          : '',
+        `Progress so far: ${(task.collected || []).length} items collected, ${(task.extracted || []).length} extracted, ${task.scrolls || 0} scrolls, ${task.actions || 0} actions.`,
+        `CURRENT INSTRUCTION — plan phases ONLY for this:\n${task.currentInstruction}`,
+      ].filter(Boolean).join('\n\n')
+    : task.goal;
   const messages = [
     { role: 'system', content: planningSystemPrompt(task.schemas, skills) + sysExtra },
-    { role: 'user', content: task.goal },
+    { role: 'user', content: sessionContext },
   ];
 
   // Small local models are flaky. temp 0 is deterministic, so a failed parse
@@ -847,7 +1204,7 @@ app.post('/tasks/:id/plan', async (req, res) => {
   plan = fixed.plan;
 
   // Strictly honor an explicit count in the goal (models often ignore "only one").
-  const wantCount = requestedCount(task.goal);
+  const wantCount = requestedCount(instr);
   if (wantCount != null && wantCount !== plan.target.count) {
     const was = plan.target.count;
     plan.target.count = wantCount;
@@ -862,13 +1219,13 @@ app.post('/tasks/:id/plan', async (req, res) => {
   // goal text deterministically.
   const nav = plan.phases.find((p) => p.tool === 'navigate');
   if (nav) {
-    if (/\bnew tab\b/i.test(task.goal)) nav.params.newTab = true;
-    else if (/\b(current|this|existing|same)\s+tab\b/i.test(task.goal)) delete nav.params.newTab;
+    if (/\bnew tab\b/i.test(instr)) nav.params.newTab = true;
+    else if (/\b(current|this|existing|same)\s+tab\b/i.test(instr)) delete nav.params.newTab;
   }
 
   // Scroll direction, decided from the goal (models often miss it). Vertical is
   // the default; horizontal only when the user says sideways/horizontally.
-  const wantsHorizontal = /\b(horizontal(ly)?|sideways|side\s*ways|left\s+to\s+right|right\s+to\s+left|carousel|stories\s+row)\b/i.test(task.goal);
+  const wantsHorizontal = /\b(horizontal(ly)?|sideways|side\s*ways|left\s+to\s+right|right\s+to\s+left|carousel|stories\s+row)\b/i.test(instr);
   for (const ph of plan.phases) {
     if (ph.tool !== 'scroll') continue;
     if (wantsHorizontal) ph.params.direction = 'horizontal';
@@ -879,30 +1236,12 @@ app.post('/tasks/:id/plan', async (req, res) => {
   const events = [...modelEvents, { at: nowIso(), kind: 'obs', msg: `Planned ${plan.phases.length} phases, target ${plan.target.count} ${plan.target.metric}.` }];
   if (fixed.repaired.length) events.push({ at: nowIso(), kind: 'think', msg: 'Plan completed: ' + fixed.repaired.join(', ') + '.' });
 
-  // Deterministic find routing: "find/search a post about X" MUST use find_post.
-  // Small models mangle this into scroll + collect_text with invalid selectors
-  // and a "scrolls" target, which finishes without ever finding anything.
-  const findIntent = /\b(find|look\s+for|search(?:\s+for)?|locate)\b[\s\S]{0,80}\bposts?\b/i.test(task.goal);
-  if (findIntent && !plan.phases.some((p) => p.tool === 'find_post')) {
-    const quoted = task.goal.match(/["“']([^"”']{2,80})["”']/);
-    const about = task.goal.match(/\b(?:about|discuss(?:es|ing|ed)?(?:\s+about)?|regarding|related\s+to|selling)\s+["“']?([^."”'\n]{2,80})/i);
-    const query = ((quoted && quoted[1]) || (about && about[1]) || task.goal).trim();
-    const n = wantCount != null ? wantCount : 1;
-    plan.target = { metric: 'items', count: n };
-    plan.phases = plan.phases.filter((p) =>
-      !['scroll', 'collect_text', 'scroll_and_collect_links', 'visit_and_extract_details', 'collect_by_skill', 'ai_verify'].includes(p.tool));
-    plan.phases.push({ tool: 'find_post', params: { query, target: n } });
-    events.push({ at: nowIso(), kind: 'think', msg: `Find task → scanning posts one by one for "${query}" (find_post, target ${n}).` });
-  }
-
-  // If the user picked no schema and the task collects data, create a
-  // task-owned schema now — from the model's suggestion, else defaults.
   // Deterministic skill routing. Prefer a skill the user explicitly picked;
   // else fall back to matching a taught collection skill named in the goal.
-  if (plan.target.metric !== 'scrolls' && !plan.phases.some((p) => p.tool === 'find_post')) {
+  if (plan.target.metric !== 'scrolls') {
     let routeSkill = (task.useSkills || []).find((s) => s.kind === 'collection') || null;
     if (!routeSkill && plan.target.metric !== 'items' && skills.length) {
-      const g = task.goal.toLowerCase();
+      const g = instr.toLowerCase();
       routeSkill = skills.find((s) => s.kind === 'collection' &&
         (g.includes(s.name.toLowerCase()) || g.includes(s.name.toLowerCase().replace(/_/g, ' ')))) || null;
     }
@@ -911,12 +1250,12 @@ app.post('/tasks/:id/plan', async (req, res) => {
       const fullSkill = skills.find((s) => s.name === routeSkill.name && s.kind === 'collection') || routeSkill;
       plan.target = { metric: 'items', count: plan.target.count };
       // Skill collection covers it — drop other collectors incl. collect_text.
-      plan.phases = plan.phases.filter((p) => !['scroll_and_collect_links', 'visit_and_extract_details', 'collect_text'].includes(p.tool));
+      plan.phases = plan.phases.filter((p) => !['collect_text'].includes(p.tool));
       // Collect ONLY the fields the task asked for (else all — safe fallback).
-      const wantedReads = requestedReadFields(task.goal, fullSkill.fields);
+      const wantedReads = requestedReadFields(instr, fullSkill.fields);
       const params = { skill: routeSkill.name, target: plan.target.count };
       if (wantedReads.length) {
-        params.fields = [...wantedReads, ...requestedClickFields(task.goal, fullSkill.fields, wantedReads)];
+        params.fields = [...wantedReads, ...requestedClickFields(instr, fullSkill.fields, wantedReads)];
       }
       const cbs = plan.phases.find((p) => p.tool === 'collect_by_skill');
       if (cbs) cbs.params = params;
@@ -940,11 +1279,23 @@ app.post('/tasks/:id/plan', async (req, res) => {
   });
 
   // If the user asked to verify/compare/correct, guarantee an ai_verify LAST phase.
-  if (/\b(verify|compare|correct|validate|cross.?check|double.?check|check if|make sure)\b/i.test(task.goal)
+  if (/\b(verify|compare|correct|validate|cross.?check|double.?check|check if|make sure)\b/i.test(instr)
       && !plan.phases.some((p) => p.tool === 'ai_verify')
-      && plan.phases.some((p) => ['collect_by_skill', 'collect_text', 'scroll_and_collect_links', 'visit_and_extract_details'].includes(p.tool))) {
+      && plan.phases.some((p) => ['collect_by_skill', 'collect_text'].includes(p.tool))) {
     plan.phases.push({ tool: 'ai_verify', params: {} });
     events.push({ at: nowIso(), kind: 'think', msg: 'Added AI verification pass (ai_verify) as the final phase.' });
+  }
+
+  // Continuing session: counters (collected/scrolls/actions) are CUMULATIVE
+  // across rounds, so "collect 5 more" means baseline + 5, not 5.
+  if (task.currentInstruction) {
+    const baseline = plan.target.metric === 'scrolls' ? (task.scrolls || 0)
+      : plan.target.metric === 'actions' ? (task.actions || 0)
+      : (task.collected?.length || 0);
+    if (baseline > 0) {
+      plan.target.count += baseline;
+      events.push({ at: nowIso(), kind: 'think', msg: `Session target: ${baseline} ${plan.target.metric} already done + ${plan.target.count - baseline} new = ${plan.target.count}.` });
+    }
   }
 
   const set = { plan, status: 'running', currentPhaseIndex: 0, messages, updatedAt: nowIso() };
@@ -965,15 +1316,6 @@ app.post('/tasks/:id/plan', async (req, res) => {
         chosen = `from skill "${skill.name}"`; nm = `Data: ${skill.name}`;
       }
     }
-    // find_post yields the matching post's text, link, and why it matched.
-    if (!fields.length && plan.phases.some((p) => p.tool === 'find_post')) {
-      fields = normFields([
-        { key: 'text', label: 'Post text', type: 'text' },
-        { key: 'url', label: 'URL', type: 'url' },
-        { key: 'match_reason', label: 'Why it matched', type: 'text' },
-      ]);
-      chosen = 'found posts'; nm = 'Found posts';
-    }
     // collect_text always yields a text block + its source url.
     if (!fields.length && plan.target.metric === 'texts') {
       fields = normFields([{ key: 'text', label: 'Text', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
@@ -984,7 +1326,7 @@ app.post('/tasks/:id/plan', async (req, res) => {
 
     // Add columns for data the user asked for that no field can scrape (counts,
     // etc.) — ai_verify will fill them from each item's full text.
-    const derived = deriveExtraFields(task.goal, fields);
+    const derived = deriveExtraFields(instr, fields);
     if (derived.length && (plan.target.metric === 'items' || plan.target.metric === 'texts')) {
       fields = [...fields, ...derived];
       if (!plan.phases.some((p) => p.tool === 'ai_verify')) {
@@ -1007,6 +1349,10 @@ app.post('/tasks/:id/plan', async (req, res) => {
     if (created) set.schemas = [schemaSnapshot(created)];
   }
 
+  // Planning happens inside the current round — stamp every event so they group
+  // under the user turn that triggered this plan.
+  const rn = task.round || 0;
+  for (const e of events) if (e.round == null) e.round = rn;
   const doc = await tasksColl().findOneAndUpdate(
     { taskId: task.taskId },
     { $set: set, $push: { events: { $each: events } } },
@@ -1146,13 +1492,8 @@ function normFields(fields) {
 
 // Sensible default fields when the model doesn't specify a schema itself.
 function defaultFields(metric) {
-  if (metric === 'details') {
-    return normFields([
-      { key: 'name', label: 'Name', type: 'text' }, { key: 'url', label: 'URL', type: 'url' },
-      { key: 'category', label: 'Category', type: 'text' }, { key: 'followers', label: 'Followers', type: 'text' },
-      { key: 'phone', label: 'Phone', type: 'phone' }, { key: 'email', label: 'Email', type: 'email' },
-      { key: 'website', label: 'Website', type: 'url' }, { key: 'address', label: 'Address', type: 'text' },
-    ]);
+  if (metric === 'texts') {
+    return normFields([{ key: 'text', label: 'Text', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
   }
   return normFields([{ key: 'name', label: 'Name', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
 }
@@ -1696,6 +2037,66 @@ async function llmRefineNames(model, skill) {
   const out = JSON.parse(j.message?.content || '{}');
   return (Array.isArray(out.names) && out.names.length === cur.length) ? out.names.map(snakeName) : null;
 }
+
+// Auto-learn (overlay): the AI analyzes a digest of candidate page nodes and
+// PICKS which ones to introduce (with names/types/attrs/details) plus a skill
+// proposal. Pure suggestion — nothing is persisted here; the overlay computes
+// selectors deterministically and saves only after the user confirms.
+app.post('/learn/auto-detect', async (req, res) => {
+  const { model, host, path: pagePath, candidates } = req.body || {};
+  if (!model) return res.json({ ok: false, error: 'no model' });
+  if (!Array.isArray(candidates) || !candidates.length) return res.json({ ok: false, error: 'candidates required' });
+  try {
+    const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: false, options: { temperature: 0 },
+        format: {
+          type: 'object',
+          properties: {
+            picks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  i: { type: 'integer' },
+                  name: { type: 'string' },
+                  type: { type: 'string', enum: ['item', 'field', 'action', 'input', 'container'] },
+                  attr: { type: 'string', enum: ['text', 'innerText', 'href', 'src', ''] },
+                  action: { type: 'string', enum: ['click', 'type', 'press', 'read', 'hover', 'scroll', ''] },
+                  details: { type: 'string' },
+                },
+                required: ['i', 'name', 'type'],
+              },
+            },
+            skillName: { type: 'string' },
+            skillDetails: { type: 'string' },
+          },
+          required: ['picks', 'skillName'],
+        },
+        messages: [
+          { role: 'system', content: 'You analyze a web page for browser automation. Input JSON: {host, path, candidates:[{i, where, tag, role, aria, text, href, img, editable, count}]}. where="item" is a repeating list/feed container (count = how many repeats); where="in-item" nodes live inside ONE instance of it; where="page" nodes are page-wide. Choose the elements worth automating: the repeating item itself, the data fields inside it (publisher/author, title, body text, permalink, image, timestamp), its key actions (like/comment/share buttons), and page-level inputs (search box, post composer). Skip decoration, icons, and duplicates — when two candidates carry the same text, pick the more specific one. For each pick give: i (the candidate index), a short snake_case name, type (item|field|action|input|container), attr for fields (text|innerText|href|src), action for action/input types (click|type|press|read|hover|scroll), and one-line details describing what it is. Also propose a snake_case skillName and one-line skillDetails for a skill composed of these picks. At most 12 picks. Reply STRICT JSON {"picks":[...],"skillName":"...","skillDetails":"..."}.' },
+          { role: 'user', content: JSON.stringify({ host, path: pagePath, candidates }) },
+        ],
+      }),
+    })).json();
+    const out = JSON.parse(j.message?.content || '{}');
+    const byI = new Set(candidates.map((c) => c.i));
+    const seenI = new Set();
+    const picks = (Array.isArray(out.picks) ? out.picks : [])
+      .filter((p) => Number.isInteger(p.i) && byI.has(p.i) && !seenI.has(p.i) && ELEMENT_TYPES.has(p.type) && (seenI.add(p.i) || true))
+      .slice(0, 12)
+      .map((p) => ({
+        i: p.i, name: snakeName(p.name), type: p.type,
+        attr: p.attr || null, action: p.action || null,
+        details: String(p.details || '').slice(0, 200),
+      }));
+    if (!picks.length) return res.json({ ok: false, error: 'model picked nothing' });
+    res.json({ ok: true, picks, skillName: snakeName(out.skillName || ''), skillDetails: String(out.skillDetails || '').slice(0, 300) });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
 
 app.post('/skills/validate', async (req, res) => {
   const d = req.body || {};

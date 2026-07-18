@@ -1,1 +1,0 @@
-{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"_sourceUrl":{"$numberInt":"1"}},"name":"_sourceUrl_1"}],"uuid":"97f362254b794a619fec883bb4527bd2","collectionName":"data_data-fb-post-item-p7h6","type":"collection"}
