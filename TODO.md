@@ -1,15 +1,5 @@
-Update project design structure in PROJECT_STRUCTURE.md
+- also it should have feature to decide what to do next while working, this way inteligent humans do things - think - do thing - so on --- get success.
 
+- It should be able to create, edit, and delete its elements, skills which are saved in database. but before it create, edit, delete it should ask my approval. 
 
-navigate → click "What's on your mind" → generate_text (prompt: "Write a post about how we can survive in the AI era") → stop.
-
-
-PIDS=$(lsof -ti tcp:4000); echo "killing: $PIDS"; [ -n "$PIDS" ] && kill -9 $PIDS; sleep 1; (nc -z localhost 4000 2>/dev/null && echo "still up" || echo "port 4000 free")
-
-for p in $(lsof -ti tcp:4000); do echo "kill $p"; kill -9 "$p"; done; sleep 1; (nc -z localhost 4000 2>/dev/null && echo "still up" || echo "port 4000 free")
-
-If you run backend server for your testing purpose, then before ending task you should close the server so that i can run it myself,
-
-- We need to do something like take me toure feature. so it will be teach me skill toure feature. in this feature. user will do operations lively and our skill learer will record what is the user doing and optionally ask the user what he did. this way we can do capture lots of human behavioral skill and save it in our agent skill database. got it? do a great plan for this feature. 
-
-- We need a special tool which can execute code in browser, for example we asked a question to do some work. but we dont have a tool which can do that work, in this situation i want ai to write code and executor tool execute code in browser to achive that job, and verify its result if it dose not meet the expected output it should try diffferent way and so on..
+- Selecting elements and teaching skills become nightmare, because if the page is designed with react i see selector get confused because it may not hold the correct unique selector. so what we can do is i will give full instruction in skill like "navigate to facebook and then find a element which includes text "What's on your mind" then it will open a popup form then find contenteditable="true" div element, then put the post text there. then find "Next" button with only "Next" Text inside. then it will navigate to next "Post settings" step, in that step find "Post" button with only "Post" text. then click on it to publish post. after post is done wait for 3 seconds and then clise the tab. "

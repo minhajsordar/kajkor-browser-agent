@@ -110,12 +110,44 @@ async function connectDb() {
   await collFor('prompts').createIndex({ promptId: 1 }, { unique: true });
   await collFor('schemas').createIndex({ schemaId: 1 }, { unique: true });
   await collFor('schemas').createIndex({ slug: 1 }, { unique: true });
+  // Every schema's collected data lives in ONE `records` collection, tagged
+  // with the schema it belongs to (see the Schemas section).
+  await collFor('records').createIndex({ schemaId: 1, _sourceUrl: 1 });
+  await collFor('records').createIndex({ schemaId: 1, _taskId: 1 });
   await collFor('skills').createIndex({ skillId: 1 }, { unique: true });
   await collFor('skills').createIndex({ host: 1 });
   await collFor('debug_items').createIndex({ taskId: 1 });
   await collFor('task_shots').createIndex({ taskId: 1 });
   await collFor('users').createIndex({ email: 1 }, { unique: true });
   console.log(`Mongo connected: ${MONGODB_URI} / ${DB_NAME}`);
+  await migrateLegacyDataCollections();
+}
+
+// One-time: schemas used to own a per-schema `data_<slug>` collection. Copy any
+// leftover rows into the shared `records` collection and drop `dataCollection`
+// from the schema doc. Source collections are left in place (manual cleanup).
+async function migrateLegacyDataCollections() {
+  const legacy = await collFor('schemas').find({ dataCollection: { $exists: true } }).toArray();
+  for (const s of legacy) {
+    try {
+      const rows = await collFor(s.dataCollection).find({}).toArray();
+      for (const r of rows) {
+        const doc = wrapRecord(s.schemaId, r);
+        const filter = doc._sourceUrl
+          ? { schemaId: s.schemaId, _sourceUrl: doc._sourceUrl }
+          : { schemaId: s.schemaId, result: doc.result };
+        await collFor('records').updateOne(
+          filter,
+          { $set: { ...doc, updatedAt: r.updatedAt || nowIso() }, $setOnInsert: { createdAt: r.createdAt || nowIso() } },
+          { upsert: true }
+        );
+      }
+      await collFor('schemas').updateOne({ schemaId: s.schemaId }, { $unset: { dataCollection: '' } });
+      if (rows.length) console.log(`Migrated ${rows.length} record(s) from ${s.dataCollection} → records`);
+    } catch (e) {
+      console.warn(`Migration skipped for ${s.dataCollection}: ${e.message}`);
+    }
+  }
 }
 
 // Read a whole store in the legacy envelope shape the extension/CRM expect.
@@ -254,19 +286,29 @@ const tasksColl = () => collFor('tasks');
 // background — names here MUST match there.
 const TOOL_CATALOG = [
   { name: 'navigate', params: ['url', 'newTab'],
-    desc: 'Open a web page by full URL. Set newTab=true to force a NEW tab; otherwise an already-open tab on the same site is reused.' },
-  { name: 'scroll', params: ['times', 'delay', 'direction'],
-    desc: 'Scroll the current page `times` steps WITHOUT collecting anything. Use when the user only wants to scroll. `direction` is "vertical" (default, down the feed) or "horizontal" (sideways through a carousel/stories/reels row) — set horizontal ONLY when the user asks to scroll sideways.' },
-  { name: 'click', params: ['selector', 'text'],
-    desc: 'Click the element matching a CSS `selector` on the current page (or the first element whose visible text contains `text`). Use for buttons, links, tabs, "See more", etc.' },
-  { name: 'hover', params: ['selector', 'text'],
-    desc: 'Hover (mouseover) the element matching a CSS `selector` (or containing `text`) on the current page — e.g. to reveal a menu or tooltip.' },
-  { name: 'wait', params: ['seconds', 'selector', 'text'],
-    desc: 'Wait. With `selector`/`text`: wait until that element APPEARS on the page (up to 30s) — use between steps of slow multi-step dialogs. With only `seconds`: pause that long.' },
+    desc: 'Open a web page by full URL. Set newTab=true when the user asks to OPEN a tab/window (e.g. "open facebook.com in a tab", or when they later want that tab closed); otherwise an already-open tab on the same site is reused.' },
+  { name: 'scroll', params: ['times', 'seconds', 'delay', 'direction'],
+    desc: 'Scroll the current page WITHOUT collecting anything. Give `times` for a number of steps, OR `seconds` when the user asks to scroll FOR A DURATION ("scroll for 5 seconds") — never convert seconds into steps yourself. `delay` is milliseconds between steps (default 1200). `direction` is "vertical" (default, down the feed) or "horizontal" (sideways through a carousel/stories/reels row) — set horizontal ONLY when the user asks to scroll sideways.' },
+  { name: 'click', params: ['selector', 'text', 'descriptor'],
+    desc: 'Click the element matching a CSS `selector` on the current page (or the first element whose visible text contains `text`). Use for buttons, links, tabs, "See more", etc. PREFER `descriptor` (see DESCRIBING ELEMENTS) when the user described the target by its wording — especially "the button with ONLY that text", which `text` cannot express.' },
+  { name: 'hover', params: ['selector', 'text', 'descriptor'],
+    desc: 'Hover (mouseover) the element matching a CSS `selector` (or containing `text`) on the current page — e.g. to reveal a menu or tooltip. Also accepts `descriptor`.' },
+  { name: 'wait', params: ['seconds', 'selector', 'text', 'descriptor'],
+    desc: 'Wait. With `selector`/`text`/`descriptor`: wait until that element APPEARS on the page (up to 30s) — use between the steps of a multi-step dialog, where the next step\'s controls do not exist until the previous one is done. With only `seconds`: pause that long.' },
   { name: 'screenshot', params: [],
     desc: 'Capture the visible area of the current tab and attach it to the task as evidence (viewable in the dashboard). Use when the user asks to see/verify what happened.' },
+  { name: 'close_tab', params: ['match'],
+    desc: 'Close a tab. With no params it closes the tab this task is working in (the one a previous `navigate` opened or reused). Pass `match` (a host, URL fragment or title text) to close a specific other tab instead.' },
+  { name: 'switch_tab', params: ['match'],
+    desc: 'Switch to another ALREADY-OPEN tab and make it the tab this task acts on. `match` is a host, URL fragment or title text (e.g. "facebook.com", "Gmail"). Use when the user says "go back to the X tab" or the work continues on a different tab.' },
+  { name: 'list_tabs', params: [],
+    desc: 'List the tabs currently open (title + URL) and record them in the task log. Use when the user asks what is open, or when you need to find the right tab before switching to it.' },
+  { name: 'reload_tab', params: [],
+    desc: 'Reload the current tab and wait for it to finish loading. Use after an action that needs a refresh to take effect, or when a page is stuck.' },
+  { name: 'go_back', params: [],
+    desc: 'Go back one page in the current tab\'s history (the browser Back button).' },
   { name: 'ask_user', params: ['question'],
-    desc: 'PAUSE the task and ask the user to confirm before continuing (Approve/Decline in the popup or dashboard). ALWAYS add this right before irreversible outward actions the user asked to confirm — publishing a post, sending a message.' },
+    desc: 'PAUSE the task and ask the user to confirm before continuing (Approve/Decline in the popup or dashboard). Add this ONLY when the user explicitly asked to approve/review something first ("ask me before posting", "let me review it"). If they simply told you to post or send something, DO IT — do not add a confirmation they did not ask for.' },
   { name: 'press_key', params: ['key', 'selector', 'text'],
     desc: 'Press a keyboard key (default "Enter") on the field matching `selector`/`text`, or on the currently focused field when omitted. Use AFTER typing when a field submits on Enter and has NO submit button (search boxes, chat inputs, comment boxes). Other keys: Tab, Escape, ArrowDown, ArrowUp, Space.' },
   { name: 'type', params: ['value', 'selector', 'text'],
@@ -281,6 +323,14 @@ const TOOL_CATALOG = [
     desc: 'Use a learned "collection" skill to scroll and extract its taught fields from each repeating item (e.g. each post), saving up to `target` records.' },
   { name: 'collect_text', params: ['selector', 'target'],
     desc: 'Scroll and collect the FULL inner text of every element matching a CSS selector on the current page (e.g. "[role=article]" for posts, ".comment" for comments). Each block is saved as one record with a "text" field. Use when the user wants the whole text content of repeating elements.' },
+  { name: 'collect_links', params: ['target'],
+    desc: 'On a SEARCH-RESULTS page (Google etc.), collect the top `target` organic result links (url + title) in ranking order — it skips ads, "People also ask", and the search engine\'s own links. Use right after opening a web search to gather the result sites to visit.' },
+  { name: 'read_pages', params: ['target', 'maxChars'],
+    desc: 'Visit each link collected by collect_links (in a background tab) and extract that page\'s readable main content — title, article text and images — saving it onto the record as a SOURCE. Use straight after collect_links when the user wants the CONTENT of the results (research, analysis, comparison, summary), not just the links. Unreachable pages are skipped, not fatal.' },
+  { name: 'synthesize', params: ['question'],
+    desc: 'Read every SOURCE gathered by read_pages and write the final answer/analysis for the user, citing each claim as [1], [2]… Add this as the LAST phase of any research/analysis task so the user gets a written answer instead of raw data.' },
+  { name: 'solve_with_code', params: ['goal', 'expect'],
+    desc: 'LAST RESORT when no other tool can do the job: writes JavaScript, runs it on the current page, checks the result, and rewrites it differently if it failed (up to 4 attempts). READ-ONLY — it can extract, count, measure and compute, but must NOT click, type or change the page (use the normal tools for that). `goal` = what to get; `expect` = how to tell it worked (e.g. "at least 5 rows, each with a name and a price").' },
   { name: 'ai_verify', params: ['source', 'fields', 'instruction'],
     desc: 'AI verification/correction pass AFTER collecting. For each collected record it gives the model the record\'s full source text (the `source` field, e.g. "text" or an innerText field holding the whole item) and the extracted `fields`, then checks each field against the source and rewrites wrong/badly-formatted values using ONLY what the source contains. Add this as the LAST phase when the user asks to verify/compare/correct collected fields.' },
 ];
@@ -341,9 +391,13 @@ function planningSystemPrompt(schemas, skills) {
     '',
     'Rules:',
     '- Output STRICT JSON only. No prose, no markdown, no code fences.',
-    '- "target.metric" is one of: "scrolls" (only scrolling, no data collection), "texts" (collecting the full inner text of matching elements via collect_text), "items" (collecting taught fields from each repeating item via a learned collection skill), or "actions" (UI interactions only — clicks/typing/etc.).',
+    '- "target.metric" is one of: "scrolls" (only scrolling, no data collection), "texts" (collecting the full inner text of matching elements via collect_text), "items" (collecting taught fields from each repeating item via a learned collection skill), "links" (collecting search-result links via collect_links), or "actions" (UI interactions only — clicks/typing/etc.).',
     '- "target.count" is the number the user asked for.',
     '- Always start with a `navigate` phase using the URL implied by the task. Only omit navigate when the task clearly acts on the page already open.',
+    '- TO SEARCH THE WEB: do NOT type into a search box. `navigate` DIRECTLY to the results URL "https://www.google.com/search?q=<the+query+url+encoded>", then use `collect_links` (metric "links") to gather the top result sites. This is far more reliable than typing + pressing Enter.',
+    '- TO RESEARCH / ANALYZE / COMPARE / SUMMARIZE a topic from the web ("give me an analysis of…", "research…", "top 10…"): navigate to the search URL, then `collect_links`, then `read_pages` to pull the CONTENT of those results, then `synthesize` to write the cited answer. Use metric "links" with the number of sources to gather (default 10).',
+    '- ANSWERING A QUESTION ("what is the current price of X", "who won…", "latest…", "best…", "is X better than Y") ALWAYS goes through the search pipeline: navigate to the google search URL for the question, `collect_links`, `read_pages`, `synthesize`. NEVER navigate straight to a site you guessed from memory to read a fact off it.',
+    '- NEVER invent a CSS selector for a site you have not inspected. `collect_text` selectors are only valid when the user named the selector, or the page structure is already known from a learned skill. If you do not know the selector, use the search pipeline instead.',
     '- If the user says only to scroll (no data), use the `scroll` tool and metric "scrolls".',
     '- To collect the text content of repeating elements (posts, results, rows, comments), use `collect_text` with a CSS `selector` and metric "texts".',
     '- For UI interactions (clicking buttons/links/tabs, hovering to reveal menus) use the `click` and `hover` tools; if the task is only interactions (no data collected) use metric "actions" with count = number of interaction steps.',
@@ -352,8 +406,36 @@ function planningSystemPrompt(schemas, skills) {
     '- use_skill, run_skill and collect_by_skill may ONLY reference a skill from the "Learned skills" list below. NEVER invent or guess a skill name. If no learned skill fits, use the generic click/type/hover/collect_text tools instead.',
     '- For navigate, set params.newTab to true ONLY if the user explicitly asks to open a NEW tab; if they refer to the current/existing tab, omit newTab.',
     '- Phases run in order. Use the fewest phases needed.',
+    '',
+    'DESCRIBING ELEMENTS (params.descriptor) — prefer this over guessing a CSS selector.',
+    'The descriptor is ALWAYS an object nested under params.descriptor. Never put "exactText"/"by"/"scope"',
+    'directly in params — a phase with no selector, text or descriptor has NO TARGET and cannot run.',
+    'Full phases, copy this shape exactly:',
+    '  {"tool":"click","params":{"descriptor":{"by":"exactText","value":"Next","scope":"dialog"}}}',
+    '  {"tool":"click","params":{"descriptor":{"by":"text","value":"What\'s on your mind"}}}',
+    '  {"tool":"type","params":{"descriptor":{"by":"attr","attr":"contenteditable","value":"true","scope":"dialog"},"value":"the text to type"}}',
+    'The `by` values available:',
+    '  "exactText"    the control whose text is EXACTLY this (not "Next step")',
+    '  "text"         anything whose text CONTAINS this',
+    '  "attr"         by attribute — needs "attr" (the attribute name) and "value"',
+    '  "placeholder"  a field by its placeholder or label',
+    'Add "scope":"dialog" when the control is inside a popup/dialog that an earlier step opened — it then',
+    'searches ONLY inside that popup, so it cannot hit a similar control in the page behind it.',
+    'Use "exactText" whenever the user says "only that text" / "just the word X". Use it for publish buttons',
+    'like Post/Share/Send, where a loose match hits a feed item instead of the real button.',
+    '- A MULTI-STEP dialog (a form with Next / Continue between screens) only renders the NEXT screen after the',
+    '  previous one is submitted: its controls do not exist yet and no amount of waiting makes them appear early.',
+    '  Plan click(Next) → wait(descriptor of something on the next screen) → click(the next screen\'s button).',
+    '- A task MAY SPAN SEVERAL SITES ("research X then post it on facebook", "summarize this then tweet it"). Emit ONE `navigate` for EACH site, in visit order, followed by the phases acting on that site. Never drop the later steps — plan the WHOLE request, end to end.',
+    '- When the task researches something and THEN writes a post/message from it, put the research phases first (`collect_links` → `read_pages` → `synthesize`), then `navigate` to the publishing site, then the composing/publishing phases. `generate_text` automatically writes from the research produced earlier in the same task, so params.prompt only needs to say what KIND of text to write.',
     '- If the user asks to verify/compare/correct collected fields against a fuller text, add an "ai_verify" phase LAST, with params.source set to the field holding the full text.',
     '',
+    'Example — "search the web for best budget laptops and gather the result links":',
+    '{"target":{"metric":"links","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.google.com/search?q=best+budget+laptops"}},{"tool":"collect_links","params":{"target":10}}]}',
+    'Example — "give me an analysis of the top 10 small businesses that need the lowest investment":',
+    '{"target":{"metric":"links","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.google.com/search?q=top+small+businesses+lowest+investment"}},{"tool":"collect_links","params":{"target":10}},{"tool":"read_pages","params":{"target":10}},{"tool":"synthesize","params":{}}]}',
+    'Example — "research windows laptop vs macbook, prepare a facebook post, then post it on my feed" (TWO sites — research, then publish):',
+    '{"target":{"metric":"links","count":10},"phases":[{"tool":"navigate","params":{"url":"https://www.google.com/search?q=windows+laptop+vs+macbook"}},{"tool":"collect_links","params":{"target":10}},{"tool":"read_pages","params":{"target":10}},{"tool":"synthesize","params":{}},{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"generate_text","params":{"prompt":"Write a short engaging facebook post comparing windows laptops and macbooks"}},{"tool":"click","params":{"text":"Post"}}]}',
     'Example — "open example.com and only scroll 10 times, do not collect":',
     '{"target":{"metric":"scrolls","count":10},"phases":[{"tool":"navigate","params":{"url":"https://example.com"}},{"tool":"scroll","params":{"times":10}}]}',
     'Example — "on the current page, hover the menu then click the Settings link":',
@@ -369,11 +451,26 @@ function planningSystemPrompt(schemas, skills) {
     base.push('', 'Learned skills you can use (reference by exact name):');
     for (const s of skills) {
       const about = s.details ? ` — ${s.details}` : '';
-      if (s.kind === 'collection') base.push(`- collect_by_skill skill="${s.name}"${about} → fields: ${(s.fields || []).map((f) => f.name).join(', ')}  [${s.urlPattern}]`);
+      // Instruction skills are GUIDANCE, not a script: the prose says what the
+      // flow is, the hints say where things were last time. Planning still
+      // happens — the hints just mean fewer guesses at button wording.
+      if (s.kind === 'instruction') {
+        base.push(`- "${s.name}" on ${s.urlPattern} — a REMEMBERED FLOW. Plan it yourself from these instructions:`);
+        base.push(`    ${String(s.instructions || s.details || '').slice(0, 700)}`);
+        const hints = (s.hints || []).filter((h) => h.descriptor).slice(0, 8);
+        if (hints.length) {
+          base.push('    Controls that worked on this site before — reuse these descriptors:');
+          for (const h of hints) {
+            base.push(`      ${h.tool || 'click'} descriptor=${JSON.stringify(h.descriptor)}${h.matched ? `  (matched "${h.matched}")` : ''}`);
+          }
+        }
+      }
+      else if (s.kind === 'collection') base.push(`- collect_by_skill skill="${s.name}"${about} → fields: ${(s.fields || []).map((f) => f.name).join(', ')}  [${s.urlPattern}]`);
       else if (Array.isArray(s.steps) && s.steps.length > 1) base.push(`- run_skill skill="${s.name}"${about} → workflow: ${s.steps.map((x) => `${x.name}(${x.action})`).join(' → ')}  [${s.urlPattern}]`);
       else base.push(`- use_skill skill="${s.name}" (${s.action})${about}  [${s.urlPattern}]`);
     }
     base.push('Prefer collect_by_skill (metric "items") when a matching collection skill exists for the data requested.');
+    base.push('IMPORTANT: if a learned skill above covers what you need on a site (posting, searching, logging in…), USE IT (`run_skill`/`use_skill`) instead of hand-writing click/type phases — it was taught on that exact page and its selectors are known-good, while guessed button text often matches the wrong element.');
   }
   if (schemas && schemas.length) {
     base.push('', 'Collected data will be saved into these schemas (field keys):');
@@ -402,15 +499,23 @@ function normalizePlan(plan) {
   const clean = [];
   for (const ph of phases) {
     if (!ph || !TOOL_NAMES.has(ph.tool)) return null;
-    clean.push({ tool: ph.tool, params: (ph.params && typeof ph.params === 'object') ? ph.params : {} });
+    const params = liftDescriptor((ph.params && typeof ph.params === 'object') ? { ...ph.params } : {});
+    // Same validation the recovery path gets: a descriptor is model output.
+    if ('descriptor' in params) {
+      const d = cleanDescriptor(params.descriptor);
+      if (d) params.descriptor = d; else delete params.descriptor;
+    }
+    clean.push({ tool: ph.tool, params });
   }
   let target = plan.target;
   if (!target || typeof target !== 'object' || !Number(target.count)) {
     const cbs = clean.find((p) => p.tool === 'collect_by_skill');
     const ct = clean.find((p) => p.tool === 'collect_text');
+    const cl = clean.find((p) => p.tool === 'collect_links');
     const scr = clean.find((p) => p.tool === 'scroll');
     if (cbs && Number(cbs.params.target)) target = { metric: 'items', count: Number(cbs.params.target) };
     else if (ct && Number(ct.params.target)) target = { metric: 'texts', count: Number(ct.params.target) };
+    else if (cl && Number(cl.params.target)) target = { metric: 'links', count: Number(cl.params.target) };
     else if (scr && Number(scr.params.times)) target = { metric: 'scrolls', count: Number(scr.params.times) };
     else {
       // Pure action task (click/hover/scroll only): target = number of such phases.
@@ -419,18 +524,75 @@ function normalizePlan(plan) {
       else return null;
     }
   }
-  const metric = ['scrolls', 'items', 'texts', 'actions'].includes(target.metric) ? target.metric : 'texts';
+  const metric = ['scrolls', 'items', 'texts', 'links', 'actions'].includes(target.metric) ? target.metric : 'texts';
   return { target: { metric, count: Number(target.count) }, phases: clean };
+}
+
+// Is this task a question about the world (answer lives on the web) rather than
+// an instruction to operate a page the user already has in mind?
+function isWebQuestion(goal) {
+  const g = String(goal || '').trim();
+  if (!g) return false;
+  // Explicit page work — never a research question.
+  if (/\b(click|type|scroll|hover|post|comment|publish|send|open the|log ?in|sign ?in|fill)\b/i.test(g)) return false;
+  return /^(what|who|when|where|why|how|which|is|are|was|were|does|do|did|can|should|will)\b/i.test(g)
+    || /\?\s*$/.test(g)
+    || /\b(price|cost|rate|worth|latest|current|today|now|news|trending|top \d+|best|cheapest|compare|comparison|analysis|analyz|research|summar(y|ise|ize)|explain|tell me about|find out|look up)\b/i.test(g);
+}
+
+// A goal that names a concrete site ("open example.com and …") is a direct
+// instruction — respect the user's chosen destination, do not search instead.
+function namesASite(goal) {
+  return /\bhttps?:\/\/|\b[a-z0-9-]+\.(com|org|net|io|dev|co|ai|gov|edu)\b/i.test(String(goal || ''));
 }
 
 // Small local models often drop essential phases. Complete the plan
 // deterministically so it can actually run: guarantee navigate -> collect ->
 // (extract for details), keep a single navigate first, and fix scroll targets.
 // Returns { plan, repaired } — repaired lists what was added, for the log.
-function repairPlan(plan) {
+function repairPlan(plan, goal = '', skills = []) {
   const repaired = [];
   let phases = plan.phases.slice();
   const has = (t) => phases.some((p) => p.tool === t);
+
+  // A click/hover with no selector, no text and no descriptor has nothing to
+  // aim at. It cannot succeed, but it FAILS SLOWLY — "no element for " four
+  // times over 15s — and then drags the task into a recovery that starts
+  // clicking whatever it can find. Drop it here, loudly: a phase that cannot
+  // act is not an instruction being discarded, it is noise.
+  const targetless = (p) => /^(click|hover)$/.test(p.tool)
+    && !p.params?.selector && !p.params?.text && !p.params?.descriptor;
+  if (phases.some(targetless)) {
+    const n = phases.filter(targetless).length;
+    phases = phases.filter((p) => !targetless(p));
+    repaired.push(`dropped ${n} click/hover step(s) that had no target (no text, selector or descriptor)`);
+  }
+
+  // A question about the world can only be answered by reading the web. Small
+  // models answer one anyway: they navigate to a site they remember and invent
+  // a CSS selector for it, which collects nothing and then repeats until the
+  // repeat cap. Rewrite that shape into the search pipeline.
+  if (isWebQuestion(goal) && !has('collect_links') && !has('read_pages')
+      && !phases.some((p) => /skill/.test(p.tool))
+      && !/^(actions|scrolls)$/.test(plan.target.metric)
+      && !namesASite(goal)) {
+    const count = 10;
+    plan = { ...plan, target: { metric: 'links', count } };
+    phases = [
+      { tool: 'navigate', params: { url: `https://www.google.com/search?q=${encodeURIComponent(goal)}` } },
+      { tool: 'collect_links', params: { target: count } },
+      { tool: 'read_pages', params: { target: count } },
+      { tool: 'synthesize', params: { question: goal } },
+    ];
+    repaired.push('rewrote guessed-site plan into a web search');
+  }
+  // A plan that gathers search results IS a "links" task whatever the model
+  // called the metric. Without this the target is checked against the wrong
+  // counter and a search returning fewer hits than asked never completes.
+  if (has('collect_links') && plan.target.metric !== 'links') {
+    plan = { ...plan, target: { ...plan.target, metric: 'links' } };
+    repaired.push('target metric set to "links"');
+  }
   const metric = plan.target.metric;
 
   if (metric === 'scrolls') {
@@ -451,17 +613,223 @@ function repairPlan(plan) {
       repaired.push('added collect_text');
     }
     for (const p of phases) if (p.tool === 'collect_text' && !Number(p.params.target)) p.params.target = plan.target.count;
+  } else if (metric === 'links') {
+    // Web-search link gathering: ensure a collect_links phase with a target.
+    if (!has('collect_links')) {
+      phases.push({ tool: 'collect_links', params: { target: plan.target.count } });
+      repaired.push('added collect_links');
+    }
+    for (const p of phases) if (p.tool === 'collect_links' && !Number(p.params.target)) p.params.target = plan.target.count;
   } else if (metric === 'actions') {
     // Pure click/hover/scroll task — nothing to auto-complete.
   }
 
-  // Enforce order: one navigate first, then scroll/collect/act, then verify.
-  const order = { navigate: 0, scroll: 1, click: 1, hover: 1, type: 1, press_key: 1, wait: 1, screenshot: 1, ask_user: 1, generate_text: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1, collect_text: 1, ai_verify: 3 };
-  const nav = phases.filter((p) => p.tool === 'navigate').slice(0, 1);
-  const rest = phases.filter((p) => p.tool !== 'navigate')
-    .sort((a, b) => (order[a.tool] ?? 9) - (order[b.tool] ?? 9));
+  // Reading pages is only useful if something summarizes them — small models
+  // routinely forget the final step, so guarantee it. It must land right after
+  // the LAST read_pages: appending it would drop it into a later segment (the
+  // publish site), where it would summarize after the post was already written.
+  if (has('read_pages') && !has('synthesize')) {
+    let at = -1;
+    for (let i = phases.length - 1; i >= 0; i--) if (phases[i].tool === 'read_pages') { at = i; break; }
+    phases.splice(at + 1, 0, { tool: 'synthesize', params: {} });
+    repaired.push('added synthesize');
+  }
 
-  return { plan: { target: plan.target, phases: [...nav, ...rest] }, repaired };
+  // Research must FINISH before anything acts on its output. Models routinely
+  // emit the posting step in the middle of the research block, and same-rank
+  // sorting would keep it there — so the post gets composed from nothing.
+  if (has('read_pages') || has('synthesize')) {
+    const RESEARCH = ['collect_links', 'read_pages', 'synthesize'];
+    const lead = phases[0]?.tool === 'navigate' ? [phases[0]] : [];
+    const rest = lead.length ? phases.slice(1) : phases;
+    const research = rest.filter((p) => RESEARCH.includes(p.tool));
+    const after = rest.filter((p) => !RESEARCH.includes(p.tool));
+    if (research.length && after.length && rest.indexOf(after[0]) < rest.lastIndexOf(research[research.length - 1])) {
+      repaired.push('moved the research phases ahead of the steps that use them');
+    }
+    phases = [...lead, ...research, ...after];
+  }
+
+  // A skill only works on the site it was taught on. If the plan calls one
+  // without navigating there first, it runs against whatever page is open —
+  // the "No skill X for google.com" failure. Insert the missing navigate.
+  phases = insertSkillNavigations(phases, skills, repaired);
+
+  phases = orderPhases(phases);
+
+  // Publishing is outward-facing and irreversible. Unless the user explicitly
+  // opted out, confirm before the step that puts it live.
+  // "scroll for 5 seconds" is a DURATION, not a step count. Models reliably
+  // emit times:5 (and sometimes delay:1, which scrolls 5 times in 5ms).
+  const secs = String(goal || '').match(/\b(?:for\s+)?(\d{1,3})\s*(seconds?|secs?|s)\b/i);
+  if (secs && phases.some((p) => p.tool === 'scroll')) {
+    for (const p of phases) {
+      if (p.tool !== 'scroll') continue;
+      if (!p.params.seconds) {
+        p.params = { ...p.params, seconds: Number(secs[1]) };
+        delete p.params.times;
+        repaired.push(`scroll set to ${secs[1]}s (a duration, not a step count)`);
+      }
+    }
+  }
+
+  // "close the tab when you're done" needs a close_tab phase; models omit the
+  // step entirely and the task then reports success having never closed it.
+  if (/\b(close|shut)\b[^.]{0,30}\b(tab|window|page)\b/i.test(goal || '') && !phases.some((p) => p.tool === 'close_tab')) {
+    phases.push({ tool: 'close_tab', params: {} });
+    repaired.push('added the close_tab step the plan was missing');
+  }
+
+  // If the user wants the tab CLOSED afterwards, it must be a tab we opened —
+  // silently reusing (and then closing) a tab of theirs is destructive.
+  if (phases.some((p) => p.tool === 'close_tab')) {
+    const nav = phases.find((p) => p.tool === 'navigate');
+    if (nav && !nav.params.newTab) {
+      nav.params = { ...nav.params, newTab: true };
+      repaired.push('open in a NEW tab, since the task closes it afterwards');
+    }
+  }
+
+  // A click that opens a composer is followed immediately by typing, but the
+  // dialog needs a moment to render. Without the pause the text lands in
+  // whatever field is already on the page (a feed comment box, in practice).
+  for (let i = phases.length - 2; i >= 0; i--) {
+    if (phases[i].tool !== 'click') continue;
+    if (!['type', 'generate_text'].includes(phases[i + 1].tool)) continue;
+    phases.splice(i + 1, 0, { tool: 'wait', params: { seconds: 2 } });
+    repaired.push('added a short wait for the composer to open');
+  }
+
+  // Models reliably compose the post and then forget to submit it. If the user
+  // asked for it to be PUBLISHED and the plan only writes text, add the submit
+  // click. It is always gated by the confirmation added below, so a wrong guess
+  // is declined rather than posted.
+  if (/\b(post|publish|share|tweet|send)\b/i.test(goal || '')
+      && phases.some((p) => ['generate_text', 'type'].includes(p.tool))
+      && !phases.some(isPublishPhase)) {
+    // Match the button the target surface actually shows.
+    const label = /\b(send|message|dm|reply)\b/i.test(goal || '') ? 'Send'
+      : /\b(share)\b/i.test(goal || '') ? 'Share' : 'Post';
+    phases.push({ tool: 'click', params: { text: label } });
+    repaired.push(`added the missing "${label}" click`);
+  }
+
+  // Confirmation is OPT-IN. The agent acts on the user's own accounts; if they
+  // asked it to post, it posts. A confirmation is only inserted when they asked
+  // to be asked ("confirm before posting", "let me review it first"). When they
+  // do ask, EVERY publish step gets its own — a plan that posts to two sites
+  // must not slip the second one through on the first approval.
+  if (WANTS_APPROVAL.test(goal || '')) {
+    let added = 0;
+    for (let i = phases.length - 1; i >= 0; i--) {
+      if (!isPublishPhase(phases[i])) continue;
+      if (i > 0 && phases[i - 1].tool === 'ask_user') continue; // already guarded
+      const site = siteOf(phases, i);
+      phases.splice(i, 0, {
+        tool: 'ask_user',
+        params: { question: `Ready to publish this publicly${site ? ` on ${site}` : ''}. Post it?` },
+      });
+      added++;
+    }
+    if (added) repaired.push(`added ${added} confirmation(s) before publishing`);
+  }
+
+  return { plan: { target: plan.target, phases }, repaired };
+}
+
+// Did the user ask to approve before the agent acts? Only then does the planner
+// insert an ask_user gate — otherwise "post it on my feed" means post it.
+const WANTS_APPROVAL =
+  /\b(ask|confirm|check|verify|approve|approval|permission|review|show)\b[^.;]{0,40}\b(me|first|before|with me)\b|\bbefore (posting|publishing|you post|sending)\b|\blet me (see|review|approve|check)\b|\bdon'?t post (it )?(until|before)\b/i;
+
+// Relative order of tools WITHIN one site visit. Cross-site order is carried by
+// the navigate phases themselves, so this only sorts inside a segment.
+const PHASE_ORDER = {
+  scroll: 1, click: 1, hover: 1, type: 1, press_key: 1, wait: 1, screenshot: 1,
+  ask_user: 1, generate_text: 1, use_skill: 1, run_skill: 1, collect_by_skill: 1,
+  collect_text: 1, collect_links: 1, read_pages: 2, ai_verify: 3, synthesize: 4,
+  close_tab: 8, // always last in its segment — nothing can act on a closed tab
+};
+
+// A plan is a SEQUENCE OF SITE VISITS: each `navigate` opens a segment, and the
+// phases after it act on that site. Sorting globally (the old behaviour) moved
+// actions across sites — "research then post" ran the posting steps on the
+// search page. Sort only within a segment, and keep every navigate.
+function orderPhases(phases) {
+  const segments = [];
+  let cur = { nav: null, rest: [] };
+  for (const p of phases) {
+    if (p.tool === 'navigate') {
+      if (cur.nav || cur.rest.length) segments.push(cur);
+      cur = { nav: p, rest: [] };
+    } else cur.rest.push(p);
+  }
+  segments.push(cur);
+
+  const out = [];
+  for (const seg of segments) {
+    // Re-visiting the site we are already on is a wasted page load.
+    const prevNav = [...out].reverse().find((p) => p.tool === 'navigate');
+    if (seg.nav && !(prevNav && sameTarget(prevNav.params?.url, seg.nav.params?.url))) out.push(seg.nav);
+    // Array.prototype.sort is stable, so same-rank phases keep the model's
+    // intended order (click composer → type → click Post).
+    out.push(...seg.rest.sort((a, b) => (PHASE_ORDER[a.tool] ?? 9) - (PHASE_ORDER[b.tool] ?? 9)));
+  }
+  return out;
+}
+
+function sameTarget(a, b) {
+  try {
+    const x = new URL(a), y = new URL(b);
+    return x.origin === y.origin && x.pathname === y.pathname && x.search === y.search;
+  } catch { return false; }
+}
+
+// Ensure every skill phase is preceded by a navigate to the host that skill was
+// taught on. Skills are host-scoped, so calling one on the wrong site fails with
+// "No skill <name> for <host>" — and small models forget the hop constantly.
+function insertSkillNavigations(phases, skills, repaired) {
+  if (!Array.isArray(skills) || !skills.length) return phases;
+  const byName = new Map(skills.map((s) => [String(s.name || '').toLowerCase(), s]));
+  const bare = (h) => String(h || '').replace(/^www\./, '').toLowerCase();
+  const out = [];
+  let curHost = '';
+  for (const p of phases) {
+    if (p.tool === 'navigate') {
+      try { curHost = bare(new URL(p.params?.url).hostname); } catch { curHost = ''; }
+      out.push(p);
+      continue;
+    }
+    if (['use_skill', 'run_skill', 'collect_by_skill'].includes(p.tool)) {
+      const sk = byName.get(String(p.params?.skill || '').toLowerCase());
+      const host = bare(sk?.host);
+      if (host && host !== curHost) {
+        out.push({ tool: 'navigate', params: { url: `https://${host}` } });
+        repaired.push(`added navigate to ${host} for skill "${sk.name}"`);
+        curHost = host;
+      }
+    }
+    out.push(p);
+  }
+  return out;
+}
+
+// Host of the navigate that opened the segment containing phase `i` — so a
+// confirmation can name the site it is about to post to.
+function siteOf(phases, i) {
+  for (let k = i; k >= 0; k--) {
+    if (phases[k].tool !== 'navigate') continue;
+    try { return new URL(phases[k].params?.url).hostname.replace(/^www\./, ''); } catch { return ''; }
+  }
+  return '';
+}
+
+// Does this phase publish something outward (post / tweet / share / send)?
+function isPublishPhase(p) {
+  const words = /\b(post|publish|share|tweet|send|submit)\b/i;
+  if (p.tool === 'click') return words.test(String(p.params?.text || ''));
+  if (p.tool === 'use_skill' || p.tool === 'run_skill') return words.test(String(p.params?.skill || ''));
+  return false;
 }
 
 // Classify a field by the concept its NAME encodes, so a task request ("publisher
@@ -524,8 +892,13 @@ function requestedClickFields(goal, skillFields, wantedReads) {
 
 // The count the user explicitly stated, so the model can't override it. Returns
 // a number, or null if the goal names no specific amount.
+// Clauses that describe something to WRITE, not something to collect. "prepare
+// a facebook post" was being read as "collect 1 item", capping the research at
+// a single source. Drop those clauses before counting.
+const COMPOSE_CLAUSE = /\b(prepare|write|create|compose|draft|make|generate|publish)\b[^.;,]*/gi;
+
 function requestedCount(goal) {
-  const g = ' ' + (goal || '').toLowerCase() + ' ';
+  const g = ' ' + String(goal || '').replace(COMPOSE_CLAUSE, ' ').toLowerCase() + ' ';
   // explicit "one/single/first/a" (with an optional adjective: "a facebook post")
   if (/\b(?:a|an|first|single|one|1)\s+(?:[a-z]+\s+)?(?:post|item|row|page|element|comment|result|link)\b/.test(g)) return 1;
   if (/\b(only|just)\s+(one|1|a single|the first)\b/.test(g)) return 1;
@@ -558,29 +931,57 @@ function deriveExtraFields(goal, existing) {
   return normFields(out);
 }
 
-// ---- Ollama proxy: list only tool-calling models ----
+// Installed models with their capabilities. /api/show is one round trip PER
+// model, so the result is cached briefly — /models, model resolution and the
+// vision lookup all hit this on nearly every request otherwise.
+let CAPS_CACHE = { at: 0, list: [] };
+async function installedModels({ maxAgeMs = 60000 } = {}) {
+  if (Date.now() - CAPS_CACHE.at < maxAgeMs && CAPS_CACHE.list.length) return CAPS_CACHE.list;
+  const list = (await (await fetch(`${OLLAMA_URL}/api/tags`)).json()).models || [];
+  const out = [];
+  for (const m of list) {
+    let caps = m.capabilities;
+    if (!Array.isArray(caps)) {
+      try {
+        const s = await fetch(`${OLLAMA_URL}/api/show`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: m.name }),
+        }).then((x) => x.json());
+        caps = s.capabilities;
+      } catch {}
+    }
+    out.push({ name: m.name, size: m.size, paramSize: m.details?.parameter_size || '', caps: Array.isArray(caps) ? caps : [] });
+  }
+  CAPS_CACHE = { at: Date.now(), list: out };
+  return out;
+}
+
+// ---- Ollama proxy ----
+// Default: tool-calling models (the only ones that can run a plan).
+// ?capability=vision lists image-capable models instead — those usually do NOT
+// have the "tools" capability, so they are invisible without this.
 app.get('/models', async (req, res) => {
   try {
-    const list = (await (await fetch(`${OLLAMA_URL}/api/tags`)).json()).models || [];
-    const models = [];
-    for (const m of list) {
-      let caps = m.capabilities;
-      if (!Array.isArray(caps)) {
-        try {
-          const s = await fetch(`${OLLAMA_URL}/api/show`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: m.name }),
-          }).then((x) => x.json());
-          caps = s.capabilities;
-        } catch {}
-      }
-      if (Array.isArray(caps) && caps.includes('tools')) models.push({ name: m.name, size: m.size, paramSize: m.details?.parameter_size || '' });
-    }
+    const want = String(req.query.capability || 'tools');
+    const models = (await installedModels())
+      .filter((m) => m.caps.includes(want))
+      .map(({ name, size, paramSize }) => ({ name, size, paramSize }));
     res.json({ ok: true, models });
   } catch (e) {
     res.status(502).json({ ok: false, error: 'Ollama not reachable at ' + OLLAMA_URL, models: [] });
   }
 });
+
+// Pick a model that can actually see images: the session's own model if it is
+// vision-capable, otherwise the largest installed vision model. null = none.
+async function visionModel(current) {
+  let list = [];
+  try { list = await installedModels(); } catch { return null; }
+  const vision = list.filter((m) => m.caps.includes('vision'));
+  if (!vision.length) return null;
+  if (current && vision.some((m) => m.name === current)) return current;
+  return vision.sort((a, b) => (b.size || 0) - (a.size || 0))[0].name;
+}
 
 // Rough task-complexity score (0..6): harder tasks warrant a bigger model.
 function taskComplexity(goal) {
@@ -686,6 +1087,29 @@ app.post('/tasks', async (req, res) => {
     return res.json({ ok: true, task: base, mode: 'host', proposal });
   }
 
+  // A question ABOUT the agent's own skills/elements is not a browser task.
+  // Answer it from the database in an idle session — planning it sent the agent
+  // to Facebook to RUN the very skill the user was only asking about.
+  if (isIntrospection(goal)) {
+    const resolved = await resolveModel(model, String(goal));
+    const useModel = resolved.name || model;
+    const reply = await answerIntrospection(useModel, String(goal));
+    const task = {
+      taskId: crypto.randomUUID(),
+      goal: String(goal), model: useModel, mode: 'once', project: taskProject,
+      schemas: [], useSkills: [], systemPrompt: null,
+      status: 'done', plan: null, currentPhaseIndex: 0,
+      collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+      repeats: 0, maxRepeats: 3, messages: [],
+      chat: [{ role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round: 0 }],
+      queue: [], sessionSummary: '', currentInstruction: null, round: 0,
+      events: [{ at: nowIso(), kind: 'ok', msg: 'Answered from my own skills/elements — no browsing needed.', round: 0 }],
+      errors: [], createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
+    };
+    await tasksColl().insertOne({ ...task });
+    return res.json({ ok: true, task, mode: 'introspect', reply });
+  }
+
   // Snapshot the chosen system prompt; its bundled skills join the task's skills.
   let systemPrompt = null;
   const extraSkillIds = [];
@@ -700,7 +1124,7 @@ app.post('/tasks', async (req, res) => {
   const ids = Array.isArray(schemas) ? schemas : [];
   if (ids.length) {
     const docs = await collFor('schemas').find({ schemaId: { $in: ids } }, { projection: { _id: 0 } }).toArray();
-    taskSchemas = docs.map((s) => ({ schemaId: s.schemaId, name: s.name, slug: s.slug, dataCollection: s.dataCollection, fields: s.fields }));
+    taskSchemas = docs.map(schemaSnapshot);
   }
 
   // Snapshot explicitly chosen learned skills so planning routes to them.
@@ -718,7 +1142,9 @@ app.post('/tasks', async (req, res) => {
     schemas: taskSchemas,        // schemas this task saves collected data into
     useSkills: taskUseSkills,    // learned skills the task should use
     systemPrompt,                // standing instructions attached to this task
-    status: 'planning',          // planning|running|checking|done|error|stopped
+    // `idle` creates a session the extension will NOT plan or execute — used
+    // when the first turn is an image to analyze, not a browser instruction.
+    status: req.body?.idle ? 'done' : 'planning', // planning|running|checking|done|error|stopped
     plan: null,
     currentPhaseIndex: 0,
     collected: [],               // task-scoped {url,name} collected this task
@@ -729,9 +1155,14 @@ app.post('/tasks', async (req, res) => {
     repeats: 0,
     maxRepeats: 3,
     messages: [],                // LLM planning transcript (audit/resume)
-    chat: [],                    // conversational session turns [{role,text,at}]
+    // The opening goal IS the first turn of the conversation. Leaving it out
+    // rendered a blank transcript in the desktop app for any task started from
+    // the composer: follow-up turns push to `chat`, but the first one never did,
+    // so a task that ran fine looked like it had said nothing.
+    chat: goal ? [{ role: 'user', text: String(goal).slice(0, 8000), at: nowIso(), round: 0 }] : [],
     sessionSummary: '',          // compacted context of earlier session rounds
     currentInstruction: null,    // latest chat instruction being planned/executed
+    queue: [],                   // prompts typed while busy; run on terminal status
     round: 0,                    // server-stamped round index (bumped per user turn)
     events: [{ at: nowIso(), kind: 'think', msg: 'Task created.', round: 0 }],
     errors: [],
@@ -780,13 +1211,75 @@ app.post('/tasks/:id/rerun', async (req, res) => {
 });
 
 // Whitelisted field updates (the extension persists progress through here).
-const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'pendingQuestion', 'repeats', 'plan', 'finishedAt', 'messages', 'model', 'project', 'round']);
+// `lastTypedText`: whatever the most recent type phase actually entered. The
+// publish verification used to key on `generatedText` alone, so a post whose
+// text the USER supplied (params.value, no generate_text phase) skipped the
+// check entirely — and a run that clicked the wrong button reported success.
+const PATCHABLE = new Set(['status', 'currentPhaseIndex', 'collected', 'extracted', 'scrolls', 'scanY', 'actions', 'generatedText', 'lastTypedText', 'pendingQuestion', 'repeats', 'plan', 'finishedAt', 'messages', 'model', 'project', 'round', 'title', 'rethinks']);
 app.patch('/tasks/:id', async (req, res) => {
   const set = {};
   for (const [k, v] of Object.entries(req.body || {})) if (PATCHABLE.has(k)) set[k] = v;
   set.updatedAt = nowIso();
   const doc = await tasksColl().findOneAndUpdate(
     { taskId: req.params.id }, { $set: set },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  const task = doc?.value || doc;
+  res.json({ ok: true, task });
+
+  // The extension marks a round finished through here — that is the moment a
+  // queued prompt may start. Drain AFTER responding: a turn can call the model,
+  // and the extension must not wait on it.
+  if (task && TERMINAL_STATUSES.has(task.status) && (task.queue || []).length) {
+    drainQueue(task.taskId).catch(() => {});
+  }
+});
+
+// Cancel a running task. The extension re-reads status between phases and at
+// the top of its loop, so flipping it in the DB is what actually halts work —
+// this also survives a torn-down service worker (nothing in memory to signal).
+// Queued prompts are discarded: "stop" means stop everything.
+app.post('/tasks/:id/stop', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const dropped = (task.queue || []).length;
+  const msg = 'Stopped by user.' + (dropped ? ` Discarded ${dropped} queued prompt(s).` : '');
+  const doc = await tasksColl().findOneAndUpdate(
+    { taskId: req.params.id },
+    {
+      $set: { status: 'stopped', queue: [], pendingQuestion: null, finishedAt: nowIso(), updatedAt: nowIso() },
+      $push: {
+        events: { at: nowIso(), kind: 'obs', msg, round: task.round || 0 },
+        chat: { role: 'assistant', text: '⏹️ ' + msg, at: nowIso(), round: task.round || 0 },
+      },
+    },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  res.json({ ok: true, dropped, task: doc?.value || doc });
+});
+
+// Narrow (or clear) the learned skills this session plans with. Fewer skills =
+// a smaller planning prompt = faster, more accurate routing. Empty array means
+// "no restriction" (all skills are offered again).
+app.post('/tasks/:id/skills', async (req, res) => {
+  const ids = Array.isArray(req.body?.skillIds) ? req.body.skillIds.map(String) : [];
+  let useSkills = [];
+  if (ids.length) {
+    const docs = await resolveSkills(await skillsColl().find({ skillId: { $in: ids } }, { projection: { _id: 0 } }).toArray());
+    useSkills = docs.map((s) => ({ skillId: s.skillId, name: s.name, kind: s.kind, action: s.action, fields: s.fields, steps: s.steps || null, urlPattern: s.urlPattern }));
+  }
+  const doc = await tasksColl().findOneAndUpdate(
+    { taskId: req.params.id }, { $set: { useSkills, updatedAt: nowIso() } },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  if (!doc && !doc?.value) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, task: doc?.value || doc });
+});
+
+// Drop a prompt that is still waiting in the queue.
+app.delete('/tasks/:id/queue/:qid', async (req, res) => {
+  const doc = await tasksColl().findOneAndUpdate(
+    { taskId: req.params.id }, { $pull: { queue: { id: req.params.qid } }, $set: { updatedAt: nowIso() } },
     { returnDocument: 'after', projection: { _id: 0 } }
   );
   res.json({ ok: true, task: doc?.value || doc });
@@ -796,6 +1289,7 @@ app.delete('/tasks/:id', async (req, res) => {
   await tasksColl().deleteOne({ taskId: req.params.id });
   await collFor('task_shots').deleteMany({ taskId: req.params.id });
   await collFor('debug_items').deleteMany({ taskId: req.params.id });
+  await collFor('task_files').deleteMany({ taskId: req.params.id });
   res.json({ ok: true });
 });
 
@@ -840,6 +1334,7 @@ app.post('/tasks/:id/answer', async (req, res) => {
 // compacted into `sessionSummary` (auto, or manually via /compact).
 
 const BUSY_STATUSES = new Set(['planning', 'running', 'checking', 'waiting']);
+const TERMINAL_STATUSES = new Set(['done', 'error', 'stopped']);
 
 async function askChat(model, messages, opts = {}) {
   const j = await (await fetch(`${OLLAMA_URL}/api/chat`, {
@@ -855,9 +1350,9 @@ async function sessionRecords(task, max = 60) {
   const rows = [];
   for (const s of (task.schemas || [])) {
     try {
-      const recs = await collFor(s.dataCollection)
-        .find({ _taskId: task.taskId }, { projection: { _id: 0, _taskId: 0 } }).limit(max).toArray();
-      rows.push(...recs);
+      const docs = await recordsColl()
+        .find({ schemaId: s.schemaId, _taskId: task.taskId }).limit(max).toArray();
+      rows.push(...docs.map((d) => d.result || {}));
     } catch {}
     if (rows.length >= max) break;
   }
@@ -871,16 +1366,172 @@ async function sessionRecords(task, max = 60) {
 // "summary" / "Analyze" / "collected" still match.
 const BROWSE_RX = /\b(navigate|go to|open|visit|reload|refresh|scroll|click|type|post|comment|like|follow|send|search|find|collect|extract|scrape|grab|capture|screenshot|fill|submit|log ?in|press|hover|download|new tab|next page)/i;
 const ANSWER_RX = /\b(summar|analy[sz]|report|explain|insight|overview|how many|what did|what is|which of|list the|tell me|compare|conclusion|takeaway|clean ?up|translate)/i;
+// Questions about the agent ITSELF — its learned skills, elements, schemas —
+// are answered from the database and must never touch the browser.
+// "Check your facebook post skill, how many elements does it have?" used to be
+// planned as a browser task: it navigated to Facebook and started RUNNING the
+// posting skill. Asking about a capability is not asking to use it.
+// The subject: does the message talk about the agent's own saved knowledge?
+// Determiners matter — "that skill" / "this element" are as common as "my".
+const INTROSPECT_SUBJECT_RX =
+  /\b(skill|skills|element|elements|schema|schemas)\b/i;
+// Reading ABOUT it. Deliberately generous: the cost of missing one of these is
+// that a read-only question runs a POSTING skill against a live account, which
+// is far worse than the cost of a false positive (an answer instead of a task).
+const INTROSPECT_READ_RX =
+  /\b(check|read|see|view|inspect|look at|tell me|show|list|describe|explain|write (it |them )?(here|out|down)|what|which|how many|how does|details?|instructions?|available|avail|do you have|is there|are there)\b/i;
+// Explicitly asking the agent to USE the skill for work — a real browser task.
+const INTROSPECT_ACTION_RX =
+  /\b(use|using|run|execute|apply|perform)\b[^.?]{0,25}\b(skill|skills)\b|\b(post|publish|tweet|send|collect|scrape|navigate|log ?in|sign ?in)\b/i;
+
+function isIntrospection(text) {
+  const s = String(text || '');
+  if (!INTROSPECT_SUBJECT_RX.test(s)) return false;
+  if (!INTROSPECT_READ_RX.test(s)) return false;
+  // "use my facebook skill to post about X" mentions a skill and reads like a
+  // task — the action wins unless the message is clearly asking to be shown it.
+  const clearlyReading = /\b(tell me|show me|write (it |them )?here|i want to (read|see|know)|how many|what (is|are)|list|describe|explain|details?|instructions?)\b/i.test(s);
+  return clearlyReading || !INTROSPECT_ACTION_RX.test(s);
+}
+
+// "Save this flow as a skill" is a request to write the agent's own memory, NOT
+// a browser task. Getting this wrong is expensive: a meta-request planned as a
+// browse round has TWICE run the posting flow again against the live account
+// (see PROJECT_MEMORY). So it is gated twice — this regex, and a routeChat
+// class — exactly like introspection.
+const SAVE_SKILL_RX =
+  /\b(save|store|remember|keep|record)\b[^.?!]{0,40}\b(as|into|to|in)\b[^.?!]{0,20}\b(a |an |my |new )?(skill|workflow|flow|routine|recipe)\b/i;
+const SAVE_SKILL_SHORT_RX =
+  /\b(save|remember|keep)\b[^.?!]{0,30}\b(this|that|it|these steps|the flow|the steps|this flow|this one)\b[^.?!]{0,30}\b(skill|workflow|flow|routine)\b/i;
+
+function isSaveSkillRequest(text) {
+  const s = String(text || '');
+  if (!/\b(skill|workflow|routine|recipe|flow)\b/i.test(s)) return false;
+  // "use my facebook skill to post" also mentions a skill — but it asks the
+  // agent to RUN one, not to write one. A save request never names a target.
+  if (/\b(use|using|run|execute|apply|with) (my |the |your )?[\w\s]{0,20}skill\b/i.test(s)) return false;
+  return SAVE_SKILL_RX.test(s) || SAVE_SKILL_SHORT_RX.test(s);
+}
+
+// A compact picture of what the agent knows, for answering questions about it.
+async function agentInventory() {
+  const skills = await resolveSkills(await skillsColl().find({}, { projection: { _id: 0 } }).toArray());
+  const elements = await elementsColl().find({}, { projection: { _id: 0, elementId: 1, name: 1, host: 1, type: 1, route: 1, details: 1, action: 1 } }).toArray();
+  const schemas = await schemasColl().find({}, { projection: { _id: 0, name: 1, fields: 1 } }).limit(40).toArray();
+
+  const raw = await skillsColl().find({}, { projection: { _id: 0, skillId: 1, elements: 1 } }).toArray();
+  const refCount = new Map(raw.map((s) => [s.skillId, (s.elements || []).length]));
+
+  return {
+    skills: skills.map((s) => ({
+      name: s.name, host: s.host, urlPattern: s.urlPattern, kind: s.kind,
+      elementCount: refCount.get(s.skillId) || 0,
+      steps: (s.steps || []).map((x) => `${x.name} (${x.action})`),
+      fields: (s.fields || []).map((f) => f.name),
+      details: s.details || '',
+      instructions: s.instructions || '',
+      hintCount: (s.hints || []).length,
+    })),
+    elements: elements.map((e) => ({ name: e.name, host: e.host, type: e.type, route: e.route, action: e.action, details: e.details || '' })),
+    schemas: schemas.map((s) => ({ name: s.name, fields: (s.fields || []).map((f) => f.key) })),
+  };
+}
+
+// Answer a question about the agent's own configuration. Returns the reply text.
+async function answerIntrospection(model, question) {
+  const inv = await agentInventory();
+  const lines = [];
+  lines.push(`LEARNED SKILLS (${inv.skills.length}):`);
+  for (const s of inv.skills) {
+    lines.push(`- "${s.name}" on ${s.urlPattern} — kind: ${s.kind || 'action'}, `
+      + (s.kind === 'instruction' ? `${s.hintCount} element hint(s)` : `${s.elementCount} element(s)`)
+      + (s.steps.length ? `, steps: ${s.steps.join(' → ')}` : '')
+      + (s.fields.length ? `, fields: ${s.fields.join(', ')}` : ''));
+    // The instructions/details are often exactly what is being asked for.
+    if (s.instructions) lines.push(`    instructions: ${s.instructions}`);
+    else if (s.details) lines.push(`    details/instructions: ${s.details}`);
+  }
+  lines.push('', `INTRODUCED ELEMENTS (${inv.elements.length}):`);
+  for (const e of inv.elements.slice(0, 60)) {
+    lines.push(`- "${e.name}" (${e.type}) on ${e.route || e.host}`
+      + (e.details ? ` — ${e.details}` : ''));
+  }
+  if (inv.schemas.length) {
+    lines.push('', `DATA SCHEMAS (${inv.schemas.length}):`);
+    for (const s of inv.schemas) lines.push(`- ${s.name}: ${s.fields.join(', ')}`);
+  }
+
+  try {
+    const reply = await askChat(model, [
+      { role: 'system', content:
+        'You are the browser agent, answering a question about YOUR OWN configuration. '
+        + 'Use ONLY the inventory below — it is the complete, current truth. Be exact with counts and names. '
+        + 'If the answer is a number, state it plainly first. Do not offer to browse the web; this is about what you already know.\n\n'
+        + lines.join('\n').slice(0, 9000) },
+      { role: 'user', content: question },
+    ], { temperature: 0.1 });
+    if (reply.trim()) return reply.trim();
+  } catch {}
+  // Model unavailable — the inventory itself is still a useful answer.
+  return lines.join('\n');
+}
+
+// Turn the run that just happened into a skill, and reply in the transcript.
+// Refuses rather than guessing when the run did not finish or there is nothing
+// to attach it to — a skill built from a broken run records the wrong thing as
+// if it were right, and it would be trusted on every later run.
+async function saveSkillFromChat(task, message, round) {
+  const say = async (text) => {
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: { chat: { role: 'assistant', text, at: nowIso(), round } },
+      $set: { updatedAt: nowIso() },
+    });
+    return text;
+  };
+
+  if (task.status !== 'done') {
+    return say(`This run is "${task.status}", not finished — I only save a flow once it has worked end to end. Let it finish (or re-run it), then ask again.`);
+  }
+  const instructions = String(task.currentInstruction || task.goal || '').trim();
+  if (!instructions) return say('There is no instruction in this session to save.');
+
+  const host = hostOfTask(task);
+  if (!host) return say('I could not work out which site this flow belongs to — it has no navigate step or recorded page.');
+
+  const hints = (task.resolutions || []).map((r) => ({
+    descriptor: r.descriptor, matched: r.matched, selectorHint: r.selectorHint, tool: r.tool, depth: r.depth,
+  }));
+  // A name in the message ("save this as My Facebook Post") wins over the guess.
+  const named = (message.match(/\b(?:as|called|named)\s+"([^"]{2,60})"/i) || message.match(/\b(?:as|called|named)\s+(?!a\b|an\b|my\b|the\b|new\b)([A-Za-z0-9][\w\s-]{2,40})\bskill\b/i) || [])[1];
+  const name = (named || '').trim() || defaultSkillName(instructions, host);
+
+  const { skill, merged } = await saveInstructionSkill({ name, host, instructions, hints, taskId: task.taskId });
+  const detail = hints.length
+    ? `I kept ${hints.length} element hint(s) from this run (${hints.map((h) => `"${h.matched}"`).slice(0, 4).join(', ')}${hints.length > 4 ? '…' : ''}).`
+    : 'This run used no descriptor steps, so there are no element hints yet — the instructions alone are saved.';
+  const text = `${merged ? 'Updated' : 'Saved'} **${skill.name}** for ${host}.\n\n${detail}\n\nRunning it still plans each time — the hints just tell me where things were, so I search less and guess less.`;
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: { events: { at: nowIso(), kind: 'ok', msg: `${merged ? 'Updated' : 'Saved'} skill "${skill.name}" (${hints.length} hints).`, round, meta: { skillId: skill.skillId, merged } } },
+  });
+  return say(text);
+}
+
 async function routeChat(task, message) {
   const b = BROWSE_RX.test(message), a = ANSWER_RX.test(message);
   if (a && !b) return 'answer';
   if (b && !a) return 'browse';
   try {
     const out = JSON.parse(await askChat(task.model, [
-      { role: 'system', content: 'Classify the user\'s follow-up message for a browser-automation task session. "browse" = it needs the browser to DO something (navigate, scroll, collect, click, post…). "answer" = it can be answered from the data already collected (summaries, analysis, questions). Reply STRICT JSON {"mode":"browse"|"answer"}.' },
+      { role: 'system', content: 'Classify the user\'s follow-up message for a browser-automation task session. '
+        + '"save_skill" = it asks to SAVE/REMEMBER what just ran as a skill/workflow/routine for later reuse. It does NOT ask to do anything in the browser. '
+        + '"introspect" = it asks ABOUT the agent\'s own saved configuration — its learned skills, introduced elements, data schemas: what they are, how many, their names, details or instructions. Asking to SEE or READ a skill is "introspect", NOT "browse". '
+        + '"browse" = it needs the browser to DO something (navigate, scroll, collect, click, post…) OR it asks for information that is NOT already in the collected data — current events, prices, news, product/company facts, anything that needs looking up on the web. '
+        + '"answer" = it can be answered purely from the data ALREADY collected in this session (summaries, analysis of that data). '
+        + 'If it mentions a skill or element and only wants to be TOLD about it, choose "introspect". Otherwise when in doubt choose "browse" — the agent can always search the web. '
+        + 'Reply STRICT JSON {"mode":"browse"|"answer"|"introspect"|"save_skill"}.' },
       { role: 'user', content: message },
-    ], { format: { type: 'object', properties: { mode: { type: 'string', enum: ['browse', 'answer'] } }, required: ['mode'] } }));
-    if (out.mode === 'answer' || out.mode === 'browse') return out.mode;
+    ], { format: { type: 'object', properties: { mode: { type: 'string', enum: ['browse', 'answer', 'introspect', 'save_skill'] } }, required: ['mode'] } }));
+    if (['answer', 'browse', 'introspect', 'save_skill'].includes(out.mode)) return out.mode;
   } catch {}
   return a ? 'answer' : 'browse';   // model unreachable — heuristic decides
 }
@@ -986,6 +1637,625 @@ async function compactSession(task) {
   return summary;
 }
 
+// Prefer a general/instruct model for prose work (summarizing, judging
+// relevance, writing the answer). Coder models are markedly worse at it — they
+// over-trigger the relevance gate and format poorly. Falls back to `current`.
+async function proseModel(current) {
+  if (!/coder/i.test(String(current || ''))) return current;
+  try {
+    const list = (await (await fetch(`${OLLAMA_URL}/api/tags`)).json()).models || [];
+    const alt = list.map((m) => m.name).find((n) => !/coder|embed/i.test(n));
+    return alt || current;
+  } catch {
+    return current;
+  }
+}
+
+// Synthesize the researched sources into the final answer, with citations.
+// MAP-REDUCE, because ten full web pages never fit a local model's context:
+//   map    — summarize each source ALONE against the question (small calls)
+//   reduce — write the answer from just those digests, citing [n] by index
+// The answer is pushed as an assistant chat turn; the sources stay on
+// task.collected so the UI can reveal them behind "Show sources".
+app.post('/tasks/:id/synthesize', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const question = String(req.body?.question || task.currentInstruction || task.goal || '').trim();
+  // Summarizing/judging prose is a poor fit for a *coder* model — if the task is
+  // running on one, borrow an installed instruct model just for this step.
+  const model = await proseModel(task.model);
+
+  const sources = (task.collected || [])
+    .filter((s) => s && s.url && String(s.text || '').trim())
+    .slice(0, 12)
+    .map((s, i) => ({ index: i + 1, url: s.url, title: s.title || s.url, text: String(s.text) }));
+  if (!sources.length) return res.json({ ok: false, error: 'No readable sources to summarize — run read_pages first.' });
+
+  // ---- MAP: one small call per source ----
+  // The relevance gate is deliberately LENIENT: dropping a partly-useful page
+  // loses real information, while a weak page only adds a little noise.
+  const digests = [];
+  for (const s of sources) {
+    let d = '';
+    try {
+      d = (await askChat(model, [
+        { role: 'system', content:
+          'You condense ONE web page so it can help answer a question. Output 3-6 short bullet points containing ONLY facts stated in the SOURCE. No preamble. '
+          + 'Be generous: if the page contains ANY information that is even partly related to the question, summarize that part. '
+          + 'Reply with exactly NOT_RELEVANT only when the page is about a COMPLETELY different subject.' },
+        { role: 'user', content: `QUESTION: ${question}\n\nSOURCE "${s.title}":\n${s.text.slice(0, 6000)}` },
+      ], { temperature: 0.2 })).trim();
+    } catch { /* a dead source must not kill the run */ }
+    // Reject on the token ANYWHERE (models append it mid-text), and scrub any
+    // stray occurrence so the control token can never leak into the answer.
+    if (d && !/NOT_RELEVANT/i.test(d)) digests.push({ ...s, digest: d.slice(0, 1500) });
+  }
+
+  // Safety net: if the gate rejected nearly everything (a known failure mode of
+  // small/coder models), fall back to raw extracts so the answer is still built
+  // from the pages actually gathered rather than from one lucky source.
+  const floor = Math.min(3, sources.length);
+  if (digests.length < floor) {
+    for (const s of sources) {
+      if (digests.length >= floor) break;
+      if (digests.some((d) => d.index === s.index)) continue;
+      digests.push({ ...s, digest: s.text.slice(0, 900) });
+    }
+    digests.sort((a, b) => a.index - b.index);
+  }
+  if (!digests.length) return res.json({ ok: false, error: 'None of the sources were relevant to the question.' });
+
+  // ---- REDUCE: one call over the digests only ----
+  const allowed = digests.map((d) => d.index);
+  const allowedSet = new Set(allowed);
+  let answer = '';
+  try {
+    answer = (await askChat(model, [
+      { role: 'system', content:
+        'You write a clear, well-structured answer using ONLY the numbered SOURCES below. '
+        + `Cite claims with the source number in square brackets. You may ONLY use these exact numbers: ${allowed.join(', ')}. `
+        + 'NEVER cite any other number, and never invent facts or sources beyond those given. '
+        + 'If the sources disagree, say so. Answer the question directly first, then the supporting detail.' },
+      { role: 'user', content:
+        `QUESTION\n${question}\n\nSOURCES (cite only these numbers: ${allowed.join(', ')})\n`
+        + digests.map((d) => `[${d.index}] ${d.title}\n${d.digest}`).join('\n\n') },
+    ], { temperature: 0.3 })).trim();
+  } catch (e) {
+    return res.json({ ok: false, error: 'Could not reach the model to summarize. ' + (e.message || '') });
+  }
+  if (!answer) return res.json({ ok: false, error: 'The model returned an empty summary.' });
+
+  // Models still hallucinate citations to sources they were never given — strip
+  // any marker that doesn't point at a real digest, so every [n] the user can
+  // click is genuine.
+  let dropped = 0;
+  answer = answer
+    // any bracketed marker — [3], [2][4], or malformed ones like [1 NOT_RELEVANT]
+    .replace(/\[([^\]]*)\]/g, (m, inner) => {
+      const nums = String(inner).match(/\d+/g) || [];
+      const keep = nums.filter((n) => allowedSet.has(Number(n)));
+      if (!nums.length) return m;                       // not a citation, leave alone
+      if (!keep.length) { dropped++; return ''; }       // entirely invalid → remove
+      if (keep.length !== nums.length || !/^\s*\d+\s*$/.test(inner)) dropped++;
+      return keep.map((n) => `[${n}]`).join('');        // normalize to clean markers
+    })
+    .replace(/NOT_RELEVANT/gi, '')                      // scrub any leaked control token
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+
+  const round = task.round || 0;
+  const note = digests.length < sources.length
+    ? `\n\n_Based on ${digests.length} of ${sources.length} sources gathered._` : '';
+  const evMsg = `Summarized ${digests.length}/${sources.length} source(s)`
+    + (model !== task.model ? ` using ${model}` : '')
+    + (dropped ? `; removed ${dropped} invalid citation(s)` : '') + '.';
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $set: { summary: answer, updatedAt: nowIso() },
+    $push: {
+      chat: { role: 'assistant', text: (answer + note).slice(0, 12000), at: nowIso(), round },
+      events: { at: nowIso(), kind: 'ok', msg: evMsg, round, meta: { synthesized: digests.length, sources: sources.length, model, droppedCitations: dropped } },
+    },
+  });
+  res.json({ ok: true, answer, used: digests.length, total: sources.length, model, dropped });
+});
+
+// ---- adaptive recovery: think → act → observe → think ----
+// A fixed plan cannot react. When a phase fails (or a verification says the
+// page is not what the plan assumed), the agent looks at what is ACTUALLY on
+// screen and decides what to do instead. Deliberately failure-gated: phases
+// that behave as expected just run, so a local model is not asked to deliberate
+// on every step.
+const MAX_RETHINKS = 3;
+
+// Render the descriptor finder's `diagnosis` for the recovery prompt. Each
+// field points at a DIFFERENT cause, and saying which one it was stops the
+// model guessing: the observed failure mode is it inventing a control that was
+// never on the page. Empty string when the phase carried no descriptor.
+function describeDiagnosis(d) {
+  if (!d || typeof d !== 'object') return '';
+  const want = (d.searched?.value || []).join('" / "');
+  const out = [`WHY THE LOOKUP MISSED (searched for "${want}"):`];
+  if (d.scopeEmpty) {
+    out.push(`- The ${d.searched?.scope} it was told to search inside is NOT OPEN. The step before this one did not do what it was supposed to — recover by opening it, not by retrying this step.`);
+  } else if (Array.isArray(d.ascentRejected) && d.ascentRejected.length) {
+    out.push(`- That text IS on the page (${d.ascentRejected.map((t) => `"${t}"`).join(', ')}) but it is not inside anything clickable. It is probably a label or heading, not a control.`);
+  } else if (Array.isArray(d.nearest) && d.nearest.length) {
+    out.push(`- Nothing matched. The nearest text actually on the page: ${d.nearest.map((t) => `"${t}"`).join(', ')}. The wording has probably changed — use one of these EXACTLY if it is the right control.`);
+  } else {
+    out.push('- Nothing on the page matched, and there is no close alternative.');
+  }
+  if (d.retries) out.push(`- Already retried ${d.retries}x with backoff, so it is not a slow-render problem.`);
+  return out.join('\n');
+}
+
+// ---- instruction skills: record what resolved, then promote a good run ------
+// A run that worked is the only trustworthy source of "where things are on this
+// page". Descriptors that resolved are recorded as they happen; when the user
+// says the flow is good, they become a skill. See
+// plans/partially-done/instruction-skills.md.
+
+const MAX_RESOLUTIONS = 60;
+
+// Pushed by the extension after a descriptor phase succeeds. A separate
+// endpoint rather than PATCH: PATCH replaces whole fields, and two phases
+// finishing close together would clobber each other's entries.
+app.post('/tasks/:id/resolution', async (req, res) => {
+  const b = req.body || {};
+  const descriptor = cleanDescriptor(b.descriptor);
+  if (!descriptor) return res.json({ ok: true, skipped: 'no descriptor' });
+  const entry = {
+    at: nowIso(),
+    tool: String(b.tool || '').slice(0, 40),
+    descriptor,
+    matched: String(b.matched || '').slice(0, 120),
+    selectorHint: String(b.selectorHint || '').slice(0, 200),
+    depth: Number.isInteger(b.depth) ? b.depth : null,
+    url: String(b.url || '').slice(0, 300),
+  };
+  await tasksColl().updateOne({ taskId: req.params.id }, {
+    $push: { resolutions: { $each: [entry], $slice: -MAX_RESOLUTIONS } },
+    $set: { updatedAt: nowIso() },
+  });
+  res.json({ ok: true });
+});
+
+function hostOfTask(task) {
+  const nav = (task.plan?.phases || []).find((p) => p.tool === 'navigate' && p.params?.url);
+  const fromRes = (task.resolutions || []).find((r) => r.url);
+  const url = nav?.params?.url || fromRes?.url || '';
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+// The ONE place an instruction skill is written. Merges into an existing skill
+// of the same name+host rather than piling up duplicates: a hint that resolved
+// again is confirmed, one that stopped resolving is replaced by whatever worked
+// instead — so the skill improves each run instead of going stale.
+async function saveInstructionSkill({ name, host, instructions, hints, taskId }) {
+  const key = { host, name: String(name).trim(), kind: 'instruction' };
+  const existing = await skillsColl().findOne(key, { projection: { _id: 0 } });
+
+  // Dedupe by descriptor identity, newest wins.
+  const idOf = (h) => `${h.descriptor?.by}:${JSON.stringify(h.descriptor?.value)}:${h.descriptor?.scope || 'page'}`;
+  const merged = new Map((existing?.hints || []).map((h) => [idOf(h), h]));
+  for (const h of hints) merged.set(idOf(h), { ...(merged.get(idOf(h)) || {}), ...h, uses: ((merged.get(idOf(h))?.uses) || 0) + 1 });
+  const hintList = [...merged.values()].slice(-MAX_RESOLUTIONS);
+
+  if (existing) {
+    await skillsColl().updateOne({ skillId: existing.skillId }, {
+      $set: { instructions, hints: hintList, updatedAt: nowIso(), provenance: { taskId, at: nowIso() } },
+    });
+    return { skill: { ...existing, instructions, hints: hintList }, merged: true };
+  }
+  const skill = {
+    skillId: crypto.randomUUID(),
+    host,
+    urlPattern: `${host}/*`,
+    name: String(name).trim(),
+    kind: 'instruction',
+    details: String(instructions).slice(0, 1200),
+    instructions: String(instructions).slice(0, 4000),
+    hints: hintList,
+    provenance: { taskId, at: nowIso() },
+    // Instruction skills carry NO element refs and NO selectors — that is the
+    // whole point. Kept null so resolveSkills leaves them alone.
+    elements: null, action: null, selectors: [], item: null, fields: [],
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await skillsColl().insertOne({ ...skill });
+  return { skill, merged: false };
+}
+
+// Promote THIS task's run into a skill. Only a run that actually finished:
+// saving a failed flow records the wrong thing as if it were right.
+app.post('/tasks/:id/save-as-skill', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  if (task.status !== 'done') {
+    return res.status(400).json({ ok: false, error: `this run is "${task.status}", not done — only a run that completed can be saved as a skill` });
+  }
+  const instructions = String(req.body?.instructions || task.goal || '').trim();
+  if (!instructions) return res.status(400).json({ ok: false, error: 'nothing to save — this session has no instruction' });
+
+  const host = String(req.body?.host || hostOfTask(task) || '').trim();
+  if (!host) return res.status(400).json({ ok: false, error: 'could not work out which site this flow is for — pass host' });
+
+  const name = String(req.body?.name || '').trim() || defaultSkillName(instructions, host);
+  const hints = (task.resolutions || []).map((r) => ({
+    descriptor: r.descriptor, matched: r.matched, selectorHint: r.selectorHint, tool: r.tool, depth: r.depth,
+  }));
+
+  const { skill, merged } = await saveInstructionSkill({ name, host, instructions, hints, taskId: task.taskId });
+  const msg = `${merged ? 'Updated' : 'Saved'} skill "${skill.name}" for ${host} — ${hints.length} element hint(s) from this run.`;
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: {
+      chat: { role: 'assistant', text: msg, at: nowIso(), round: task.round || 0 },
+      events: { at: nowIso(), kind: 'ok', msg, round: task.round || 0, meta: { skillId: skill.skillId, merged } },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  res.json({ ok: true, skill, merged, message: msg });
+});
+
+function defaultSkillName(instructions, host) {
+  const verb = (instructions.match(/\b(post|publish|share|send|message|comment|search|collect|apply|book|order|upload)\b/i) || [])[0];
+  const site = host.split('.')[0];
+  const label = `${site[0].toUpperCase()}${site.slice(1)} ${verb ? verb.toLowerCase() : 'flow'}`;
+  return label.slice(0, 60);
+}
+
+app.post('/tasks/:id/rethink', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+
+  const used = task.rethinks || 0;
+  if (used >= MAX_RETHINKS) {
+    return res.json({ ok: true, decision: { action: 'abort', reason: `Already rethought ${used} time(s) — stopping instead of looping.` } });
+  }
+
+  const { failedPhase, error, snapshot, phaseIndex, diagnosis } = req.body || {};
+
+  // Never rethink an outward action whose outcome is unclear. A publish step is
+  // only safe to retry when we have POSITIVE evidence nothing happened — the
+  // draft still sitting in the composer, or the control never being found. Any
+  // other publish failure aborts: repeating it risks double-posting, and asking
+  // a model to judge that has already been observed to improvise instead.
+  if (isPublishPhase(failedPhase)) {
+    const nothingHappened = /still in the composer|no element|not found|no field|no editable/i.test(String(error || ''));
+    if (!nothingHappened) {
+      const reason = 'The publish step may already have gone through — stopping rather than risking a duplicate post.';
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: { events: { at: nowIso(), kind: 'err', msg: reason, round: task.round || 0 } },
+        $set: { updatedAt: nowIso() },
+      });
+      return res.json({ ok: true, decision: { action: 'abort', reason } });
+    }
+  }
+  const remaining = (task.plan?.phases || []).slice(Number(phaseIndex) + 1);
+  const done = (task.plan?.phases || []).slice(0, Number(phaseIndex));
+
+  const view = (snapshot && typeof snapshot === 'object') ? snapshot : {};
+  // Annotations use (parens), not [brackets]: a bracketed note next to a quoted
+  // label got copied into params as if it were part of the selector.
+  const controls = (view.controls || []).map((c) =>
+    `- "${c.text}"${c.dialog ? ' (in dialog)' : ''}${c.disabled ? ' (disabled)' : ''}`).join('\n');
+  const fields = (view.fields || []).map((f) =>
+    `- "${f.text}"${f.dialog ? ' (in dialog)' : ''} (${f.filled ? 'has text' : 'empty'})`).join('\n');
+
+  const sys = [
+    'You are recovering a browser-automation task whose step just failed.',
+    'You are shown the ORIGINAL goal, what already ran, the step that failed, and WHAT IS ACTUALLY ON THE PAGE right now.',
+    'Decide what to do instead, using ONLY these tools:',
+    TOOL_CATALOG.map((t) => `- ${t.name}(${t.params.join(', ')})`).join('\n'),
+    '',
+    'Reply with STRICT JSON only, no prose:',
+    '{"action":"replace","reason":"<one short sentence>","phases":[{"tool":"...","params":{...}}]}',
+    '  - "replace": run these phases INSTEAD of the failed step, then continue with the rest of the plan.',
+    '  - {"action":"skip","reason":"..."} : the step is unnecessary; carry on.',
+    '  - {"action":"abort","reason":"..."} : cannot be done; stop and tell the user.',
+    '',
+    'RULES:',
+    '- Target things that appear in the page listing below — do NOT invent button text that is not there.',
+    '- To target a control, put its EXACT quoted label in params.text — e.g. {"tool":"click","params":{"text":"Post"}}.',
+    '- params.selector is for a real CSS selector ONLY (like "div[aria-label=\'Post\']"). If you do not have one, omit it.',
+    '- "(in dialog)" / "(disabled)" are NOTES about an item, never part of its label — never put them in params.',
+    '- Prefer a control marked (in dialog) when a dialog is open: that is the surface the task just opened.',
+    '- If an action that changes something outward (posting, sending) may ALREADY have happened, do NOT repeat it — abort and say so.',
+    '- Keep it to the fewest phases that recover the step.',
+  ].join('\n');
+
+  const user = [
+    `GOAL: ${task.currentInstruction || task.goal}`,
+    done.length ? `ALREADY RAN: ${done.map((p) => p.tool).join(' → ')}` : 'ALREADY RAN: (nothing)',
+    `FAILED STEP: ${failedPhase?.tool}(${JSON.stringify(failedPhase?.params || {})})`,
+    `ERROR: ${String(error || '').slice(0, 400)}`,
+    remaining.length ? `REMAINING PLAN: ${remaining.map((p) => p.tool).join(' → ')}` : 'REMAINING PLAN: (none)',
+    describeDiagnosis(diagnosis),
+    '',
+    `PAGE: ${view.title || ''} — ${view.url || ''}`,
+    `A dialog is ${view.dialogOpen ? 'OPEN' : 'not open'}.`,
+    controls ? `CLICKABLE ON SCREEN:\n${controls}` : 'CLICKABLE ON SCREEN: (none found)',
+    fields ? `INPUT FIELDS ON SCREEN:\n${fields}` : '',
+  ].filter(Boolean).join('\n');
+
+  let decision = null;
+  try {
+    const raw = await askChat(task.model, [
+      { role: 'system', content: sys }, { role: 'user', content: user },
+    ], { temperature: 0.1, format: 'json' });
+    decision = JSON.parse(String(raw).replace(/```json|```/g, '').trim());
+  } catch (e) {
+    decision = { action: 'abort', reason: 'Could not reach the model to rethink: ' + (e.message || e) };
+  }
+
+  decision = sanitizeDecision(decision, failedPhase);
+
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $set: { rethinks: used + 1, updatedAt: nowIso() },
+    $push: { events: {
+      at: nowIso(), kind: 'think', round: task.round || 0,
+      msg: `Rethinking after a failed step (${used + 1}/${MAX_RETHINKS}): ${decision.reason || decision.action}`,
+      meta: { rethink: decision.action, phases: (decision.phases || []).map((p) => p.tool) },
+    } },
+  });
+
+  res.json({ ok: true, decision });
+});
+
+// Does this look like a real CSS selector, or a button label the model dropped
+// into the wrong field? A bare word like "Post" is a label; "div[aria-label]"
+// is a selector. Guessing wrong either way just fails, so prefer treating an
+// ambiguous value as text — findTarget can search by text, not by fake CSS.
+function looksLikeSelector(s) {
+  const v = String(s || '').trim();
+  if (!v) return false;
+  if (/\s/.test(v) && !/[.#[>~+:]/.test(v)) return false; // "What's on your mind" — a label
+  return /[.#[\]>~+:=]/.test(v) || /^(a|p|div|span|button|input|form|textarea|li|ul|ol|h[1-6]|img|table|tr|td|section|nav|header|footer|main|article)$/i.test(v);
+}
+
+// Strip the annotations the model copies out of the page listing, and move a
+// mis-filed label out of `selector` into `text`.
+function cleanParams(params) {
+  const p = liftDescriptor(params && typeof params === 'object' ? { ...params } : {});
+  const clean = (v) => String(v).replace(/[[(](in dialog|disabled|has text|empty)[\])]/gi, '').replace(/^["'\s]+|["'\s]+$/g, '');
+
+  if (typeof p.text === 'string') p.text = clean(p.text);
+  if (typeof p.selector === 'string') {
+    const sel = clean(p.selector);
+    if (!sel) delete p.selector;
+    else if (looksLikeSelector(sel)) p.selector = sel;
+    else { if (!p.text) p.text = sel; delete p.selector; } // it was a label
+  }
+  if (p.text === '') delete p.text;
+  p.descriptor = cleanDescriptor(p.descriptor);
+  if (!p.descriptor) delete p.descriptor;
+  return p;
+}
+
+// A descriptor the model produced is model output like any other: validated
+// against the enum, not trusted. The precedent is the run that returned
+// {selector:"Post", text:"[in dialog]"} — a label in the CSS field. A malformed
+// descriptor reaching the finder searches for nonsense and reports a confusing
+// miss, so drop it and let the phase fall back to selector/text.
+const DESCRIPTOR_BY = new Set(['text', 'exactText', 'attr', 'placeholder', 'label', 'role', 'css']);
+
+// Models emit the descriptor FLAT — `{"tool":"click","params":{"exactText":"Next"}}`
+// instead of nesting it under `descriptor`. Observed on the first real run: the
+// model picked exactly the right strategy and the wrong shape, so the phase
+// executed with NO target at all, failed "no element for " four times over 15s,
+// and dragged the task into a recovery that clicked the wrong things.
+// Cheap to accept, so accept it.
+function liftDescriptor(params) {
+  if (!params || typeof params !== 'object' || params.descriptor) return params;
+  let d = null;
+  if (params.by && params.value != null) d = { by: params.by, value: params.value };
+  else if (params.exactText != null) d = { by: 'exactText', value: params.exactText };
+  else if (params.placeholder != null) d = { by: 'placeholder', value: params.placeholder };
+  else if (params.label != null) d = { by: 'label', value: params.label };
+  else if (params.contenteditable != null) d = { by: 'attr', attr: 'contenteditable', value: params.contenteditable };
+  else if (params.attr && params.attrValue != null) d = { by: 'attr', attr: params.attr, value: params.attrValue };
+  if (!d) return params;
+  if (params.scope) d.scope = params.scope;
+  if (params.tag) d.tag = params.tag;
+  const out = { ...params, descriptor: d };
+  for (const k of ['by', 'exactText', 'placeholder', 'label', 'contenteditable', 'attr', 'attrValue', 'scope', 'tag']) delete out[k];
+  // `value` is a real param for `type`; only strip it when it fed the descriptor.
+  if (params.by && params.value != null) delete out.value;
+  return out;
+}
+
+function cleanDescriptor(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const by = String(d.by || '').trim();
+  if (!DESCRIPTOR_BY.has(by)) return null;
+  const strip = (v) => String(v).replace(/[[(](in dialog|disabled|has text|empty)[\])]/gi, '').replace(/^["'\s]+|["'\s]+$/g, '');
+  // `value` is a string OR a list of alternates (localization); keep the shape.
+  const raw = Array.isArray(d.value) ? d.value : [d.value];
+  const value = raw.map(strip).filter(Boolean).slice(0, 5);
+  if (!value.length) return null;
+
+  const out = { by, value: value.length === 1 ? value[0] : value };
+  if (d.tag && /^[a-z][a-z0-9]*$/i.test(String(d.tag))) out.tag = String(d.tag).toLowerCase();
+  if (by === 'attr') out.attr = /^[a-z-]+$/i.test(String(d.attr || '')) ? String(d.attr) : 'contenteditable';
+  const scope = String(d.scope || '').trim();
+  if (scope === 'dialog' || scope === 'page' || scope.startsWith('within:')) out.scope = scope;
+  return out;
+}
+
+// Never let a recovery decision introduce unknown tools or unbounded work.
+function sanitizeDecision(d, failedPhase = null) {
+  const known = new Set(TOOL_CATALOG.map((t) => t.name));
+  const action = ['replace', 'skip', 'abort'].includes(d?.action) ? d.action : 'abort';
+  const reason = String(d?.reason || '').slice(0, 300);
+  if (action !== 'replace') return { action, reason: reason || 'no reason given' };
+  let phases = (Array.isArray(d.phases) ? d.phases : [])
+    .filter((p) => p && known.has(p.tool))
+    .slice(0, 4)
+    .map((p) => ({ tool: p.tool, params: cleanParams(p.params) }));
+
+  // Recovering a PUBLISH step may only click something that looks like a
+  // publish control. Recovering "click Post", the model clicked a carousel
+  // arrow and then "React with Like to <user>'s post" — it LIKED the user's own
+  // post while trying to publish. The page is full of controls whose text
+  // contains "post"; only the ones that read as a publish verb are candidates.
+  if (isPublishPhase(failedPhase)) {
+    const targetOf = (p) => String(p.params?.text
+      || (Array.isArray(p.params?.descriptor?.value) ? p.params.descriptor.value[0] : p.params?.descriptor?.value)
+      || '').trim();
+    const bad = phases.filter((p) => /^(click|hover)$/.test(p.tool) && !isPublishControlLabel(targetOf(p)));
+    if (bad.length) {
+      return {
+        action: 'abort',
+        reason: `Recovering the publish step suggested clicking ${bad.map((p) => `"${targetOf(p).trim()}"`).join(', ')}, which is not a publish control — stopping rather than clicking something else on your account.`,
+      };
+    }
+  }
+  if (!phases.length) return { action: 'abort', reason: reason || 'the model proposed no usable step' };
+  return { action, reason, phases };
+}
+
+// Does this label read as a publish BUTTON rather than something else on the
+// page that merely mentions posting?
+//
+// Containing the word is not enough — "React with Like to Minhaj Sorder's post"
+// contains "post" as a whole word and is the Like button, which is exactly what
+// got clicked. A real publish control is a short label that essentially IS the
+// verb: "Post", "Share now", "Send". Length is the discriminator that separates
+// them, because descriptive labels are long by nature.
+const PUBLISH_WORD_RX = /\b(post|publish|share|send|tweet|submit)\b/i;
+
+function isPublishControlLabel(label) {
+  const s = String(label || '').trim();
+  if (!s) return false;
+  if (/^(post|publish|share|send|tweet|submit)$/i.test(s)) return true;   // exactly the verb
+  return s.length <= 15 && PUBLISH_WORD_RX.test(s);                        // "Share now", "Post it"
+}
+
+// ---- agent-proposed changes to its own elements / skills ----
+// The agent may PROPOSE creating, repointing or deleting the knowledge it runs
+// on, but never writes it. Every proposal waits for explicit approval — this is
+// the agent editing its own memory, which is a different matter from carrying
+// out a task the user asked for.
+// Non-blocking by design: the task keeps running; the proposal sits in the
+// transcript until it is answered.
+const PROPOSAL_KINDS = new Set(['element.create', 'element.repoint', 'skill.update', 'skill.delete']);
+
+app.post('/tasks/:id/propose', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1, taskId: 1 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const { kind, summary, detail, payload } = req.body || {};
+  if (!PROPOSAL_KINDS.has(kind)) return res.status(400).json({ ok: false, error: 'unknown proposal kind' });
+
+  const proposal = {
+    proposalId: crypto.randomUUID(),
+    kind,
+    summary: String(summary || kind).slice(0, 200),
+    detail: String(detail || '').slice(0, 600),
+    payload: payload && typeof payload === 'object' ? payload : {},
+    status: 'pending',
+    at: nowIso(),
+  };
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: {
+      proposals: proposal,
+      events: { at: nowIso(), kind: 'think', round: task.round || 0, msg: `Proposed: ${proposal.summary} (waiting for your approval)`, meta: { proposal: kind } },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  res.json({ ok: true, proposal });
+});
+
+app.post('/tasks/:id/proposals/:pid', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const p = (task.proposals || []).find((x) => x.proposalId === req.params.pid);
+  if (!p) return res.status(404).json({ ok: false, error: 'proposal not found' });
+  if (p.status !== 'pending') return res.json({ ok: false, error: `already ${p.status}` });
+
+  const approve = String(req.body?.decision || '').toLowerCase() === 'approve';
+  let result = { ok: true };
+  if (approve) {
+    try { result = await applyProposal(p); } catch (e) { result = { ok: false, error: e.message || String(e) }; }
+  }
+
+  const status = !approve ? 'declined' : result.ok ? 'approved' : 'failed';
+  const note = !approve ? `Declined: ${p.summary}`
+    : result.ok ? `Applied: ${p.summary}`
+    : `Could not apply "${p.summary}": ${result.error}`;
+
+  await tasksColl().updateOne(
+    { taskId: task.taskId, 'proposals.proposalId': p.proposalId },
+    {
+      $set: {
+        'proposals.$.status': status,
+        'proposals.$.decidedAt': nowIso(),
+        'proposals.$.result': result.ok ? (result.summary || 'done') : String(result.error || 'failed'),
+        updatedAt: nowIso(),
+      },
+      $push: { events: { at: nowIso(), kind: status === 'approved' ? 'ok' : 'obs', round: task.round || 0, msg: note } },
+    }
+  );
+  res.json({ ok: result.ok, status, error: result.error });
+});
+
+// Carry out an APPROVED proposal. Kept in one place so nothing else can write
+// element/skill records on the agent's behalf.
+async function applyProposal(p) {
+  const d = p.payload || {};
+  if (p.kind === 'element.create') {
+    if (!d.host || !d.name || !d.type) return { ok: false, error: 'host, name and type required' };
+    if (!ELEMENT_TYPES.has(d.type)) return { ok: false, error: 'bad element type' };
+    const host = String(d.host).replace(/^www\./, '');
+    const element = {
+      elementId: crypto.randomUUID(), host,
+      route: normalizeRoute(d.route, host),
+      name: await uniqueElementName(host, d.name),
+      details: String(d.details || 'Proposed by the agent after recovering a failed step.'),
+      type: d.type, action: d.action || null, attr: d.attr || null, key: d.key || null,
+      parentId: null,
+      selectors: Array.isArray(d.selectors) ? d.selectors : [],
+      sample: d.sample || null, sampleHtml: null,
+      version: 1, createdAt: nowIso(), updatedAt: nowIso(),
+    };
+    await elementsColl().insertOne(element);
+    return { ok: true, summary: `created element "${element.name}" on ${host}` };
+  }
+
+  if (p.kind === 'element.repoint') {
+    const el = await elementsColl().findOne({ elementId: d.elementId });
+    if (!el) return { ok: false, error: 'element no longer exists' };
+    const fresh = Array.isArray(d.selectors) ? d.selectors : [];
+    if (!fresh.length) return { ok: false, error: 'selectors required' };
+    // Same merge as /elements/:id/repoint: keep the old ones, demoted.
+    const demoted = (el.selectors || []).map((s) => ({ ...s, score: Math.max(1, (s.score || 50) - 20) }));
+    const seen = new Set();
+    const merged = [...fresh, ...demoted].filter((s) => {
+      const k = s.strategy + '|' + (s.value || s.text || '');
+      if (seen.has(k)) return false; seen.add(k); return true;
+    }).slice(0, 6);
+    await elementsColl().updateOne({ elementId: el.elementId },
+      { $set: { selectors: merged, version: (el.version || 1) + 1, updatedAt: nowIso() } });
+    return { ok: true, summary: `repointed element "${el.name}"` };
+  }
+
+  if (p.kind === 'skill.update') {
+    const set = {};
+    for (const [k, v] of Object.entries(d.patch || {})) if (SKILL_PATCHABLE.has(k)) set[k] = v;
+    if (!Object.keys(set).length) return { ok: false, error: 'nothing patchable in the proposal' };
+    set.updatedAt = nowIso();
+    const r = await skillsColl().updateOne({ skillId: d.skillId }, { $set: set });
+    if (!r.matchedCount) return { ok: false, error: 'skill no longer exists' };
+    return { ok: true, summary: `updated skill (${Object.keys(set).filter((k) => k !== 'updatedAt').join(', ')})` };
+  }
+
+  if (p.kind === 'skill.delete') {
+    const r = await skillsColl().deleteOne({ skillId: d.skillId });
+    if (!r.deletedCount) return { ok: false, error: 'skill no longer exists' };
+    return { ok: true, summary: `deleted skill "${d.name || d.skillId}"` };
+  }
+
+  return { ok: false, error: 'unknown proposal kind' };
+}
+
 app.post('/tasks/:id/compact', async (req, res) => {
   const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
   if (!task) return res.status(404).json({ ok: false, error: 'not found' });
@@ -999,14 +2269,46 @@ app.post('/tasks/:id/chat', async (req, res) => {
   const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
   if (!task) return res.status(404).json({ ok: false, error: 'not found' });
   const message = String(req.body?.message || '').trim();
-  if (!message) return res.status(400).json({ ok: false, error: 'message required' });
-  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'Task is busy — wait for it to finish, or stop it first.' });
+  const imageIds = (Array.isArray(req.body?.imageIds) ? req.body.imageIds : []).map(String).slice(0, MAX_IMAGES_PER_TURN);
+  // An image on its own is a valid turn ("what is this?" is implied).
+  if (!message && !imageIds.length) return res.status(400).json({ ok: false, error: 'message required' });
 
+  // Busy → QUEUE it instead of rejecting. The prompt runs automatically when
+  // the current round reaches a terminal status (see drainQueue).
+  if (BUSY_STATUSES.has(task.status)) {
+    const item = { id: crypto.randomUUID(), text: message, at: nowIso(), platform: String(req.body?.platform || ''), imageIds };
+    const doc = await tasksColl().findOneAndUpdate(
+      { taskId: task.taskId },
+      {
+        $push: { queue: item, events: { at: nowIso(), kind: 'think', msg: `Queued: ${message || `${imageIds.length} image(s)`}`, round: task.round || 0 } },
+        $set: { updatedAt: nowIso() },
+      },
+      { returnDocument: 'after', projection: { _id: 0 } }
+    );
+    const t = doc?.value || doc;
+    return res.json({ ok: true, mode: 'queued', queued: (t?.queue || []).length, item });
+  }
+
+  const out = await runChatTurn(task, message, req.body?.platform, imageIds);
+  res.status(out.status || 200).json(out.body);
+});
+
+// One conversational turn. Returns { status?, body } rather than writing to a
+// response, so the queue drainer can run a turn with no HTTP request in flight.
+async function runChatTurn(task, message, platform, imageIds = []) {
   // Each user turn opens a new round; everything the backend/extension records
   // until the next user turn is stamped with this index (exact client grouping).
   const round = (task.round || 0) + 1;
   task.round = round;
-  const userTurn = { role: 'user', text: message, at: nowIso(), round };
+  // Attachment metadata rides on the turn (id + name only) so the transcript can
+  // render thumbnails; the bytes stay in task_files and are fetched by URL.
+  let attachments = [];
+  if (imageIds.length) {
+    attachments = (await filesColl()
+      .find({ fileId: { $in: imageIds }, taskId: task.taskId }, { projection: { _id: 0, fileId: 1, name: 1, mime: 1 } })
+      .toArray());
+  }
+  const userTurn = { role: 'user', text: message, at: nowIso(), round, ...(attachments.length ? { attachments } : {}) };
   await tasksColl().updateOne({ taskId: task.taskId }, { $push: { chat: userTurn }, $set: { round, updatedAt: nowIso() } });
   task.chat = [...(task.chat || []), userTurn];
 
@@ -1018,16 +2320,16 @@ app.post('/tasks/:id/chat', async (req, res) => {
   const hostMatch = message.match(HOST_PREFIX_RX);
   if (hostMatch) {
     const instruction = message.slice(hostMatch[0].length).trim();
-    if (!instruction) return res.json({ ok: false, error: 'Say what to run after /run.' });
+    if (!instruction) return { body: { ok: false, error: 'Say what to run after /run.' } };
     let proposal;
     try {
-      proposal = await proposeHostCommand(task.model, instruction, String(req.body?.platform || process.platform));
+      proposal = await proposeHostCommand(task.model, instruction, String(platform || process.platform));
     } catch (e) {
       const msg = 'Could not propose a command (is the model running?). ' + (e.message || '');
       await tasksColl().updateOne({ taskId: task.taskId }, {
         $push: { chat: { role: 'assistant', text: msg, at: nowIso(), round } }, $set: { updatedAt: nowIso() },
       });
-      return res.json({ ok: false, error: msg });
+      return { body: { ok: false, error: msg } };
     }
     const desc = `🖥️ Proposed command: \`${proposal.argv.join(' ')}\``
       + (proposal.cwd ? ` (in ${proposal.cwd})` : '')
@@ -1039,10 +2341,96 @@ app.post('/tasks/:id/chat', async (req, res) => {
       },
       $set: { updatedAt: nowIso() },
     });
-    return res.json({ ok: true, mode: 'host', proposal });
+    return { body: { ok: true, mode: 'host', proposal } };
+  }
+
+  // Images attached to this turn → answer with a vision model. This runs before
+  // routing: the answer is in the picture, not in session data or on the web.
+  if (imageIds.length) {
+    const files = await filesColl()
+      .find({ fileId: { $in: imageIds }, taskId: task.taskId }).limit(MAX_IMAGES_PER_TURN).toArray();
+    if (!files.length) return { body: { ok: false, error: 'Those images are no longer available.' } };
+
+    const vm = await visionModel(task.model);
+    if (!vm) {
+      const msg = 'No vision-capable model is installed. Pull one first, e.g. `ollama pull llama3.2-vision` or `ollama pull qwen2.5vl`.';
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: { chat: { role: 'assistant', text: msg, at: nowIso(), round } }, $set: { updatedAt: nowIso() },
+      });
+      return { body: { ok: false, error: msg } };
+    }
+
+    let reply = '';
+    try {
+      // Ollama takes images as bare base64 on the user message.
+      reply = (await askChat(vm, [
+        { role: 'system', content:
+          'You are analyzing images the user uploaded. Describe exactly what you see and answer their question about it. '
+          + 'Be concrete and specific — quote any text visible in the image verbatim. If the image does not show what they asked about, say so plainly instead of guessing.' },
+        { role: 'user', content: message || 'Describe this image in detail.', images: files.map((f) => f.b64) },
+      ], { temperature: 0.2 })).trim();
+    } catch (e) {
+      reply = '';
+    }
+    if (!reply) reply = `Could not get a reply from ${vm} — is Ollama running and the model pulled?`;
+
+    const label = files.length > 1 ? `${files.length} images` : files[0].name;
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round },
+        events: { at: nowIso(), kind: 'ok', msg: `Analyzed ${label} with ${vm}.`, round, meta: { vision: files.length, model: vm } },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'vision', reply, model: vm, images: files.length } };
+  }
+
+  // "Save this flow as a skill" — write the agent's own memory from the run that
+  // just happened. Checked BEFORE introspection and before routeChat: planning
+  // this as a browser task would re-run the flow, which on a posting task means
+  // posting again.
+  if (isSaveSkillRequest(message)) {
+    const reply = await saveSkillFromChat(task, message, round);
+    return { body: { ok: true, mode: 'save_skill', reply } };
+  }
+
+  // A question about the agent's own skills/elements — answer from the DB.
+  // Never plan a browser task for it: running a skill is not the same as
+  // describing one.
+  if (isIntrospection(message)) {
+    const reply = await answerIntrospection(task.model, message);
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round },
+        events: { at: nowIso(), kind: 'ok', msg: 'Answered from my own skills/elements — no browsing needed.', round },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'introspect', reply } };
   }
 
   const mode = await routeChat(task, message);
+
+  // Second line of defence for the save request, same reasoning as introspect.
+  if (mode === 'save_skill') {
+    const reply = await saveSkillFromChat(task, message, round);
+    return { body: { ok: true, mode: 'save_skill', reply } };
+  }
+
+  // Second line of defence: the classifier also recognises introspection, so a
+  // phrasing the regex missed still gets answered instead of being planned as
+  // a browser task that could run a posting skill.
+  if (mode === 'introspect') {
+    const reply = await answerIntrospection(task.model, message);
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round },
+        events: { at: nowIso(), kind: 'ok', msg: 'Answered from my own skills/elements — no browsing needed.', round },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'introspect', reply } };
+  }
 
   if (mode === 'answer') {
     const rows = await sessionRecords(task, 60);
@@ -1050,7 +2438,9 @@ app.post('/tasks/:id/chat', async (req, res) => {
     try {
       reply = (await askChat(task.model, [
         { role: 'system', content:
-          'You are the assistant inside a browser-automation task session. Answer the user using ONLY the session context and collected data below. Be concise and concrete; use numbers from the data. If the data cannot answer it, say so and suggest what to collect.\n\n'
+          'You are the assistant inside a browser-automation task session. Answer the user using ONLY the session context and collected data below. Be concise and concrete; use numbers from the data.\n'
+          + 'IMPORTANT: if the collected data does not contain the answer — or the question needs current/live information from the web — reply with EXACTLY the single token NEEDS_WEB and nothing else. '
+          + 'You have a browser and CAN look things up, so NEVER reply that you lack real-time data, lack internet access, or cannot browse: reply NEEDS_WEB instead and the system will search the web for you.\n\n'
           + `Original goal: ${task.goal}\n`
           + (task.sessionSummary ? `Session summary: ${task.sessionSummary}\n` : '')
           + `Collected records this session: ${rows.length}\n`
@@ -1060,11 +2450,33 @@ app.post('/tasks/:id/chat', async (req, res) => {
       ], { temperature: 0.2 })).trim();
     } catch {}
     if (!reply) reply = 'I could not reach the model to analyze the data — is Ollama running?';
+
+    // The session data can't answer it → don't tell the user we lack real-time
+    // data. We have a browser: escalate into a web-research round instead.
+    // (Also catches models that ignore the NEEDS_WEB instruction and refuse.)
+    const needsWeb = /\bNEEDS_WEB\b/i.test(reply)
+      || /\b(don'?t|do not|doesn'?t) have (access to )?(real[\s-]?time|live|current|up[\s-]?to[\s-]?date)\b/i.test(reply)
+      || /\b(cannot|can'?t) (browse|access the internet|search the web)\b/i.test(reply)
+      || /\bno (access to the )?internet\b/i.test(reply);
+    if (needsWeb) {
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $set: {
+          currentInstruction: message, plan: null, status: 'planning',
+          currentPhaseIndex: 0, repeats: 0, scanY: 0, pendingQuestion: null, updatedAt: nowIso(),
+        },
+        $push: {
+          chat: { role: 'assistant', text: '🌐 That is not in this session yet — searching the web…', at: nowIso(), round },
+          events: { at: nowIso(), kind: 'act', msg: `Not answerable from session data → web research round: ${message}`, round },
+        },
+      });
+      return { body: { ok: true, mode: 'browse', escalated: true } };
+    }
+
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $push: { chat: { role: 'assistant', text: reply.slice(0, 8000), at: nowIso(), round }, events: { at: nowIso(), kind: 'obs', msg: 'Chat: answered from session data.', round } },
       $set: { updatedAt: nowIso() },
     });
-    return res.json({ ok: true, mode: 'answer', reply });
+    return { body: { ok: true, mode: 'answer', reply } };
   }
 
   // browse: this becomes the task's next round — replan against session context.
@@ -1078,8 +2490,44 @@ app.post('/tasks/:id/chat', async (req, res) => {
       events: { at: nowIso(), kind: 'act', msg: `New round from chat: ${message}`, round },
     },
   });
-  res.json({ ok: true, mode: 'browse' });
-});
+  return { body: { ok: true, mode: 'browse' } };
+}
+
+// Run queued prompts once the session goes idle. Loops because an "answer"
+// turn finishes immediately (the next prompt can start right away); a "browse"
+// turn leaves the task busy, so the loop exits and the drain resumes from the
+// PATCH that later marks it done. IN_FLIGHT guards against two drains racing
+// (the extension PATCHes terminal status more than once in some paths).
+const DRAINING = new Set();
+async function drainQueue(taskId) {
+  if (DRAINING.has(taskId)) return;
+  DRAINING.add(taskId);
+  try {
+    for (;;) {
+      const task = await tasksColl().findOne({ taskId }, { projection: { _id: 0 } });
+      if (!task || BUSY_STATUSES.has(task.status)) break;
+      const next = (task.queue || [])[0];
+      if (!next) break;
+      await tasksColl().updateOne({ taskId }, {
+        $pull: { queue: { id: next.id } },
+        $push: { events: { at: nowIso(), kind: 'act', msg: `Running queued prompt: ${next.text}`, round: task.round || 0 } },
+        $set: { updatedAt: nowIso() },
+      });
+      const fresh = await tasksColl().findOne({ taskId }, { projection: { _id: 0 } });
+      if (!fresh) break;
+      try {
+        await runChatTurn(fresh, next.text, next.platform, next.imageIds || []);
+      } catch (e) {
+        await tasksColl().updateOne({ taskId }, {
+          $push: { events: { at: nowIso(), kind: 'err', msg: `Queued prompt failed: ${e.message || e}`, round: fresh.round || 0 } },
+          $set: { updatedAt: nowIso() },
+        });
+      }
+    }
+  } finally {
+    DRAINING.delete(taskId);
+  }
+}
 
 // Screenshots captured by the screenshot tool (kept out of the task doc — data
 // URLs are large). Loaded on demand by the dashboard.
@@ -1090,22 +2538,70 @@ app.post('/tasks/:id/screenshot', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- image attachments (vision) ----
+// Kept in their OWN collection, never on the task doc: a few photos would blow
+// past Mongo's 16MB document cap and every task read would drag them along.
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGES_PER_TURN = 4;
+function filesColl() { return collFor('task_files'); }
+
+app.post('/tasks/:id/attachments', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { taskId: 1 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const images = Array.isArray(req.body?.images) ? req.body.images.slice(0, MAX_IMAGES_PER_TURN) : [];
+  if (!images.length) return res.status(400).json({ ok: false, error: 'images required' });
+
+  const saved = [];
+  for (const img of images) {
+    const dataUrl = String(img?.dataUrl || '');
+    const m = dataUrl.match(/^data:(image\/[a-z.+-]+);base64,(.+)$/i);
+    if (!m) return res.status(400).json({ ok: false, error: 'each image needs a base64 image dataUrl' });
+    const b64 = m[2];
+    // base64 is 4 chars per 3 bytes — check the decoded size, not the string.
+    if (Math.floor(b64.length * 0.75) > MAX_IMAGE_BYTES) {
+      return res.status(413).json({ ok: false, error: `"${img?.name || 'image'}" is larger than 8MB.` });
+    }
+    const doc = {
+      fileId: crypto.randomUUID(), taskId: task.taskId,
+      name: String(img?.name || 'image').slice(0, 200),
+      mime: m[1], b64, bytes: Math.floor(b64.length * 0.75), at: nowIso(),
+    };
+    await filesColl().insertOne(doc);
+    saved.push({ fileId: doc.fileId, name: doc.name, mime: doc.mime, bytes: doc.bytes });
+  }
+  res.json({ ok: true, files: saved });
+});
+
+// Serve one attachment as a real image response so <img src> can point at it
+// (embedding data URLs in the transcript would bloat every task fetch).
+app.get('/tasks/:id/files/:fileId', async (req, res) => {
+  const f = await filesColl().findOne({ fileId: req.params.fileId, taskId: req.params.id });
+  if (!f) return res.status(404).end();
+  res.set('Content-Type', f.mime).set('Cache-Control', 'private, max-age=86400');
+  res.send(Buffer.from(f.b64, 'base64'));
+});
+
 app.get('/tasks/:id/screenshots', async (req, res) => {
   const shots = await collFor('task_shots').find({ taskId: req.params.id }, { projection: { _id: 0 } }).sort({ at: 1 }).toArray();
   res.json({ ok: true, shots });
 });
 
 app.post('/tasks/:id/event', async (req, res) => {
-  const { kind, msg, meta } = req.body || {};
+  const { kind, msg, meta, chat } = req.body || {};
   // Stamp the task's CURRENT round so the extension's execution events group
   // under the user turn that started them — no round tracking needed client-side
   // (round only changes on /chat, which is blocked while a task is running).
   const t = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1 } });
   const ev = { at: nowIso(), kind: kind || 'obs', msg: msg || '', round: t?.round || 0 };
   if (meta && typeof meta === 'object') ev.meta = meta;
+  // `chat: true` also posts the message as an assistant turn. Used for the few
+  // events the USER needs to see in the transcript (a round finishing, a round
+  // failing) — the rest belong in the event log only, which is the detail view.
+  const push = { events: ev };
+  if (chat && msg) push.chat = { role: 'assistant', text: String(msg).slice(0, 4000), at: nowIso(), round: t?.round || 0 };
   await tasksColl().updateOne(
     { taskId: req.params.id },
-    { $push: { events: ev }, $set: { updatedAt: nowIso() } }
+    { $push: push, $set: { updatedAt: nowIso() } }
   );
   res.json({ ok: true });
 });
@@ -1139,8 +2635,12 @@ app.post('/tasks/:id/plan', async (req, res) => {
   }
 
   // Hydrate v2 skills (element refs) into runtime shape so planning, routing
-  // and field-subset logic see real field lists.
-  const skills = await resolveSkills(await skillsColl().find({}, { projection: { _id: 0 } }).toArray());
+  // and field-subset logic see real field lists. When the user narrowed the
+  // session to specific skills, only those go into the prompt — every extra
+  // skill is prompt weight the model has to read and reason past.
+  const pickedIds = (task.useSkills || []).map((s) => s.skillId).filter(Boolean);
+  const skillQuery = pickedIds.length ? { skillId: { $in: pickedIds } } : {};
+  const skills = await resolveSkills(await skillsColl().find(skillQuery, { projection: { _id: 0 } }).toArray());
   // Standing instructions from the task's system prompt ride along with every plan.
   let sysExtra = task.systemPrompt?.content
     ? `\n\nSTANDING USER INSTRUCTIONS (system prompt "${task.systemPrompt.name}") — honor these when planning:\n${task.systemPrompt.content}`
@@ -1200,7 +2700,7 @@ app.post('/tasks/:id/plan', async (req, res) => {
     return res.json({ ok: false, error: 'Invalid plan from model' });
   }
 
-  const fixed = repairPlan(plan);
+  const fixed = repairPlan(plan, instr, skills);
   plan = fixed.plan;
 
   // Strictly honor an explicit count in the goal (models often ignore "only one").
@@ -1320,6 +2820,17 @@ app.post('/tasks/:id/plan', async (req, res) => {
     if (!fields.length && plan.target.metric === 'texts') {
       fields = normFields([{ key: 'text', label: 'Text', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
       chosen = 'full text content';
+    }
+    // collect_links yields title + url; with read_pages each row also carries
+    // the page's readable content (the source text used for analysis).
+    if (!fields.length && plan.target.metric === 'links') {
+      const reads = plan.phases.some((p) => p.tool === 'read_pages');
+      fields = normFields([
+        { key: 'title', label: 'Title', type: 'text' },
+        { key: 'url', label: 'URL', type: 'url' },
+        ...(reads ? [{ key: 'text', label: 'Page content', type: 'text' }] : []),
+      ]);
+      chosen = reads ? 'researched sources' : 'search result links';
     }
     if (!fields.length) { fields = normFields(parsed?.schema?.fields); chosen = fields.length ? 'from your description' : 'auto-decided'; }
     if (!fields.length) fields = defaultFields(plan.target.metric);
@@ -1447,6 +2958,87 @@ app.post('/ai/verify-record', async (req, res) => {
 });
 
 // AI text generation — write content from a prompt (post, message, comment…).
+// ---- solve_with_code: write JS for the current page ----
+// Small local models write poor raw-DOM code but decent code against a tiny,
+// documented helper API. `BA` is that API; it is injected alongside the code.
+const BA_API_DOC = [
+  'BA.$(sel)            → first matching element, or null',
+  'BA.$$(sel)           → array of matching elements',
+  'BA.text(el)          → trimmed visible text of an element',
+  'BA.attr(el, name)    → an attribute value',
+  'BA.visible(el)       → true if the element is actually on screen',
+  'BA.byText(t, sel)    → elements whose text contains t (sel defaults to *)',
+].join('\n');
+
+app.post('/ai/codegen', async (req, res) => {
+  const { model, goal, expect, digest, attempts } = req.body || {};
+  if (!model || !goal) return res.json({ ok: false, error: 'model and goal required' });
+
+  const past = (Array.isArray(attempts) ? attempts : []).slice(-3).map((a, i) =>
+    `ATTEMPT ${i + 1}:\n${String(a.code || '').slice(0, 700)}\nRESULT: ${String(a.error || a.note || 'did not satisfy the check').slice(0, 300)}`
+  ).join('\n\n');
+
+  const sys = [
+    'You write a SHORT JavaScript snippet that runs on a web page and RETURNS data.',
+    'Output ONLY the code — no markdown fences, no explanation, no function wrapper.',
+    '',
+    'Available helpers (prefer these over raw DOM):',
+    BA_API_DOC,
+    '',
+    'RULES:',
+    '- The last expression / an explicit `return` is the result. Return plain JSON-serializable data (arrays, objects, numbers, strings).',
+    '- READ ONLY. Never click, type, submit, navigate, or modify the page. No .click(), no .value =, no location changes.',
+    '- No network calls, no timers, no async/await — it must finish immediately.',
+    '- Do not assume class names you have not seen; use the page structure shown below.',
+    '- If several containers could match, prefer the one that yields the most complete rows.',
+    past ? '- Previous attempts FAILED. Do something structurally DIFFERENT — do not repeat a failed selector.' : '',
+  ].filter(Boolean).join('\n');
+
+  const user = [
+    `GOAL: ${goal}`,
+    expect ? `SUCCESS MEANS: ${expect}` : '',
+    '',
+    'PAGE:',
+    String(digest || '').slice(0, 6000),
+    past ? `\nWHAT ALREADY FAILED:\n${past}` : '',
+  ].filter(Boolean).join('\n');
+
+  try {
+    let code = await askChat(model, [
+      { role: 'system', content: sys }, { role: 'user', content: user },
+    ], { temperature: past ? 0.5 : 0.2 }); // hotter after a failure — force a different idea
+    code = String(code).replace(/```[a-z]*\n?|```/gi, '').trim();
+    if (!code) return res.json({ ok: false, error: 'model returned no code' });
+    // Cheap static guard — the sandbox enforces this too, but failing here
+    // costs nothing and gives the model a specific reason to try again.
+    const banned = /\.(click|submit|focus)\s*\(|\.value\s*=|location\s*=|location\.(href|assign|replace)|fetch\s*\(|XMLHttpRequest|document\.write|innerHTML\s*=/;
+    if (banned.test(code)) return res.json({ ok: false, error: 'generated code tried to modify the page or make a request (read-only tool)', code });
+    res.json({ ok: true, code });
+  } catch (e) {
+    res.json({ ok: false, error: 'Ollama error: ' + e.message });
+  }
+});
+
+// Judge whether a result satisfies `expect`. Deterministic checks happen in the
+// extension; this is the judgement call the extension cannot make.
+app.post('/ai/verify-code', async (req, res) => {
+  const { model, goal, expect, sample } = req.body || {};
+  if (!model) return res.json({ ok: false, error: 'model required' });
+  try {
+    const raw = await askChat(model, [
+      { role: 'system', content:
+        'Decide whether a result satisfies the requirement. Reply STRICT JSON: {"pass":true|false,"reason":"<short>","hint":"<what to change if it failed>"}. '
+        + 'Be strict about emptiness and obviously wrong shapes, but do NOT demand more than the requirement asks for.' },
+      { role: 'user', content: `GOAL: ${goal}\nSUCCESS MEANS: ${expect || 'a non-empty, sensible result'}\n\nRESULT SAMPLE:\n${String(sample || '').slice(0, 2500)}` },
+    ], { temperature: 0, format: 'json' });
+    const out = JSON.parse(String(raw).replace(/```json|```/g, '').trim());
+    res.json({ ok: true, pass: !!out.pass, reason: String(out.reason || '').slice(0, 200), hint: String(out.hint || '').slice(0, 300) });
+  } catch (e) {
+    // Model unreachable — let the deterministic checks decide rather than block.
+    res.json({ ok: true, pass: true, reason: 'verifier unavailable; accepted on deterministic checks' });
+  }
+});
+
 app.post('/ai/generate', async (req, res) => {
   const { model, prompt, words, context } = req.body || {};
   if (!model || !prompt) return res.json({ ok: false, error: 'model and prompt required' });
@@ -1472,11 +3064,36 @@ app.post('/ai/generate', async (req, res) => {
 });
 
 // =============================== Schemas ====================================
-// User-defined data schemas. Each schema gets its OWN Mongo collection
-// (data_<slug>) that tasks tagged with it write their collected records into.
+// User-defined data schemas. Collected data for EVERY schema lives in the one
+// shared `records` collection; each doc references its schema and keeps the
+// field values under `result`:
+//   { schemaId, _taskId, _sourceUrl, result: {…fields}, createdAt, updatedAt }
+// The HTTP API still speaks flat records (field keys at the top level next to
+// _taskId/_sourceUrl) — wrapping/unwrapping happens here, so the extension and
+// desktop app are unaffected.
 
 const schemasColl = () => collFor('schemas');
-const dataCollName = (slug) => `data_${slug}`;
+const recordsColl = () => collFor('records');
+
+// Meta keys that stay at the doc top level; everything else is schema data.
+const RECORD_META = new Set(['_taskId', '_sourceUrl']);
+
+// flat record → stored doc shape
+function wrapRecord(schemaId, r) {
+  const result = {};
+  const meta = {};
+  for (const [k, v] of Object.entries(r)) {
+    if (k === '_id') continue;
+    if (RECORD_META.has(k)) meta[k] = v; else result[k] = v;
+  }
+  return { schemaId, ...meta, result };
+}
+
+// stored doc → flat record the clients expect
+const unwrapRecord = (d) => {
+  const { _id, schemaId, result, createdAt, updatedAt, ...meta } = d;
+  return { ...(result || {}), ...meta };
+};
 
 // Clean incoming field defs: a stable key, a label, a type.
 function normFields(fields) {
@@ -1495,11 +3112,14 @@ function defaultFields(metric) {
   if (metric === 'texts') {
     return normFields([{ key: 'text', label: 'Text', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
   }
+  if (metric === 'links') {
+    return normFields([{ key: 'title', label: 'Title', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
+  }
   return normFields([{ key: 'name', label: 'Name', type: 'text' }, { key: 'url', label: 'URL', type: 'url' }]);
 }
 
-// Create + persist a schema (its own collection). Returns the schema doc, or
-// null if no valid fields. Shared by the API and the planner's auto-create.
+// Create + persist a schema. Returns the schema doc, or null if no valid
+// fields. Shared by the API and the planner's auto-create.
 async function createSchemaDoc(name, fields) {
   const cleanFields = normFields(fields);
   if (!cleanFields.length) return null;
@@ -1509,17 +3129,15 @@ async function createSchemaDoc(name, fields) {
     schemaId: crypto.randomUUID(),
     name: (String(name).trim() || slug),
     slug,
-    dataCollection: dataCollName(slug),
     fields: cleanFields,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
   await schemasColl().insertOne({ ...schema });
-  await collFor(schema.dataCollection).createIndex({ _sourceUrl: 1 });
   return schema;
 }
 
-const schemaSnapshot = (s) => ({ schemaId: s.schemaId, name: s.name, slug: s.slug, dataCollection: s.dataCollection, fields: s.fields });
+const schemaSnapshot = (s) => ({ schemaId: s.schemaId, name: s.name, slug: s.slug, fields: s.fields });
 
 app.get('/schemas', async (req, res) => {
   const schemas = await schemasColl().find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray();
@@ -1544,7 +3162,7 @@ app.delete('/schemas/:id', async (req, res) => {
   const schema = await schemasColl().findOne({ schemaId: req.params.id });
   if (schema) {
     await schemasColl().deleteOne({ schemaId: req.params.id });
-    try { await collFor(schema.dataCollection).drop(); } catch {}
+    await recordsColl().deleteMany({ schemaId: schema.schemaId });
   }
   res.json({ ok: true });
 });
@@ -1553,30 +3171,36 @@ app.delete('/schemas/:id', async (req, res) => {
 app.get('/schemas/:id/records', async (req, res) => {
   const schema = await schemasColl().findOne({ schemaId: req.params.id });
   if (!schema) return res.status(404).json({ ok: false, error: 'not found' });
-  const q = {};
+  const q = { schemaId: schema.schemaId };
   if (req.query.taskId) q._taskId = req.query.taskId;
-  const records = await collFor(schema.dataCollection).find(q, { projection: { _id: 0 } }).limit(1000).toArray();
-  res.json({ ok: true, records, fields: schema.fields });
+  const docs = await recordsColl().find(q).limit(1000).toArray();
+  res.json({ ok: true, records: docs.map(unwrapRecord), fields: schema.fields });
 });
 
-// Upsert records into a schema collection (dedup by _sourceUrl when present).
+// Upsert records for a schema into the shared `records` collection
+// (dedup by _sourceUrl within the schema, when present).
 app.post('/schemas/:id/records', async (req, res) => {
   const schema = await schemasColl().findOne({ schemaId: req.params.id });
   if (!schema) return res.status(404).json({ ok: false, error: 'not found' });
   const records = Array.isArray(req.body?.records) ? req.body.records : [];
-  const coll = collFor(schema.dataCollection);
+  const coll = recordsColl();
   let added = 0, updated = 0;
   for (const r of records) {
     if (!r || typeof r !== 'object') continue;
-    if (r._sourceUrl) {
-      const u = await coll.updateOne({ _sourceUrl: r._sourceUrl }, { $set: r }, { upsert: true });
+    const doc = wrapRecord(schema.schemaId, r);
+    if (doc._sourceUrl) {
+      const u = await coll.updateOne(
+        { schemaId: schema.schemaId, _sourceUrl: doc._sourceUrl },
+        { $set: { ...doc, updatedAt: nowIso() }, $setOnInsert: { createdAt: nowIso() } },
+        { upsert: true }
+      );
       if (u.upsertedCount) added++; else updated++;
     } else {
-      await coll.insertOne({ ...r });
+      await coll.insertOne({ ...doc, createdAt: nowIso(), updatedAt: nowIso() });
       added++;
     }
   }
-  const total = await coll.countDocuments();
+  const total = await coll.countDocuments({ schemaId: schema.schemaId });
   res.json({ ok: true, added, updated, total });
 });
 

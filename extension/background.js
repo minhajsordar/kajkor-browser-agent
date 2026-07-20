@@ -34,19 +34,255 @@ function waitForTabLoad(tabId, timeout = 30000) {
   });
 }
 
+// Open a URL in a BACKGROUND tab, run one content-script message against it,
+// then always close the tab. Used by read_pages to visit result links.
+async function readUrl(url, message, { settle = 2500, timeout = 30000 } = {}) {
+  let tab = null;
+  try {
+    tab = await chrome.tabs.create({ url, active: false });
+    await waitForTabLoad(tab.id, timeout);
+    await new Promise((r) => setTimeout(r, settle)); // let client-rendered text land
+    return (await msgTab(tab.id, message)) || { ok: false, error: 'no response' };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+  }
+}
+
 // ======================= Agent orchestrator ================================
 // Plan-and-execute. The backend plans (NL -> JSON phases) and checks the target;
 // this runs each phase as a deterministic browser tool. Every state change is
 // persisted to the task doc via the backend, so a power cut can be resumed.
 
 const AGENT = {}; // taskId -> { running, tabId }  (runtime only; DB is source of truth)
+// Clicks that put something live — these get verified, never assumed.
+const PUBLISH_WORD = /\b(post|publish|share|tweet|send|submit)\b/i;
+// taskId -> true when the next successful click came out of a recovery, and is
+// therefore worth offering to save as a learned element.
+const LEARN = {};
+
+// Run generated JS on the page and bring back its return value.
+//
+// Vehicle: chrome.scripting into the MAIN world. The snippet is compiled with
+// `new Function` INSIDE the page's realm, so a strict page CSP can refuse it —
+// that failure is reported plainly rather than silently swallowed. (The clean
+// upgrade is chrome.userScripts, which ignores page CSP but needs the user to
+// switch on "Allow user scripts".)
+//
+// Read-only is enforced HERE, not just asked for in the prompt: the helpers
+// expose no mutators and the page-modifying APIs are shadowed inside the
+// snippet's scope.
+async function runPageCode(tabId, code, timeoutMs = 20000) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    args: [String(code), Number(timeoutMs)],
+    func: (src, limit) => {
+      const t0 = Date.now();
+      const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+      const vis = (el) => {
+        if (!el || el.offsetParent === null) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      // Elements are handed out through a proxy that refuses the mutating
+      // members. Without this, read-only is only a promise in the prompt —
+      // `BA.$('.x').click()` would simply work.
+      const MUTATORS = new Set([
+        'click', 'submit', 'focus', 'blur', 'remove', 'requestSubmit',
+        'setAttribute', 'removeAttribute', 'insertAdjacentHTML', 'append',
+        'prepend', 'appendChild', 'removeChild', 'replaceWith', 'scrollIntoView',
+      ]);
+      const WRITABLE = new Set(['value', 'innerHTML', 'outerHTML', 'textContent', 'checked', 'src', 'href']);
+      const ro = (el) => {
+        if (!el || typeof el !== 'object') return el;
+        return new Proxy(el, {
+          get(target, prop) {
+            if (typeof prop === 'string' && MUTATORS.has(prop)) {
+              return () => { throw new Error(`${prop}() is not allowed — this tool is read-only`); };
+            }
+            const v = target[prop];
+            return typeof v === 'function' ? v.bind(target) : v;
+          },
+          set(target, prop) {
+            if (typeof prop === 'string' && WRITABLE.has(prop)) {
+              throw new Error(`setting .${prop} is not allowed — this tool is read-only`);
+            }
+            throw new Error('modifying the page is not allowed — this tool is read-only');
+          },
+        });
+      };
+      const BA = {
+        $: (s, root) => { const e = (root || document).querySelector(s); return e ? ro(e) : null; },
+        $$: (s, root) => [...(root || document).querySelectorAll(s)].map(ro),
+        text: (el) => norm(el && (el.innerText || el.textContent)),
+        attr: (el, n) => (el ? el.getAttribute(n) : null),
+        visible: vis,
+        byText: (t, sel) => [...document.querySelectorAll(sel || '*')]
+          .filter((e) => norm(e.textContent).toLowerCase().includes(String(t).toLowerCase()))
+          .map(ro),
+      };
+      // A read-only stand-in for `document`, so code that bypasses BA and calls
+      // document.querySelector(...) directly still gets guarded elements.
+      const roDocument = {
+        querySelector: (s) => BA.$(s),
+        querySelectorAll: (s) => BA.$$(s),
+        getElementById: (id) => { const e = document.getElementById(id); return e ? ro(e) : null; },
+        getElementsByClassName: (c) => [...document.getElementsByClassName(c)].map(ro),
+        getElementsByTagName: (t) => [...document.getElementsByTagName(t)].map(ro),
+        get title() { return document.title; },
+        get URL() { return document.URL; },
+        get body() { return ro(document.body); },
+      };
+      try {
+        // Shadow the obvious escape hatches inside the snippet's scope. This is
+        // a guard rail for a well-meaning model, not a security boundary —
+        // MAIN-world code shares the page's realm by definition.
+        // NB: "eval" cannot be a parameter name under "use strict" — it is a
+        // SyntaxError that would reject every snippet. eval is left to the
+        // page's own CSP and the server-side static check.
+        const fn = new Function(
+          'BA', 'document', 'fetch', 'XMLHttpRequest', 'WebSocket',
+          'localStorage', 'sessionStorage', 'indexedDB',
+          `"use strict";\n${src}`
+        );
+        const blocked = () => { throw new Error('not allowed in read-only code'); };
+        const out = fn(BA, roDocument, blocked, blocked, blocked, undefined, undefined, undefined);
+        let data;
+        try {
+          data = JSON.parse(JSON.stringify(out === undefined ? null : out));
+        } catch {
+          data = String(out).slice(0, 20000); // not serializable — keep something
+        }
+        const json = JSON.stringify(data);
+        if (json && json.length > 100000) {
+          return { ok: false, error: `result too large (${json.length} bytes) — narrow what you return` };
+        }
+        return { ok: true, data, ms: Date.now() - t0 };
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        return {
+          ok: false,
+          error: /unsafe-eval|Content Security Policy/i.test(msg)
+            ? `this page's Content Security Policy blocks generated code (${msg})`
+            : msg,
+        };
+      }
+    },
+  });
+  return res?.result || { ok: false, error: 'no result from the page' };
+}
+
+// A compact description of the page for the code generator: structure it can
+// actually target, rather than a full DOM dump.
+async function pageDigestFor(tabId) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: () => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const vis = (el) => {
+        if (!el || el.offsetParent === null) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 4 && r.height > 4;
+      };
+      const sig = (el) => {
+        const cls = (el.className && typeof el.className === 'string')
+          ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+        const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
+        const test = el.getAttribute('data-testid') ? `[data-testid="${el.getAttribute('data-testid')}"]` : '';
+        return el.tagName.toLowerCase() + (test || role || cls);
+      };
+      // Repeating structures are what most extraction targets look like.
+      const counts = new Map();
+      for (const el of document.querySelectorAll('body *')) {
+        if (!vis(el)) continue;
+        const s = sig(el);
+        if (!s || s.length > 90) continue;
+        const c = counts.get(s) || { n: 0, sample: '' };
+        c.n++;
+        if (!c.sample) c.sample = norm(el.innerText).slice(0, 90);
+        counts.set(s, c);
+      }
+      const repeating = [...counts.entries()]
+        .filter(([, c]) => c.n >= 3)
+        .sort((a, b) => b[1].n - a[1].n)
+        .slice(0, 18)
+        .map(([s, c]) => `${s}  ×${c.n}  e.g. "${c.sample}"`);
+      return {
+        url: location.href.slice(0, 200),
+        title: norm(document.title).slice(0, 120),
+        repeating,
+        headings: [...document.querySelectorAll('h1,h2,h3')].filter(vis).slice(0, 10).map((h) => norm(h.innerText).slice(0, 70)),
+      };
+    },
+  });
+  const d = res?.result;
+  if (!d) return 'page structure unavailable';
+  return [
+    `URL: ${d.url}`,
+    `TITLE: ${d.title}`,
+    d.headings.length ? `HEADINGS: ${d.headings.join(' | ')}` : '',
+    d.repeating.length ? `REPEATING ELEMENTS (selector ×count, sample text):\n${d.repeating.join('\n')}` : 'No obvious repeating structure found.',
+  ].filter(Boolean).join('\n');
+}
+
+// Find an open tab by host, URL fragment or title text. Prefers the ACTIVE tab
+// when several match (e.g. two Facebook tabs), then the most recently used.
+async function findTabByMatch(match) {
+  const m = String(match || '').toLowerCase().trim();
+  if (!m) return null;
+  const tabs = await chrome.tabs.query({});
+  const hits = tabs.filter((t) => {
+    const url = (t.url || '').toLowerCase();
+    const title = (t.title || '').toLowerCase();
+    if (/^(chrome|edge|about|devtools):/i.test(url)) return false;
+    return url.includes(m) || title.includes(m) || hostOfTab(t).includes(m);
+  });
+  if (!hits.length) return null;
+  return hits.find((t) => t.active) || hits[hits.length - 1];
+}
+
+// hostOfTab(tab) takes a tab object; this takes an id.
+async function hostOfTabId(tabId) {
+  try { return hostOfTab(await chrome.tabs.get(tabId)); } catch { return ''; }
+}
+
+async function urlOfTabId(tabId) {
+  try { return (await chrome.tabs.get(tabId)).url || ''; } catch { return ''; }
+}
+
+// Ask the user whether to remember an element. Never writes it directly.
+async function proposeElement(base, taskId, payload, summary) {
+  if (!payload.host) return;
+  try {
+    await jf(`${base}/tasks/${taskId}/propose`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'element.create',
+        summary,
+        detail: `Selector: ${payload.selectors?.[0]?.value || ''}`,
+        payload,
+      }),
+    });
+    await taskEvent(base, taskId, 'think', `${summary} — waiting for your approval.`);
+  } catch { /* proposing is best-effort; never fail the task over it */ }
+}
 
 const jf = (url, opts) => fetch(url, opts).then((r) => r.json());
 const getTask = (base, id) => jf(`${base}/tasks/${id}`).then((j) => (j.ok ? j.task : null));
 const patchTask = (base, id, fields) =>
   jf(`${base}/tasks/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fields) });
-const taskEvent = (base, id, kind, msg) =>
-  jf(`${base}/tasks/${id}/event`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, msg }) });
+// `chat` also posts the message as an assistant turn in the transcript. Reserve
+// it for the handful of events the user needs to see without opening the event
+// log — a round finishing or failing.
+const taskEvent = (base, id, kind, msg, chat = false) =>
+  jf(`${base}/tasks/${id}/event`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, msg, chat }) });
+// Record a descriptor that actually resolved, so a run that works can later be
+// promoted into a skill. Best-effort: a failed record must never fail the task.
+const recordResolution = (base, id, entry) =>
+  jf(`${base}/tasks/${id}/resolution`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry) }).catch(() => {});
 const taskError = (base, id, phase, message) =>
   jf(`${base}/tasks/${id}/error`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phase, message }) });
 const planTask = (base, id) =>
@@ -131,17 +367,28 @@ async function msgTab(tabId, message) {
   }
 }
 
+// A phase failure that carries the finder's structured `diagnosis` (see
+// findByDescriptor in content.js). The message still reads the same, so
+// executeLoop's TRANSIENT regex is unaffected; the extra field rides along so
+// rethink can be told WHY the lookup missed instead of guessing from a string.
+function failureWithDiagnosis(msg, res) {
+  const err = new Error(msg);
+  if (res && res.diagnosis) err.diagnosis = res.diagnosis;
+  return err;
+}
+
 // Tool implementations. Names MUST match the backend TOOL_CATALOG.
 async function runTool(base, taskId, phase) {
   const p = phase.params || {};
 
   if (phase.tool === 'navigate') {
-    const url = p.url || 'https://www.facebook.com';
+    const url = p.url;
+    if (!url) throw new Error('navigate needs a url');
     let host = '';
     try { host = new URL(url).hostname.replace(/^www\./, ''); } catch {}
 
-    // Reuse an already-open tab on the same site (e.g. the Facebook tab the user
-    // already has open) UNLESS the user explicitly asked for a new tab.
+    // Reuse an already-open tab on the same site (so repeated tasks don't pile
+    // up tabs) UNLESS the user explicitly asked for a new tab.
     let tab = null;
     if (!p.newTab && host) {
       const others = ownedByOthers(taskId);
@@ -149,8 +396,23 @@ async function runTool(base, taskId, phase) {
       tab = tabs.find((t) => { try { return new URL(t.url).hostname.replace(/^www\./, '') === host && !others.has(t.id); } catch { return false; } });
     }
     if (tab) {
-      await chrome.tabs.update(tab.id, { active: true });
-      await taskEvent(base, taskId, 'obs', `Using existing ${host} tab (no new tab opened).`);
+      // CRITICAL: reusing a tab must still LOAD the requested URL. The query
+      // often lives in the URL (e.g. /search?q=…), so merely focusing a stale
+      // tab would silently run the task against the PREVIOUS page's content.
+      const sameUrl = (() => {
+        try {
+          const a = new URL(tab.url), b = new URL(url);
+          return a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
+        } catch { return false; }
+      })();
+      await chrome.tabs.update(tab.id, { active: true, ...(sameUrl ? {} : { url }) });
+      if (sameUrl) {
+        await taskEvent(base, taskId, 'obs', `Reusing the ${host} tab — already on this page.`);
+      } else {
+        await waitForTabLoad(tab.id);
+        await new Promise((r) => setTimeout(r, 1500));
+        await taskEvent(base, taskId, 'obs', `Loaded ${url} in the existing ${host} tab.`);
+      }
     } else {
       tab = await chrome.tabs.create({ url, active: true });
       await waitForTabLoad(tab.id);
@@ -163,11 +425,151 @@ async function runTool(base, taskId, phase) {
 
   if (phase.tool === 'scroll') {
     const tabId = await currentTab(taskId);
-    const res = await msgTab(tabId, { type: 'SCROLL_PAGE', times: p.times || 10, delay: p.delay || 1200, direction: p.direction || 'vertical' });
+    // Clamp the delay: models emit values like delay:1, which would turn a
+    // 5-second scroll into 5000 steps. 250ms is about the fastest a scroll
+    // still reads as scrolling rather than teleporting.
+    const delay = Math.min(Math.max(Number(p.delay) || 1200, 250), 10000);
+    // "scroll for 5 seconds" is a duration: scroll until the time is up,
+    // rather than taking a step count from the number of seconds.
+    const seconds = Number(p.seconds) > 0 ? Number(p.seconds) : 0;
+    const times = Math.min(seconds ? Math.max(1, Math.round((seconds * 1000) / delay)) : (Number(p.times) || 10), 200);
+    const res = await msgTab(tabId, { type: 'SCROLL_PAGE', times, delay, direction: p.direction || 'vertical' });
     const did = (res && res.ok) ? res.scrolled : 0;
     const t = await getTask(base, taskId);
     await patchTask(base, taskId, { scrolls: (t?.scrolls || 0) + did });
-    await taskEvent(base, taskId, 'obs', `Scrolled ${did} times.`);
+    await taskEvent(base, taskId, 'obs', seconds
+      ? `Scrolled for ${seconds}s (${did} steps).`
+      : `Scrolled ${did} times.`);
+    return;
+  }
+
+  if (phase.tool === 'close_tab') {
+    const tab = p.match ? await findTabByMatch(p.match) : null;
+    const tabId = p.match ? tab?.id : AGENT[taskId]?.tabId;
+    if (!tabId) throw new Error(p.match ? `no tab found matching "${p.match}"` : 'no tab to close — this task has not opened one');
+    let label = '';
+    try { label = hostOfTab(await chrome.tabs.get(tabId)); } catch {}
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (e) {
+      throw new Error(`could not close the tab: ${e.message || e}`);
+    }
+    // The tab is gone; later phases must not try to use it.
+    if (AGENT[taskId]?.tabId === tabId) AGENT[taskId] = { ...(AGENT[taskId] || {}), tabId: null };
+    const t = await getTask(base, taskId);
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    await taskEvent(base, taskId, 'obs', `Closed the ${label || 'task'} tab.`);
+    return;
+  }
+
+  if (phase.tool === 'solve_with_code') {
+    const tabId = await currentTab(taskId);
+    const t0 = await getTask(base, taskId);
+    const goal = p.goal || t0?.currentInstruction || t0?.goal || '';
+    const expect = p.expect || '';
+    const attempts = [];
+    let solved = null;
+
+    for (let attempt = 1; attempt <= 4 && !solved; attempt++) {
+      const digest = await pageDigestFor(tabId);
+      await taskEvent(base, taskId, 'think', `Writing code for "${String(goal).slice(0, 60)}" (attempt ${attempt}/4)…`);
+
+      const gen = await jf(`${base}/ai/codegen`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: t0.model, goal, expect, digest, attempts }),
+      }).catch(() => null);
+      if (!gen?.ok) {
+        attempts.push({ code: gen?.code || '', error: gen?.error || 'code generation failed' });
+        await taskEvent(base, taskId, 'err', `Could not write code: ${gen?.error || 'model unavailable'}`);
+        continue;
+      }
+
+      const run = await runPageCode(tabId, gen.code, 20000);
+      if (!run.ok) {
+        attempts.push({ code: gen.code, error: run.error });
+        await taskEvent(base, taskId, 'obs', `Attempt ${attempt} failed: ${String(run.error).slice(0, 140)}`);
+        continue;
+      }
+
+      // Deterministic checks first — cheap, and they catch the common "returned
+      // nothing" case without spending a model call.
+      const data = run.data;
+      const rows = Array.isArray(data) ? data.length : (data && typeof data === 'object' ? Object.keys(data).length : (data ? 1 : 0));
+      if (!rows) {
+        attempts.push({ code: gen.code, error: 'returned an empty result' });
+        await taskEvent(base, taskId, 'obs', `Attempt ${attempt} returned nothing.`);
+        continue;
+      }
+
+      const sample = JSON.stringify(data).slice(0, 2000);
+      const v = await jf(`${base}/ai/verify-code`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: t0.model, goal, expect, sample }),
+      }).catch(() => ({ ok: true, pass: true }));
+
+      if (v?.pass) {
+        solved = { data, rows, code: gen.code, ms: run.ms };
+      } else {
+        attempts.push({ code: gen.code, error: v?.reason || 'did not satisfy the check', note: v?.hint });
+        await taskEvent(base, taskId, 'obs', `Attempt ${attempt} rejected: ${String(v?.reason || '').slice(0, 140)}`);
+      }
+    }
+
+    if (!solved) {
+      throw new Error(`code attempts exhausted (4 tries) — last problem: ${attempts[attempts.length - 1]?.error || 'unknown'}`);
+    }
+
+    // Save like any other collection tool so the data lands in the session.
+    const records = Array.isArray(solved.data)
+      ? solved.data.map((d) => (d && typeof d === 'object' ? d : { value: d }))
+      : [(solved.data && typeof solved.data === 'object') ? solved.data : { value: solved.data }];
+    await mergeRecords(base, taskId, records);
+    const tsk = await getTask(base, taskId);
+    if (tsk?.schemas?.length && records.length) await saveToSchemas(base, taskId, tsk.schemas, records);
+    await taskEvent(base, taskId, 'ok',
+      `Code worked on attempt ${attempts.length + 1}: ${solved.rows} result(s) in ${solved.ms}ms.`);
+    await taskEvent(base, taskId, 'obs', `Code used:\n${String(solved.code).slice(0, 600)}`);
+    return;
+  }
+
+  if (phase.tool === 'switch_tab') {
+    const match = String(p.match || '').trim();
+    if (!match) throw new Error('switch_tab needs a `match` (host, URL fragment or title)');
+    const tab = await findTabByMatch(match);
+    if (!tab) throw new Error(`no open tab found matching "${match}"`);
+    await chrome.tabs.update(tab.id, { active: true });
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
+    AGENT[taskId] = { ...(AGENT[taskId] || {}), tabId: tab.id };
+    await taskEvent(base, taskId, 'obs', `Switched to "${(tab.title || '').slice(0, 60)}" (${hostOfTab(tab)}).`);
+    return;
+  }
+
+  if (phase.tool === 'list_tabs') {
+    const tabs = await chrome.tabs.query({});
+    const list = tabs
+      .filter((t) => !/^(chrome|edge|about|devtools):/i.test(t.url || ''))
+      .map((t) => `- ${(t.title || '(untitled)').slice(0, 70)} — ${(t.url || '').slice(0, 120)}`);
+    await taskEvent(base, taskId, 'obs', `${list.length} tab(s) open:\n${list.join('\n')}`.slice(0, 4000));
+    return;
+  }
+
+  if (phase.tool === 'reload_tab') {
+    const tabId = await currentTab(taskId);
+    await chrome.tabs.reload(tabId);
+    await waitForTabLoad(tabId);
+    await new Promise((r) => setTimeout(r, 1000));
+    await taskEvent(base, taskId, 'obs', 'Reloaded the page.');
+    return;
+  }
+
+  if (phase.tool === 'go_back') {
+    const tabId = await currentTab(taskId);
+    try { await chrome.tabs.goBack(tabId); } catch (e) { throw new Error(`cannot go back: ${e.message || e}`); }
+    await waitForTabLoad(tabId);
+    await new Promise((r) => setTimeout(r, 800));
+    let where = '';
+    try { where = hostOfTab(await chrome.tabs.get(tabId)); } catch {}
+    await taskEvent(base, taskId, 'obs', `Went back${where ? ` to ${where}` : ''}.`);
     return;
   }
 
@@ -175,13 +577,64 @@ async function runTool(base, taskId, phase) {
     const tabId = await currentTab(taskId);
     const res = await msgTab(tabId, {
       type: phase.tool === 'click' ? 'CLICK_ELEMENT' : 'HOVER_ELEMENT',
-      selector: p.selector || '', text: p.text || '',
+      selector: p.selector || '', text: p.text || '', descriptor: p.descriptor || null,
     });
     const t = await getTask(base, taskId);
     await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
     const okMsg = res && res.ok ? `${phase.tool}ed ${res.matched || (p.selector || p.text)}` : `${phase.tool} failed: ${(res && res.error) || 'not found'}`;
     await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
-    if (res && !res.ok) throw new Error(okMsg);
+    if (res && !res.ok) throw failureWithDiagnosis(okMsg, res);
+    if (p.descriptor) {
+      await recordResolution(base, taskId, {
+        tool: phase.tool, descriptor: p.descriptor, matched: res.matched,
+        selectorHint: res.selectorHint, depth: res.depth, url: await urlOfTabId(tabId),
+      });
+    }
+
+    // This click came out of a recovery, and it worked — offer to REMEMBER it
+    // as a named element so the next run does not have to rediscover it. Only
+    // ever a proposal: the user approves before anything is written.
+    if (phase.tool === 'click' && res?.ok && LEARN[taskId] && res.selectorHint) {
+      const host = await hostOfTabId(tabId);
+      LEARN[taskId] = false; // one proposal per recovery
+      await proposeElement(base, taskId, {
+        host,
+        name: res.matched || p.text || 'Recovered control',
+        type: 'action',
+        action: 'click',
+        selectors: [{ strategy: 'css', value: res.selectorHint, score: 80 }],
+        details: `Found while recovering a failed step on ${host}.`,
+      }, `Remember "${res.matched}" on ${host} as a reusable element`);
+    }
+
+    // A PUBLISH click must be verified. Clicking something is not the same as
+    // publishing: a mis-matched button still "succeeds", and the task would
+    // report complete while the post sat unsent in the composer.
+    // Gate on ANY draft text, not just generate_text output. Keying on
+    // generatedText alone meant a user-supplied post skipped verification
+    // entirely: a run that clicked "Add to your post" instead of "Post" left
+    // the draft unsent and still reported "Task complete".
+    const draftText = t?.generatedText || t?.lastTypedText || '';
+    if (phase.tool === 'click' && PUBLISH_WORD.test(String(p.text || '')) && draftText) {
+      // POLL, don't check once. A single check at 2.5s produced a FALSE
+      // "publish did not go through" on a post that HAD published — Facebook
+      // leaves the text in the composer briefly while it submits. The false
+      // alarm then sent the task into a recovery that clicked a carousel arrow
+      // and finally the Like button on the user's own post. A false negative
+      // here is far more expensive than waiting a few more seconds.
+      let check = null;
+      for (let i = 0; i < 5; i++) {
+        await new Promise((r) => setTimeout(r, i === 0 ? 2500 : 2000));
+        check = await msgTab(tabId, { type: 'DRAFT_STILL_OPEN', text: draftText }).catch(() => null);
+        if (!check || !check.ok || !check.open) break; // cleared — it went through
+      }
+      if (check && check.ok && check.open) {
+        const msg = `Publish did not go through — the text is still in the composer (clicked "${res.matched || p.text}", which was probably the wrong control).`;
+        await taskEvent(base, taskId, 'err', msg);
+        throw new Error(msg);
+      }
+      await taskEvent(base, taskId, 'ok', 'Verified: the composer is empty — the post went through.');
+    }
     return;
   }
 
@@ -189,10 +642,10 @@ async function runTool(base, taskId, phase) {
     const t = await getTask(base, taskId);
     if (p.selector || p.text) {
       const tabId = await currentTab(taskId);
-      const res = await msgTab(tabId, { type: 'WAIT_FOR', selector: p.selector || '', text: p.text || '', timeout: (Number(p.seconds) || 30) * 1000 });
+      const res = await msgTab(tabId, { type: 'WAIT_FOR', selector: p.selector || '', text: p.text || '', descriptor: p.descriptor || null, op: p.op || 'click', timeout: (Number(p.seconds) || 30) * 1000 });
       const okMsg = res && res.ok ? `Waited — "${res.matched}" appeared.` : `wait failed: ${(res && res.error) || 'timeout'}`;
       await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
-      if (res && !res.ok) throw new Error(okMsg);
+      if (res && !res.ok) throw failureWithDiagnosis(okMsg, res);
     } else {
       const secs = Math.min(Number(p.seconds) || 3, 300);
       await taskEvent(base, taskId, 'obs', `Waiting ${secs}s…`);
@@ -260,25 +713,55 @@ async function runTool(base, taskId, phase) {
     // Models emit placeholders like "<generated text>" — substitute the text
     // the generate_text phase produced (also used when value is omitted).
     let value = p.value || '';
-    if (t?.generatedText && (!value || /^\s*<[^>]*>\s*$/.test(value) || /\bgenerated\s+(text|post|content)\b/i.test(value))) {
+    const isPlaceholder = /^\s*<[^>]*>\s*$/.test(value) || /\bgenerated\s+(text|post|content)\b/i.test(value);
+    if (t?.generatedText && (!value || isPlaceholder)) {
       value = t.generatedText;
+    } else if (isPlaceholder || !value) {
+      // The planner emitted a placeholder ("<the post text>") but nothing ever
+      // produced real text — no generate_text phase ran and the user gave none.
+      // Typing it literally PUBLISHES "<the post text>" to a live account and
+      // then reports success, which is the worst outcome available here. Fail
+      // loudly instead. Worded to avoid the TRANSIENT regex: waiting and
+      // retrying cannot conjure text that was never written.
+      const msg = value
+        ? `type has no real text to enter — params.value is still the placeholder "${String(value).slice(0, 40)}" and no generate_text step produced anything. Say what should be written, or plan a generate_text phase.`
+        : 'type has no text to enter — params.value is empty and no generate_text step produced anything.';
+      await taskEvent(base, taskId, 'err', msg);
+      throw new Error(msg);
     }
-    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', value });
-    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1 });
+    const res = await msgTab(tabId, { type: 'TYPE_TEXT', selector: p.selector || '', text: p.text || '', descriptor: p.descriptor || null, value });
+    // Remember what was typed: the publish check below needs SOME draft text to
+    // look for, and user-supplied text never sets generatedText.
+    await patchTask(base, taskId, { actions: (t?.actions || 0) + 1, ...(res?.ok && value ? { lastTypedText: value } : {}) });
     const okMsg = res && res.ok ? `Typed into ${res.matched || 'field'}: "${String(value).slice(0, 60)}"` : `type failed: ${(res && res.error) || 'no field'}`;
     await taskEvent(base, taskId, res && res.ok ? 'obs' : 'err', okMsg);
-    if (res && !res.ok) throw new Error(okMsg);
+    if (res && !res.ok) throw failureWithDiagnosis(okMsg, res);
+    if (p.descriptor) {
+      await recordResolution(base, taskId, {
+        tool: 'type', descriptor: p.descriptor, matched: res.matched,
+        selectorHint: res.selectorHint, depth: res.depth, url: await urlOfTabId(tabId),
+      });
+    }
     return;
   }
 
   if (phase.tool === 'generate_text') {
     const t = await getTask(base, taskId);
     const prompt = p.prompt || t.goal;
-    // Hand the latest found/collected post text to the model as source
-    // material, so "regenerate the found post" actually sees the post.
-    const last = (t.collected || [])[(t.collected || []).length - 1] || null;
-    const context = last ? String(last.text || last._sourceText || '').slice(0, 4000) : '';
-    await taskEvent(base, taskId, 'think', `Generating text: ${String(prompt).slice(0, 80)}…${context ? ' (using the found post as source)' : ''}`);
+    // Source material, best first: research this task already synthesized (so
+    // "research X then post about it" writes FROM the findings), else the last
+    // collected post ("regenerate the found post" should see that post).
+    let context = '';
+    let sourceLabel = '';
+    if (t.summary) {
+      context = String(t.summary).slice(0, 4000);
+      sourceLabel = ' (from this task\'s research)';
+    } else {
+      const last = (t.collected || [])[(t.collected || []).length - 1] || null;
+      context = last ? String(last.text || last._sourceText || '').slice(0, 4000) : '';
+      if (context) sourceLabel = ' (using the found post as source)';
+    }
+    await taskEvent(base, taskId, 'think', `Generating text: ${String(prompt).slice(0, 80)}…${sourceLabel}`);
     const gen = await jf(`${base}/ai/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: t.model, prompt, words: p.words, context }),
@@ -390,6 +873,65 @@ async function runTool(base, taskId, phase) {
     return;
   }
 
+  if (phase.tool === 'collect_links') {
+    const tabId = await currentTab(taskId);
+    const res = await msgTab(tabId, { type: 'COLLECT_LINKS', options: { target: p.target || 10 } });
+    if (!res || !res.ok) throw new Error((res && res.error) || 'no result links found on this page');
+    const links = Array.isArray(res.links) ? res.links : [];
+    const collected = links.map((l, i) => ({ index: i + 1, url: l.url, title: l.title || '', collectedAt: new Date().toISOString() }));
+    await mergeRecords(base, taskId, collected);
+    const t = await getTask(base, taskId);
+    if (t?.schemas?.length && collected.length) await saveToSchemas(base, taskId, t.schemas, collected);
+    await taskEvent(base, taskId, collected.length ? 'ok' : 'err', `Collected ${collected.length} result link(s).`);
+    return;
+  }
+
+  // Visit each collected link and attach its readable content to that record,
+  // turning links into SOURCES. Saves after every page so a crash keeps progress,
+  // and a page that blocks/times out is skipped rather than failing the task.
+  if (phase.tool === 'read_pages') {
+    const t0 = await getTask(base, taskId);
+    const list = (t0?.collected || []).slice();
+    const limit = Number(p.target) || list.length;
+    let read = 0, failed = 0;
+    for (let i = 0; i < list.length && read < limit; i++) {
+      if (!AGENT[taskId]?.running) break;
+      const rec = list[i];
+      if (!rec || !rec.url || rec.text) continue;         // nothing to read, or already read
+      const r = await readUrl(rec.url, { type: 'EXTRACT_ARTICLE', maxChars: Number(p.maxChars) || 8000 });
+      if (r && r.ok && r.article) {
+        list[i] = { ...rec, title: rec.title || r.article.title || '', text: r.article.text || '', images: r.article.images || [] };
+        read++;
+        await taskEvent(base, taskId, 'obs', `Read ${read}/${limit}: ${String(list[i].title || rec.url).slice(0, 70)}`);
+      } else {
+        list[i] = { ...rec, readError: (r && r.error) || 'unreadable' };
+        failed++;
+        await taskEvent(base, taskId, 'err', `Skipped ${String(rec.url).slice(0, 60)} — ${(r && r.error) || 'unreadable'}`);
+      }
+      await patchTask(base, taskId, { collected: list });  // incremental, crash-safe
+    }
+    const t = await getTask(base, taskId);
+    const withText = list.filter((x) => x && x.text);
+    if (t?.schemas?.length && withText.length) await saveToSchemas(base, taskId, t.schemas, withText);
+    await taskEvent(base, taskId, read ? 'ok' : 'err', `Read ${read} page(s)${failed ? `, ${failed} unreadable` : ''}.`);
+    return;
+  }
+
+  // Final research step: the BACKEND does the map-reduce summarization (it owns
+  // the model) and writes the cited answer into the session transcript.
+  if (phase.tool === 'synthesize') {
+    const t0 = await getTask(base, taskId);
+    const question = p.question || t0?.currentInstruction || t0?.goal || '';
+    await taskEvent(base, taskId, 'act', 'Reading the sources and writing the answer…');
+    const r = await jf(`${base}/tasks/${taskId}/synthesize`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    }).catch(() => null);
+    if (!r || !r.ok) throw new Error((r && r.error) || 'synthesize failed');
+    await taskEvent(base, taskId, 'ok', `Answer written from ${r.used}/${r.total} source(s).`);
+    return;
+  }
+
   if (phase.tool === 'ai_verify') {
     const t = await getTask(base, taskId);
     const records = t?.collected || [];
@@ -453,6 +995,66 @@ function pickSourceField(records) {
 }
 
 // Execute remaining phases, then check the target -> done / repeat / error.
+// Has the task been cancelled server-side (desktop-app Stop button)? Network
+// hiccups must NOT read as cancelled, or a blip would kill a healthy run.
+async function isCancelled(base, taskId) {
+  try {
+    const t = await getTask(base, taskId);
+    return !!t && ['stopped', 'error'].includes(t.status);
+  } catch {
+    return false;
+  }
+}
+
+// A phase failed. Observe the live page, ask the backend what to do instead,
+// and apply the decision by rewriting the plan.
+// Returns 'retry' (plan rewritten — re-run this index), 'skip', or 'abort'.
+async function rethink(base, taskId, phase, index, err) {
+  let snapshot = null;
+  try {
+    const tabId = await currentTab(taskId);
+    const r = await msgTab(tabId, { type: 'PAGE_SNAPSHOT', limit: 40 });
+    if (r && r.ok) snapshot = r.snapshot;
+  } catch { /* no page to look at — the model still gets the error */ }
+
+  await taskEvent(base, taskId, 'think', `"${phase.tool}" failed — looking at the page to work out what to do instead…`);
+
+  let decision = null;
+  try {
+    const r = await jf(`${base}/tasks/${taskId}/rethink`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        failedPhase: phase, phaseIndex: index, error: err?.message || String(err), snapshot,
+        // Why the lookup missed: copy changed (nearest), text found but nothing
+        // actionable above it (ascentRejected), or the scope was never open
+        // (scopeEmpty). Without this the model only sees "not found".
+        diagnosis: err?.diagnosis || null,
+      }),
+    });
+    decision = r?.decision || null;
+  } catch { /* fall through to abort */ }
+  if (!decision) return 'abort';
+
+  if (decision.action === 'skip') {
+    await taskEvent(base, taskId, 'obs', `Skipping this step: ${decision.reason}`);
+    return 'skip';
+  }
+  if (decision.action !== 'replace') {
+    await taskEvent(base, taskId, 'err', `Giving up: ${decision.reason}`);
+    return 'abort';
+  }
+
+  // Swap the failed phase for the recovery phases, keeping the rest of the plan.
+  const task = await getTask(base, taskId);
+  const phases = (task?.plan?.phases || []).slice();
+  phases.splice(index, 1, ...decision.phases);
+  await patchTask(base, taskId, { plan: { ...task.plan, phases }, currentPhaseIndex: index });
+  await taskEvent(base, taskId, 'act',
+    `New approach: ${decision.phases.map((p) => p.tool).join(' → ')} — ${decision.reason}`);
+  LEARN[taskId] = true; // if the new approach works, offer to remember it
+  return 'retry';
+}
+
 async function executeLoop(base, taskId) {
   while (true) {
     if (!AGENT[taskId]?.running) return;
@@ -463,6 +1065,15 @@ async function executeLoop(base, taskId) {
       if (!AGENT[taskId]?.running) {
         await patchTask(base, taskId, { status: 'stopped' });
         await taskEvent(base, taskId, 'err', 'Stopped by user.');
+        return;
+      }
+      // Stop can also arrive from the desktop app, which only flips the status
+      // in the DB — this worker has no in-memory signal for that. Re-read it
+      // between phases so Stop halts the run instead of waiting for the plan
+      // to finish. (Never mid-phase: a fired side effect must not be retried.)
+      if (await isCancelled(base, taskId)) {
+        if (AGENT[taskId]) AGENT[taskId].running = false;
+        await taskEvent(base, taskId, 'obs', 'Stopped — halting before the next phase.');
         return;
       }
       const phase = task.plan.phases[i];
@@ -492,9 +1103,21 @@ async function executeLoop(base, taskId) {
           await taskEvent(base, taskId, 'err', 'Stopped — you declined the confirmation.');
           return;
         }
+        // THINK instead of giving up: look at what is actually on the page and
+        // decide what to do instead. Capped server-side so a task cannot loop.
+        const recovered = await rethink(base, taskId, phase, i, lastErr);
+        if (recovered === 'retry') {
+          task = await getTask(base, taskId); // plan was rewritten — reload it
+          i--;                                // re-run this index (now the new step)
+          continue;
+        }
+        if (recovered === 'skip') {
+          await patchTask(base, taskId, { currentPhaseIndex: i + 1 });
+          continue;
+        }
         await taskError(base, taskId, phase.tool, lastErr?.message || String(lastErr));
         await patchTask(base, taskId, { status: 'error' });
-        await taskEvent(base, taskId, 'err', `${phase.tool} failed: ${lastErr?.message || lastErr}`);
+        await taskEvent(base, taskId, 'err', `${phase.tool} failed: ${lastErr?.message || lastErr}`, true);
         return; // stop on unrecoverable error, per design
       }
       await patchTask(base, taskId, { currentPhaseIndex: i + 1 });
@@ -510,11 +1133,19 @@ async function executeLoop(base, taskId) {
       : (task.collected?.length || 0);
     await taskEvent(base, taskId, 'obs', `Target check: ${have}/${count} ${metric}.`);
 
-    // An ACTION plan that ran every phase without error IS the job done —
-    // repeating it would re-click/re-type (e.g. post the same text twice).
-    if (metric === 'actions' || have >= count) {
+    // Repeating is ONLY safe for pure collection plans. A plan that clicked,
+    // typed or published already fired side effects, so re-running it from the
+    // top would post the same thing twice — even when the collection half fell
+    // short of its target (a chained "research N sources then post" plan is
+    // metric "links", so the metric check alone does not cover it).
+    const SIDE_EFFECT = ['click', 'type', 'press_key', 'generate_text', 'use_skill', 'run_skill', 'ask_user'];
+    const acted = task.plan.phases.some((p) => SIDE_EFFECT.includes(p.tool));
+    if (metric === 'actions' || acted || have >= count) {
       await patchTask(base, taskId, { status: 'done', finishedAt: new Date().toISOString() });
-      await taskEvent(base, taskId, 'ok', `Task complete: ${have >= count ? `${have}/${count} ${metric}` : `all ${task.plan.phases.length} phases ran`}.`);
+      const why = have >= count ? `${have}/${count} ${metric}`
+        : acted && metric !== 'actions' ? `all ${task.plan.phases.length} phases ran (${have}/${count} ${metric}; not repeating — the plan already acted on a page)`
+        : `all ${task.plan.phases.length} phases ran`;
+      await taskEvent(base, taskId, 'ok', `Task complete: ${why}.`, true);
       return;
     }
 
