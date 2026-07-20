@@ -37,6 +37,75 @@ Two independent causes, both fixed:
 backend was restarted after prompt changes before concluding the model ignored
 them.
 
+### 2026-07-20 — research rewrite searched for the WHOLE instruction; overview intent ignored
+Task `2bc09dbe`, follow-on from the fix below. *create a new tab for google.com
+and search "…winner…", answer me from ai overview* got routed to research (good)
+but three things were wrong:
+
+1. **The Google query was the entire goal sentence.** `repairPlan` built the URL
+   with `encodeURIComponent(goal)` — so it searched Google for *"create a new tab
+   for google.com and search '…' answer me from ai overview"*, which returns
+   junk. → `searchQueryOf(goal)` extracts the real query: a quoted span wins
+   outright; otherwise strip a leading run of mechanics words and a trailing
+   report clause. The synthesize question uses it too.
+2. **"answer from ai overview" was ignored and it crawled 10 links.** We do NOT
+   scrape Google's obfuscated AI-Overview box (brittle); instead an "overview /
+   quick / just / featured snippet" intent drops the crawl to the top 3, which
+   answers the same question far faster. Honest trade recorded here so nobody
+   "fixes" it by adding a fragile AI-Overview selector.
+3. **It repeated because 8 links < target 10, re-reading the same 8 pages.** The
+   `have === 0` guard from the entry below did not cover partial-but-stalled.
+   → `executeLoop` now also stops when a pass makes NO NEW progress
+   (`have <= AGENT[taskId].lastHave`), keeping what it gathered. The overview
+   count of 3 also makes this specific case complete on pass 1.
+
+Lesson worth holding: each of these mechanics-heavy phrasings ("create a tab,
+search X, answer from Y") is handled by a CHAIN of heuristics, and a fix at one
+link can expose the next. Read the whole event log before concluding the model
+"stopped following commands" — here the model planned fine; the deterministic
+rewrite mangled the query.
+
+### 2026-07-20 — The planning prompt was TEACHING two of the bugs
+User's catch: the hardcoded `planningSystemPrompt` contradicted itself and
+seeded the exact failures.
+
+- **A rule said "NEVER invent a CSS selector for a site you have not inspected"
+  — then an EXAMPLE handed the model `collect_text([role="article"])`.** A 7B
+  copies the example over the rule, so it used `[role="article"]` on Google,
+  where it matches nothing. The example is now explicitly labelled
+  Facebook-feed-specific with a "do not copy this selector to other sites" note.
+- **An example literally showed `"value":"<the post text>"`** — the very
+  placeholder that got published to the live feed. Replaced with a literal value
+  ("Hello everyone"), and a new rule forbids placeholder values outright
+  (use `generate_text` when the user gave no text). The runtime guard added
+  earlier stays as the backstop; this stops the prompt from provoking it.
+
+General principle: **few-shot examples in a planner prompt are stronger than the
+rules** for a small model. An example that shows a guessable selector or a
+placeholder value will be copied literally. Audit examples as if they were
+rules — because to a 7B they outrank the rules.
+
+### 2026-07-20 — "search google for X and tell me" collected nothing, repeated 4x
+Task `2abea76b`. Goal: *create a new tab for google.com and search "…" and tell
+me here.* Planned as `navigate → collect_text([role="article"]) → ai_verify`,
+collected 0 (Google results are not `[role="article"]`), and re-ran the whole
+plan 4 times giving no answer. TWO independent bugs:
+
+1. **The research-pipeline rewrite never fired.** It needs
+   `isWebQuestion && !namesASite`, and BOTH failed: the goal has no question word
+   ("tell me here" ≠ "tell me about"), and it names "google.com" so `namesASite`
+   was true. So the naive guessed-selector plan survived.
+   → `isWebQuestion` now recognises a search-and-report request (search/look up
+   verb, or a named search engine, plus "tell me / let me know / answer / who /
+   winner / here"). `namesASite` now **strips search-engine hosts first** — a
+   search engine is how you REACH the web, not a site to scrape, so naming
+   google.com no longer blocks the rewrite. `facebook.com` still counts.
+2. **The repeat loop re-ran a zero-yield plan.** Repeating is deterministic:
+   same URL + same selector = same zero. It only helps when a pass makes
+   PROGRESS (an infinite feed). `executeLoop` now stops when a collection pass
+   collects `have === 0`, with a chat-visible message, instead of burning the
+   whole retry budget. Same lesson as "retries cannot fix a stepped form".
+
 ### 2026-07-19 — The post published, then the agent LIKED the user's own post
 Task `c52e1619`. Read the whole log before changing any of the three fixes — it
 is one failure causing the next.

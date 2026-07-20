@@ -1149,10 +1149,40 @@ async function executeLoop(base, taskId) {
       return;
     }
 
+    // A pass that gathered NOTHING will gather nothing on the next pass either:
+    // re-navigating to the same URL and running the same selector is
+    // deterministic, so repeating cannot change a zero. Repeating only helps
+    // when a pass makes PROGRESS (an infinite feed yielding more each scroll).
+    // Without this, a plan with a wrong selector (e.g. [role="article"] on a
+    // Google results page) re-ran 4 times and still answered nothing.
+    if (have === 0) {
+      const sel = (task.plan.phases.find((p) => p.tool === 'collect_text' || p.tool === 'collect_links')?.params?.selector) || '';
+      await patchTask(base, taskId, { status: 'done', finishedAt: new Date().toISOString() });
+      await taskEvent(base, taskId, 'err',
+        `Collected nothing${sel ? ` — the selector "${sel}" matched no elements on this page` : ''}. `
+        + 'Not repeating: re-running the same plan would collect nothing again. This needs a different approach (a research/search plan, or a correct selector).',
+        true);
+      return;
+    }
+
+    // A pass that added NOTHING NEW will add nothing next time either — the
+    // search returned all it had (8 results when 10 were asked), so re-running
+    // re-collects the same 8 and re-reads the same pages forever. Repeating only
+    // earns its keep when each pass makes progress. Stop on a stalled pass and
+    // keep what was gathered instead of burning the retry budget.
+    const prevHave = AGENT[taskId]?.lastHave;
+    if (prevHave != null && have <= prevHave) {
+      await patchTask(base, taskId, { status: 'done', finishedAt: new Date().toISOString() });
+      await taskEvent(base, taskId, 'ok',
+        `Got ${have} ${metric} (asked for ${count}, but that is all this page has). Answering from what I gathered rather than re-running.`, true);
+      return;
+    }
+    AGENT[taskId] = { ...(AGENT[taskId] || {}), lastHave: have };
+
     const repeats = (task.repeats || 0) + 1;
     if (repeats > (task.maxRepeats || 3)) {
       await patchTask(base, taskId, { status: 'done', repeats, finishedAt: new Date().toISOString() });
-      await taskEvent(base, taskId, 'obs', `Stopped after ${task.maxRepeats || 3} repeats: ${have}/${count} ${metric}.`);
+      await taskEvent(base, taskId, 'obs', `Stopped after ${task.maxRepeats || 3} repeats: ${have}/${count} ${metric}.`, true);
       return;
     }
     // Not met -> repeat the plan from the top.

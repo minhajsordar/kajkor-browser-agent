@@ -402,6 +402,7 @@ function planningSystemPrompt(schemas, skills) {
     '- To collect the text content of repeating elements (posts, results, rows, comments), use `collect_text` with a CSS `selector` and metric "texts".',
     '- For UI interactions (clicking buttons/links/tabs, hovering to reveal menus) use the `click` and `hover` tools; if the task is only interactions (no data collected) use metric "actions" with count = number of interaction steps.',
     '- To enter EXACT text the user gave into a field/box use the `type` tool with params.value = that text. Do NOT use use_skill for typing.',
+    '- NEVER put a placeholder like "<the post text>", "<generated text>" or "<...>" in params.value. If the user gave exact words, copy them verbatim; if they did NOT give any text, use `generate_text` — typing a placeholder publishes the literal placeholder.',
     '- To WRITE/GENERATE/COMPOSE text with AI (a post/message/comment about a topic) use the `generate_text` tool with params.prompt describing what to write; it generates the text and types it into the field.',
     '- use_skill, run_skill and collect_by_skill may ONLY reference a skill from the "Learned skills" list below. NEVER invent or guess a skill name. If no learned skill fits, use the generic click/type/hover/collect_text tools instead.',
     '- For navigate, set params.newTab to true ONLY if the user explicitly asks to open a NEW tab; if they refer to the current/existing tab, omit newTab.',
@@ -440,11 +441,11 @@ function planningSystemPrompt(schemas, skills) {
     '{"target":{"metric":"scrolls","count":10},"phases":[{"tool":"navigate","params":{"url":"https://example.com"}},{"tool":"scroll","params":{"times":10}}]}',
     'Example — "on the current page, hover the menu then click the Settings link":',
     '{"target":{"metric":"actions","count":2},"phases":[{"tool":"hover","params":{"text":"menu"}},{"tool":"click","params":{"text":"Settings"}}]}',
-    'Example — "open the composer and write a post, do not publish":',
-    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"type","params":{"value":"<the post text>"}}]}',
+    'Example — "open the composer and write \'Hello everyone\', do not publish" (a LITERAL value, never a <placeholder>):',
+    '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"type","params":{"value":"Hello everyone"}}]}',
     'Example — "open the composer and generate a post about surviving the AI era":',
     '{"target":{"metric":"actions","count":2},"phases":[{"tool":"click","params":{"text":"What\'s on your mind"}},{"tool":"generate_text","params":{"prompt":"Write a post about how we can survive in the AI era"}}]}',
-    'Example — "collect the full text of 5 posts":',
+    'Example — "collect the full text of 5 posts ON FACEBOOK" — the [role="article"] selector below is SPECIFIC to Facebook\'s feed. Do NOT copy it to Google or any other site; on a site whose structure you do not know, use the search pipeline (collect_links → read_pages) instead of guessing a selector:',
     '{"target":{"metric":"texts","count":5},"phases":[{"tool":"navigate","params":{"url":"https://www.facebook.com"}},{"tool":"collect_text","params":{"selector":"[role=\\"article\\"]","target":5}}]}',
   ];
   if (skills && skills.length) {
@@ -530,11 +531,26 @@ function normalizePlan(plan) {
 
 // Is this task a question about the world (answer lives on the web) rather than
 // an instruction to operate a page the user already has in mind?
+// Search engines are how you REACH the web, not a site to scrape. Naming one is
+// a signal to research, and it must not be treated as "the user named a target
+// site" (see namesASite).
+function namesSearchEngine(goal) {
+  return /\b(google|bing|duck ?duck ?go|duckduckgo|yahoo|ecosia|startpage|brave search)\b/i.test(String(goal || ''));
+}
+
 function isWebQuestion(goal) {
   const g = String(goal || '').trim();
   if (!g) return false;
   // Explicit page work — never a research question.
   if (/\b(click|type|scroll|hover|post|comment|publish|send|open the|log ?in|sign ?in|fill)\b/i.test(g)) return false;
+  // "search 'X' on google and tell me here", "google who won …", "look up X and
+  // let me know" — an explicit search-and-report request. It carries no question
+  // word, so the checks below miss it; but a search verb aimed at a search
+  // engine, or asking to be TOLD the result, is unmistakably a web question.
+  // This is the case that got planned as collect_text with a guessed selector,
+  // collected nothing, and repeated to the cap.
+  if ((namesSearchEngine(g) || /\b(search|look ?up)\b/i.test(g))
+      && /\b(search|look ?up|find|tell me|show me|let me know|give me|answer|who|what|when|where|winner|here)\b/i.test(g)) return true;
   return /^(what|who|when|where|why|how|which|is|are|was|were|does|do|did|can|should|will)\b/i.test(g)
     || /\?\s*$/.test(g)
     || /\b(price|cost|rate|worth|latest|current|today|now|news|trending|top \d+|best|cheapest|compare|comparison|analysis|analyz|research|summar(y|ise|ize)|explain|tell me about|find out|look up)\b/i.test(g);
@@ -542,8 +558,36 @@ function isWebQuestion(goal) {
 
 // A goal that names a concrete site ("open example.com and …") is a direct
 // instruction — respect the user's chosen destination, do not search instead.
+// Pull the actual search query out of an instruction sentence. The user writes
+// the MECHANICS ("create a new tab for google.com and search 'X', answer me from
+// the ai overview"); the query is just X. Using the whole sentence as the query
+// searched Google for the sentence and returned junk.
+function searchQueryOf(goal) {
+  const g = String(goal || '').trim();
+  // A quoted span is the query, explicitly. This is the common, unambiguous case.
+  const quoted = g.match(/["“”']([^"“”']{3,200})["“”']/);
+  if (quoted) return quoted[1].trim();
+
+  let s = g;
+  // Strip a leading run of mechanics words ("create a new tab for google.com and
+  // search for", "go to google and look up"…).
+  s = s.replace(/^(?:\s*(?:please|can you|could you|create(?:\s+a)?\s+new\s+tab\s+for|open|go\s+to|navigate\s+to|on|in|for|using|the|a|and|then|search(?:ing)?(?:\s+for)?|google(?:\.com)?|bing|duckduckgo|look\s?up|find(?:\s+me)?|about|info(?:rmation)?)\b[\s,:.]*)+/i, '');
+  // Strip a trailing report/mechanics clause ("… and tell me here", "… answer me
+  // from the ai overview", "… let me know").
+  s = s.replace(/[\s,.]*\b(?:and\s+)?(?:then\s+)?(?:tell|show|give|let\s+me\s+know|answer|report|summari[sz]e)\b.*$/i, '');
+  s = s.replace(/[\s,.]*\b(?:from|in|on)\s+(?:the\s+)?(?:ai\s+overview|overview|google(?:'?s)?(?:\s+answer)?|search\s+results?|featured\s+snippet)\b.*$/i, '');
+  s = s.replace(/[\s,.]*\b(?:here|to\s+me)\b[\s.]*$/i, '');
+  s = s.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  return s || g;
+}
+
 function namesASite(goal) {
-  return /\bhttps?:\/\/|\b[a-z0-9-]+\.(com|org|net|io|dev|co|ai|gov|edu)\b/i.test(String(goal || ''));
+  // A search engine is not a scrape TARGET — searching via it IS the research
+  // pipeline. Strip search-engine hosts before deciding, so "search google.com
+  // for X" no longer looks like "the user named a specific site to work on" and
+  // no longer blocks the web-question rewrite. "facebook.com" still counts.
+  const g = String(goal || '').replace(/\b(www\.)?(google|bing|duckduckgo|yahoo|ecosia|startpage)\.[a-z.]+/gi, ' ');
+  return /\bhttps?:\/\/|\b[a-z0-9-]+\.(com|org|net|io|dev|co|ai|gov|edu)\b/i.test(g);
 }
 
 // Small local models often drop essential phases. Complete the plan
@@ -576,15 +620,27 @@ function repairPlan(plan, goal = '', skills = []) {
       && !phases.some((p) => /skill/.test(p.tool))
       && !/^(actions|scrolls)$/.test(plan.target.metric)
       && !namesASite(goal)) {
-    const count = 10;
+    // Search for the QUERY, not the whole instruction. The goal is a sentence of
+    // mechanics ("create a new tab for google.com and search 'X', answer me from
+    // ai overview"); using it verbatim as the query searched Google for that
+    // whole sentence and produced junk sources. searchQueryOf pulls out "X".
+    const query = searchQueryOf(goal);
+    // "answer from the ai overview / quick answer" wants the answer off the
+    // results page, NOT a 10-link crawl. We can't reliably scrape Google's
+    // obfuscated AI-Overview box, but reading the top FEW results answers the
+    // same question in a fraction of the time — which is the real intent.
+    const wantsOverview = /\b(ai overview|overview|quick(ly)?|just|directly|featured snippet|short answer|google'?s? answer)\b/i.test(goal);
+    const count = wantsOverview ? 3 : 10;
     plan = { ...plan, target: { metric: 'links', count } };
     phases = [
-      { tool: 'navigate', params: { url: `https://www.google.com/search?q=${encodeURIComponent(goal)}` } },
+      { tool: 'navigate', params: { url: `https://www.google.com/search?q=${encodeURIComponent(query)}` } },
       { tool: 'collect_links', params: { target: count } },
       { tool: 'read_pages', params: { target: count } },
-      { tool: 'synthesize', params: { question: goal } },
+      { tool: 'synthesize', params: { question: query } },
     ];
-    repaired.push('rewrote guessed-site plan into a web search');
+    repaired.push(wantsOverview
+      ? `rewrote into a quick web search for "${query}" (top ${count})`
+      : `rewrote guessed-site plan into a web search for "${query}"`);
   }
   // A plan that gathers search results IS a "links" task whatever the model
   // called the metric. Without this the target is checked against the wrong
