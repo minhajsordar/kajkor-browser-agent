@@ -110,6 +110,25 @@ per app). Verified: 9-case :4010 run (persist / default profile / explicit wins 
 vscode+notepad refused on new session AND follow-up / empty=unrestricted). Live UI
 unverified. Approval-behaviour tie-in stays out of scope.
 
+### 2026-07-21 — Regenerate the last response (replace in place; answers only)
+Plan: `plans/partially-done/regenerate-response.md`. A refresh icon on the last
+round re-runs its instruction. User's decisions: **replace in place** (not a second
+attempt), and **answers only** — a round that acted must never re-run (double-post).
+- `POST /tasks/:id/regenerate` (server.js): `$pull` the whole round R (its user +
+  assistant turns + events), rewind `task.round` to R-1, clear plan state, and call
+  the existing `runChatTurn` — which rebuilds round R through the SAME routing (so
+  a tab question becomes a `list_tabs` round, an answer re-answers). 409 if busy;
+  400 if `round<1`, no user message, or `roundActed`.
+- `roundActed(events)` (server + `ChatThread.vue`, mirrored): a round acted if any
+  event has `meta.launch`/`meta.host`, a side-effect phase (`Phase n/m:
+  click|type|press_key|generate_text|use_skill|run_skill|ask_user` — executeLoop's
+  SIDE_EFFECT set), or a launch/host PROPOSAL (`proposed launch|app-launch
+  session|proposed host command` — the executed marker may not be back yet).
+- Desktop: `sessions.regenerate()` + a refresh icon next to 👍/👎, shown only on the
+  LAST round when `!r.acted && r.replies.length` (rounds carry `r.acted`).
+- Verified: 10-case :4010 run (replace-in-place keeps round N with one user + one
+  assistant; round 0 preserved; acted launch round refused; round-0-only refused).
+
 ### 2026-07-21 — "How many tabs are open?" answered via list_tabs (not the canned refusal)
 Follow-up to the launch-status fix below: that fix was TOO broad — it swallowed
 "is chrome open, how many tab open?" with the "can't verify a detached launch"

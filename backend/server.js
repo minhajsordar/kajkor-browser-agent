@@ -1853,6 +1853,20 @@ function isLaunchStatusQuestion(text) {
   return asking && about;
 }
 
+// Did a round fire side effects? A round that clicked / typed / posted / launched
+// / ran a host command must NOT be regenerated — re-running would repeat the
+// action (double-post). Mirrors executeLoop's SIDE_EFFECT set. Read-only rounds
+// (a chat answer, a tab list, a read-only research pass) are safe to regenerate.
+const REGEN_SIDE_EFFECT_RE = /Phase \d+\/\d+: (click|type|press_key|generate_text|use_skill|run_skill|ask_user)/i;
+// Also treat a launch/host PROPOSAL as "acted" — re-running it would re-launch or
+// re-run the command (the executed marker meta.launch/meta.host may not have been
+// posted back yet).
+const REGEN_PROPOSAL_RE = /proposed launch|app-launch session|proposed host command/i;
+function roundActed(events) {
+  return (events || []).some((e) =>
+    e.meta?.launch || e.meta?.host || REGEN_SIDE_EFFECT_RE.test(e.msg || '') || REGEN_PROPOSAL_RE.test(e.msg || ''));
+}
+
 // "how many tabs are open?", "list my tabs", "what tabs are open" — answerable by
 // the extension's list_tabs (chrome.tabs.query in its own Chrome; no content
 // script, so it avoids the 'Receiving end does not exist' failure). Distinct from
@@ -2901,6 +2915,32 @@ app.post('/tasks/:id/chat', async (req, res) => {
   }
 
   const out = await runChatTurn(task, message, req.body?.platform, imageIds);
+  res.status(out.status || 200).json(out.body);
+});
+
+// Regenerate the LAST round: re-run its instruction in place. Only for a round
+// that did NOT act (a round that posted/clicked/launched must not re-fire). We
+// remove the whole round, rewind the round counter, and re-run runChatTurn — so
+// the round is rebuilt from scratch through the same routing.
+app.post('/tasks/:id/regenerate', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'still working — wait for it to finish' });
+  const R = task.round || 0;
+  if (R < 1) return res.status(400).json({ ok: false, error: 'nothing to regenerate' });
+  const roundEvents = (task.events || []).filter((e) => (e.round || 0) === R);
+  if (roundActed(roundEvents)) return res.status(400).json({ ok: false, error: 'this round performed actions and cannot be regenerated safely' });
+  const lastUser = [...(task.chat || [])].reverse().find((m) => (m.round || 0) === R && m.role === 'user');
+  if (!lastUser || !String(lastUser.text || '').trim()) return res.status(400).json({ ok: false, error: 'no message to regenerate' });
+
+  // Drop the whole round (its user + assistant turns and its events), rewind the
+  // counter, and clear any per-round run state; runChatTurn re-creates round R.
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $pull: { chat: { round: R }, events: { round: R } },
+    $set: { round: R - 1, plan: null, currentInstruction: null, currentPhaseIndex: 0, pendingQuestion: null, status: 'done', updatedAt: nowIso() },
+  });
+  const fresh = await tasksColl().findOne({ taskId: task.taskId }, { projection: { _id: 0 } });
+  const out = await runChatTurn(fresh, String(lastUser.text), req.body?.platform, []);
   res.status(out.status || 200).json(out.body);
 });
 

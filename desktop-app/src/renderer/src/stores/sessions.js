@@ -350,6 +350,25 @@ export const useSessionsStore = defineStore('sessions', () => {
     }
   }
 
+  // Regenerate the last round: re-run its instruction in place. Backend refuses a
+  // round that acted (double-post safety); the UI hides the button there too.
+  async function regenerate() {
+    if (!selectedId.value) return false
+    sending.value = true
+    notice.value = ''
+    try {
+      const { data } = await api.post(`/tasks/${selectedId.value}/regenerate`, {})
+      if (!data.ok && data.error) notice.value = data.error
+      await refreshCurrent()
+      return !!data.ok
+    } catch (e) {
+      notice.value = e?.response?.data?.error || 'Could not regenerate.'
+      return false
+    } finally {
+      sending.value = false
+    }
+  }
+
   // Confirm a round was right — a like. No form: a positive example needs no
   // "what went wrong". Stored as kind:'up' with the round's context.
   async function likeRound({ round, messageAt } = {}) {
@@ -525,6 +544,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     denyLaunch,
     submitFeedback,
     likeRound,
-    analyzeFeedback
+    analyzeFeedback,
+    regenerate
   }
 })

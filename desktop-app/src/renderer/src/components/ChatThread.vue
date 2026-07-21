@@ -202,6 +202,22 @@
               >
                 <q-tooltip>Something wrong in this step? Tell the agent</q-tooltip>
               </q-btn>
+              <!-- Regenerate: re-run the last round in place. Only on the last
+                   round, and only when it did NOT act (re-running a post/click
+                   would repeat it). -->
+              <q-btn
+                v-if="ri === rounds.length - 1 && !r.acted && r.replies.length"
+                dense
+                flat
+                round
+                size="10px"
+                icon="refresh"
+                class="text-grey-5 round-fb"
+                :disable="store.currentBusy || store.sending"
+                @click="regenerate"
+              >
+                <q-tooltip>Not satisfied? Regenerate this response</q-tooltip>
+              </q-btn>
             </template>
             <q-chip
               v-for="(c, ci) in r.chips"
@@ -510,6 +526,13 @@ async function likeStep(r) {
   const okDone = await store.likeRound({ round, messageAt: lastReply?.at || null })
   if (okDone) $q.notify({ message: 'Marked this step as right', color: 'grey-8', timeout: 1200, position: 'top' })
 }
+// Regenerate the last round in place (replace its response). Backend re-runs the
+// same instruction through the same routing; refreshCurrent shows the result.
+async function regenerate() {
+  const ok = await store.regenerate()
+  if (ok) $q.notify({ message: 'Regenerated', color: 'grey-8', timeout: 1000, position: 'top' })
+}
+
 // Images staged for the next turn: [{name, dataUrl}]. Uploaded on send.
 const pending = ref([])
 const dragOver = ref(false)
@@ -727,7 +750,18 @@ function finalizeRounds(out, t, isLast) {
     r.duration = Math.max(0, (r.running ? Date.now() : Math.max(evEnd, repEnd)) - start)
     r.failed = last && t.status === 'error'
     r.chips = chipsFor(r)
+    r.acted = roundActed(r.events)
   })
+}
+
+// Did this round fire side effects (click/type/post/launch/host)? Such a round
+// must NOT show Regenerate — re-running would repeat the action. Mirrors the
+// backend's roundActed + executeLoop's SIDE_EFFECT set.
+const SIDE_EFFECT_RE = /Phase \d+\/\d+: (click|type|press_key|generate_text|use_skill|run_skill|ask_user)/i
+const PROPOSAL_RE = /proposed launch|app-launch session|proposed host command/i
+function roundActed(events) {
+  return (events || []).some((e) =>
+    e.meta?.launch || e.meta?.host || SIDE_EFFECT_RE.test(e.msg || '') || PROPOSAL_RE.test(e.msg || ''))
 }
 
 // Outcome chips — prefer structured event `meta` (Phase 2, exact); fall back to
