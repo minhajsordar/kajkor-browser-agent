@@ -11,6 +11,33 @@ history and reasoning behind them — the "why" and the "what's already there".
 
 ## Capabilities
 
+### 2026-07-21 — Desktop UI finish: project inheritance UX, saved-prompt picker, Feedback page
+Three code-buildable remainders from the partially-done plans (runtime checks in
+the Electron app are still the only thing left on each — no vue-tsc is configured
+for the renderer, so these are manual-review only). All renderer-side; NO backend
+change (every endpoint already existed).
+- **Composer inheritance UX** (`plans/.../project-settings.md` phase 3): a caption
+  under the new-session composer (`ChatThread.vue` `projectHint`) reads "Model &
+  skills from project X" when the composer matches the project's defaults, or
+  "Overriding X's defaults this session · Reset to project" once the user changes
+  the model/skills. Compares `store.model`/`store.newSessionSkillIds` vs
+  `projects.current.settings`; Reset re-runs `projects.applySettings`. Shown only
+  for a backend-backed project that sets a model or skills.
+- **Saved-prompt picker** in `ProjectSettingsDialog.vue` (finishes project-settings
+  phase 2): the dialog now sets `settings.promptId` (a reusable named prompt from
+  `/prompts`), not just the inline `systemPrompt`. `promptId` was ALREADY
+  whitelisted + used ahead of the inline text at `POST /tasks` — nothing set it.
+  The inline field disables and says "not used" while a saved prompt is picked, so
+  the precedence (`promptId` > inline) is visible, not silent. Dialog loads
+  `/prompts` itself (prompts aren't in the library store).
+- **Feedback review page** (feedback-learning's last nice-to-have): a **Feedback**
+  tab — `pages/FeedbackView.vue` + `stores/feedback.js` + route + App.vue tab.
+  Lists captured feedback newest-first with status/host filters; per-item Analyze
+  (posts the approval-gated proposal into that session; hidden once `triaged`),
+  Dismiss, Delete. Likes show as "Marked correct" with no Analyze. Reuses
+  `GET /feedback?host&status`, `POST /feedback/:id/analyze|dismiss`,
+  `DELETE /feedback/:id`.
+
 ### 2026-07-19 — "Task complete" on a post that was never published
 Event log of a real run: the final publish phase was `click {"text":"Post"}` and
 the log reads **`clicked Add to your post`** — the attachment menu, not the Post
@@ -64,6 +91,194 @@ search X, answer from Y") is handled by a CHAIN of heuristics, and a fix at one
 link can expose the next. Read the whole event log before concluding the model
 "stopped following commands" — here the model planned fine; the deterministic
 rewrite mangled the query.
+
+### 2026-07-20 — Host-launch tools (open Chrome/apps) — phase 1 built
+Plan: `plans/partially-done/host-launch-tools.md`. The agent should open Chrome
+(by profile) and installed apps. **Critical split:** the extension runs INSIDE
+Chrome and CANNOT launch a process — only the Electron main process can. "Open a
+new tab" already exists (`navigate {newTab}`); the rest are host-launch tools.
+
+Phase 1 done: `desktop-app/src/main/host/launch-registry.ts` (pure registry +
+`resolveLaunch`, no imports → unit-testable) and `launcher.ts` (`launchApp`
+DETACHED/no-wait — a GUI app never exits, so waiting like `runHostCommand` would
+report a false timeout; confirm-first-time remembered-apps list;
+`listChromeProfiles` from Chrome's `Local State`). User's decisions: allowlist +
+confirm-first-time, curated registry (never a raw path from the model), all
+three OSes.
+
+**Phases 1–3 now built + tested (2026-07-20).** A launch goes through the SAME
+propose→confirm→execute path as a `/run` host command — NOT a browser phase, so
+the extension is never involved (it can't spawn anyway). Pieces:
+- `detectLaunch` (backend, keyword map → appId + profile — deliberately NOT the
+  model; 15 unit cases incl. "open a new chrome TAB" → null, "open google" →
+  null). `mode:'launch'` branch in both `POST /tasks` and `runChatTurn`;
+  `POST /tasks/:id/launch-result` records the outcome ("Launch requested" — never
+  more, a detached GUI app gives no exit code).
+- Desktop: `launch:*` IPC + `window.api.launch` + d.ts; `pendingLaunch` flow in
+  the sessions store (resolves a profile NAME → Chrome dir, remembers on
+  approve); ChatThread launch card; "Launchable apps" Settings pane.
+- 9 launch-integration cases on :4010, all prior suites still green after heavy
+  server.js edits. Main + web typecheck clean.
+**Phase 4 — achievable half done (2026-07-20):** "open chrome with my Work
+profile and go to gmail" launches Chrome on the profile AND opens the URL —
+Chrome navigates itself given a URL arg, so NO extension coordination is needed.
+`detectLaunch` extracts a destination (explicit URL / domain / `SITE_ALIASES`
+word), browsers only; it passes as a positional arg after the profile flag.
+Profile-regex bug fixed en route: suffix form ("X profile") now matched before
+the prefix form so a trailing "and go to …" clause isn't captured as the profile.
+The FULL Phase 4 (agent CLICKS inside a launched profile) stays deferred — needs
+the extension in that profile + task-claiming to avoid multi-profile races; an
+architecture call + live testing, not buildable blind. Left: runtime GUI
+verification on the user's Windows box.
+
+### 2026-07-21 — Feedback learning phase 4 (effectiveness + NL capture) — plan DONE
+Plan moved to `plans/done/feedback-learning.md` (all 4 phases built + tested).
+- **Effectiveness tracking.** `injectLessons` returns `{block, ids}`; `planTask`
+  stamps `task.pendingLesson={round,lessonIds}`, `synthesize` merges into it. The
+  terminal `PATCH /tasks/:id` hook runs `attributeLessonOutcome` →
+  `lessons.attributionFor(task)` (PURE: done→`successCount`, error→`failCount`,
+  stopped→clear only) then `$unset`s the stamp so a repeated terminal PATCH can't
+  double-count. `pendingLesson` is deliberately NOT in `PATCHABLE` (server-owned;
+  the extension must not clobber it). Settings shows "N% ok", red under 50%.
+- **Natural-language capture.** `feedbackTriage.isCorrectionMessage` is PURE and
+  STRICT — no LLM, because the plan's own history says intent classifiers misfired
+  twice here. Fires ONLY on a past-referring correction ("that was wrong", "you
+  should have…"), never a fresh command (`FRESH_COMMAND_START` guard rejects
+  "go to twitter instead", "open settings and fix it"). In `runChatTurn`, BEFORE
+  `routeChat` and guarded by "the previous round actually produced events", a
+  match records feedback (`source:'nl'`) on the previous round and runs the same
+  `runFeedbackAnalysis` as a 👎. This stops a typed correction being re-planned as
+  a browser task (which on a posting task would post again — the recurring bug).
+- **Refactor (DRY):** `buildFeedbackDoc`/`recordFeedback` and `runFeedbackAnalysis`
+  extracted so the button path and NL path share one tested pipeline. The
+  `/feedback/:id/analyze` endpoint is now a thin wrapper returning
+  `runFeedbackAnalysis`'s `{status, ...body}`.
+- Tests: pure suites 21 (lessons, incl. attributionFor) + 41 (triage, incl. 13 NL
+  detector cases); integration 18 (feedback) + 10 (analyze/lessons) still green
+  after the refactor.
+
+### 2026-07-21 — Feedback learning phase 3 (scoped lessons injected into prompts)
+Plan: `plans/partially-done/feedback-learning.md`. Non-data corrections become
+scoped guidance loaded into prompts. **Open question RESOLVED: SITE-SCOPED by
+default** (the feedback dialog defaults to "This site only"; a lesson inherits
+that host unless widened to a task-type/Everywhere — stops a Facebook quirk
+leaking into a research plan).
+- **`backend/lessons.js` is a PURE module** (16 unit cases): `lessonMatches`,
+  `selectLessons` (matching + newest-first + HARD caps ≤5 lessons/~600 chars — an
+  over-budget lesson does not load), `formatLessons`, `supersededIds` (Jaccard
+  **≥0.3** within the SAME scope so a refinement REPLACES, not accumulates; 0.3
+  is deliberately moderate — same-scope means same site, and real refinements
+  like "keep posts short"→"keep posts under 100 words" share only topic words).
+- **Lessons are written ONLY through the approval gate.** New proposal kind
+  `lesson.create` (in `PROPOSAL_KINDS`); `applyProposal` inserts the lesson +
+  deactivates superseded ones. The lesson TEXT is the model's; the SCOPE is the
+  user's dialog choice (`feedbackTriage.lessonScopeFrom`, defaults site).
+- **Injection via `injectLessons(ctx)`** (never throws — a lesson lookup must not
+  break planning): wired into the **planner** (host + global lessons) and
+  **synthesize** (research task-type + global). Bumps `injectedCount` per use
+  (phase-4 groundwork). NOT wired into `/ai/generate` (the extension sends no
+  host); the planner covers post length via `generate_text.words`.
+- `GET /lessons` / `DELETE /lessons/:id`; desktop **Settings → "Learned lessons"**
+  lists active lessons (scope + use count) with delete — a bad lesson injects
+  into every matching prompt, so forgetting one is one click.
+- **analyze endpoint no longer short-circuits on "no candidates"** — a lesson
+  needs no learned skills/elements, so the model runs regardless (unless it's a
+  like).
+
+### 2026-07-21 — Feedback learning phase 2 (correction → approval-gated proposal)
+Plan: `plans/partially-done/feedback-learning.md`. A 👎 correction now becomes a
+proposal that rides the EXISTING `proposals[]` + `applyProposal` approval gate.
+- **`backend/feedback-triage.js` is a PURE module** (no DB, no network):
+  `TRIAGE_FORMAT`, `buildTriageMessages`, `proposalFromAnalysis`. **Why a separate
+  file:** `require('./server.js')` boots Mongo and calls `app.listen` (the desktop
+  app embeds the backend by requiring it — can't gate listen on `require.main`),
+  so the only way to unit-test the validation deterministically was to move it
+  out. 20 unit cases + 9 endpoint-guard cases.
+- **`POST /feedback/:id/analyze`** (server.js): gathers the host's skills+elements
+  (`feedbackCandidates`, capped, names+ids only — NEVER HTML into a 7B), resolves
+  the model via `resolveModel` (handles `auto`), runs the model, validates with
+  `proposalFromAnalysis`, and on success pushes the proposal onto the feedback's
+  own task. Marks feedback `triaged`+`proposalId`. `POST /feedback/:id/dismiss`
+  keeps the record (for effectiveness tracking) but flips status.
+- **Honest scope — the model canNOT invent a selector for a page it never saw.**
+  Three fix kinds: `skill.reorder` (**permutation-checked: may not drop or add a
+  step** — the model dropping a step would silently delete skill data), `skill.edit`
+  (clarify `details`), `element.repoint` **only when the correction itself names a
+  selector**. Everything else → `none`, left for review. Prefer none over a guess.
+- **Desktop:** `FeedbackDialog.send()` calls `store.analyzeFeedback(feedbackId)`
+  after submitting; a resulting proposal shows in the transcript's existing
+  proposal banner (approve → `applyProposal`), with a toast either way.
+  `submitFeedback` now returns the feedback doc (was a bool) so the id is available.
+
+### 2026-07-20 — Feedback learning phase 1 (capture + storage), PER-ROUND
+Plan: `plans/partially-done/feedback-learning.md`. A `feedback` collection +
+`POST /tasks/:id/feedback`. **Feedback is per-ROUND, not per-session** (user's
+correction — a session has many rounds, only one went wrong; session-level
+captured the wrong aggregate context). The stored context is scoped to that
+round: `instruction`, that round's `messages`, that round's `events`; optional
+`messageAt` pins the exact assistant message. `GET /feedback`,
+`DELETE /feedback/:id`. Desktop: a per-round **👍/👎 pair, LEFT-aligned** in the
+transcript (both `roundsByIndex`/`roundsByTime` carry a `round` number). 👎 →
+`FeedbackDialog.vue` → `sessions.submitFeedback(round, messageAt, …)` posts
+`kind:'down'`; 👍 → `sessions.likeRound(round, messageAt)` posts `kind:'up'`
+one-click, **no form** — a like is a positive example so `whatWrong` is NOT
+required for `kind:'up'` (backend enforces it only for `down`/`note`); the like
+still stores the round context and leaves a "Marked this step as correct" note.
+**Captures only — NO behaviour change yet** (collects both wins and corrections).
+Items start `status:'open'` for phase 2. 18 integration cases pass.
+Left: phase 2 (feedback→proposal), phase 3 (scoped lessons — BLOCKED on the open
+question: site-scoped vs global-by-default), phase 4, review page.
+
+**Whole-session checkpoint (2026-07-20):** 185 automated cases across 13 scratch
+suites all green; `node --check` clean on server.js/background.js/content.js;
+desktop `tsc` (main) + `vue-tsc` (web) clean. A stale duplicate
+`plans/partially-done/instruction-skills.md` (said phases 1–2) was removed — the
+authoritative final version is in `plans/done/`. Nothing committed; backend NOT
+yet restarted by the user, so none of the server-side work is live for them.
+
+### 2026-07-20 — Project-wise settings — backend built, desktop pending
+Plan: `plans/partially-done/project-settings.md`. **Phase 1 (backend) done +
+tested** (14 cases). New `projects` collection + CRUD; `POST /tasks` inherits a
+project's `settings` with precedence **explicit request > project default >
+global**. Whitelisted settings: `model`, `skillIds`, `promptId`, `schemaIds`,
+`systemPrompt` (the project's inline "dynamic" prompt — user asked for it),
+materialised into the task's `{name,content}` systemPrompt. `POST /tasks` now
+requires `goal` + an EFFECTIVE model (request OR project), not `model` outright —
+watch for callers that assumed the old 400.
+
+**Desktop phase now built (2026-07-20, typecheck clean, runtime unverified):**
+`projects.js` is backend-backed (`loadProjects` + migration of local-only
+projects by name; `addFolder`/`remove`/`updateSettings` hit `/projects`;
+localStorage is just a cache). `createSession` sends `project:{projectId}`.
+**Override UX = "composer adopts project defaults":** `setCurrent` →
+`applySettings` pushes the project's model+skills into the composer via
+`sessions.setModel`/`setNewSessionSkills`, so the request carries them
+explicitly (satisfying explicit>project); the inline prompt is applied
+server-side. `ProjectSettingsDialog.vue` (model/skills/dynamic prompt) →
+`PATCH /projects/:id`, opened from the project selector. **Caveat:**
+`applySettings` writes the GLOBAL model picker — selecting a project changes the
+app's current model and "No Project" doesn't revert it. Acceptable for v1.
+Decisions were: backend store, inline dynamic prompt, allow override.
+
+### 2026-07-20 — planSchema forbade metric "links" the prompt demanded
+The heavy one, found in a prompt audit. `planSchema()` is handed to Ollama as
+`format`, so its enums are GRAMMAR-ENFORCED — a value absent from an enum is one
+the model literally cannot emit. Its metric enum was
+`['scrolls','items','texts','actions']` — **no "links"** — while the prompt and
+every research example told the model to output `metric:"links"`. So constrained
+decoding coerced every search/research plan to "texts"/"actions", and the plan
+only worked if `repairPlan`/`normalizePlan` later relabeled it. A direct
+contributor to the Google-search failures. Fixed: enum now
+`['scrolls','items','texts','links','actions']`.
+
+- Guard added (scratchpad `metric-enum-test.js`, not committed): asserts the
+  schema enum, the `normalizePlan` whitelist, and every `repairPlan` metric
+  branch agree. **Rule: any grammar-enforced enum handed to the model as
+  `format` must list everything the prompt asks for — audit them together.**
+- Audit also confirmed: no stale tool references in the prompt (all 24 backtick
+  tool names exist in `TOOL_CATALOG`); `metric:'details'` is read in the
+  extension's `executeLoop` but never SET server-side — dead legacy branch,
+  harmless, left alone.
 
 ### 2026-07-20 — The planning prompt was TEACHING two of the bugs
 User's catch: the hardcoded `planningSystemPrompt` contradicted itself and

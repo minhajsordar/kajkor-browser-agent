@@ -13,6 +13,8 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { MongoClient } = require('mongodb');
+const feedbackTriage = require('./feedback-triage');
+const lessons = require('./lessons');
 
 const PORT = process.env.PORT || 34730;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://minhaj:m1nh8j@mdb.softrking.com:27017/browser_agent?authSource=admin&directConnection=true';
@@ -345,7 +347,14 @@ function planSchema() {
       target: {
         type: 'object',
         properties: {
-          metric: { type: 'string', enum: ['scrolls', 'items', 'texts', 'actions'] },
+          // MUST list every metric the prompt tells the model to use — this
+          // enum is grammar-ENFORCED by Ollama (passed as `format`), so a value
+          // missing here is one the model physically cannot emit. "links" was
+          // missing while the prompt and all research examples demanded it, so
+          // every search plan was silently coerced to "texts"/"actions" and only
+          // survived if repairPlan happened to relabel it. Keep in sync with the
+          // metric list in planningSystemPrompt and the branches in repairPlan.
+          metric: { type: 'string', enum: ['scrolls', 'items', 'texts', 'links', 'actions'] },
           count: { type: 'integer' },
         },
         required: ['metric', 'count'],
@@ -1093,15 +1102,107 @@ app.get('/tasks/:id', async (req, res) => {
   res.json({ ok: true, task });
 });
 
+// ============================= Projects ====================================
+// A project groups sessions AND carries default settings its tasks inherit
+// (model, skills, system prompt, schemas, workdir). Precedence at task
+// creation: an explicit request field > the project default > the global
+// default. Backend-authoritative (matches tasks/skills), keyed by a stable
+// projectId — names get renamed and collide.
+const projectsColl = () => collFor('projects');
+
+// Whitelist the inheritable settings. Anything not here is dropped, so a client
+// cannot smuggle arbitrary fields into a project's defaults.
+function cleanProjectSettings(s) {
+  const o = (s && typeof s === 'object') ? s : {};
+  const out = {};
+  if (typeof o.model === 'string') out.model = o.model.slice(0, 120);
+  if (Array.isArray(o.skillIds)) out.skillIds = o.skillIds.map(String).slice(0, 100);
+  if (typeof o.promptId === 'string') out.promptId = o.promptId || null;
+  if (Array.isArray(o.schemaIds)) out.schemaIds = o.schemaIds.map(String).slice(0, 50);
+  // The project's own "dynamic" system prompt — free text applied to its tasks.
+  if (typeof o.systemPrompt === 'string') out.systemPrompt = o.systemPrompt.slice(0, 8000);
+  return out;
+}
+
+app.get('/projects', async (_req, res) => {
+  const projects = await projectsColl().find({}, { projection: { _id: 0 } }).sort({ createdAt: 1 }).toArray();
+  res.json({ ok: true, projects });
+});
+
+app.get('/projects/:id', async (req, res) => {
+  const project = await projectsColl().findOne({ projectId: req.params.id }, { projection: { _id: 0 } });
+  if (!project) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, project });
+});
+
+app.post('/projects', async (req, res) => {
+  const b = req.body || {};
+  if (!b.name) return res.status(400).json({ ok: false, error: 'name required' });
+  const project = {
+    projectId: crypto.randomUUID(),
+    name: String(b.name).slice(0, 120),
+    dir: String(b.dir || ''),
+    settings: cleanProjectSettings(b.settings),
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await projectsColl().insertOne({ ...project });
+  res.json({ ok: true, project });
+});
+
+app.patch('/projects/:id', async (req, res) => {
+  const b = req.body || {};
+  const set = { updatedAt: nowIso() };
+  if (typeof b.name === 'string' && b.name.trim()) set.name = b.name.slice(0, 120);
+  if (typeof b.dir === 'string') set.dir = b.dir;
+  // settings is MERGED, not replaced, so a PATCH of one field keeps the rest.
+  if (b.settings && typeof b.settings === 'object') {
+    const cur = await projectsColl().findOne({ projectId: req.params.id }, { projection: { _id: 0, settings: 1 } });
+    set.settings = { ...(cur?.settings || {}), ...cleanProjectSettings(b.settings) };
+  }
+  const doc = await projectsColl().findOneAndUpdate(
+    { projectId: req.params.id }, { $set: set },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  const project = doc?.value || doc;
+  if (!project) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, project });
+});
+
+app.delete('/projects/:id', async (req, res) => {
+  await projectsColl().deleteOne({ projectId: req.params.id });
+  // Tasks keep their {name,dir} snapshot, so deleting a project does not orphan
+  // its history — the sessions stay grouped by the snapshot.
+  res.json({ ok: true });
+});
+
 app.post('/tasks', async (req, res) => {
   const { goal, model, mode, schemas, useSkills, promptId, project } = req.body || {};
-  if (!goal || !model) return res.status(400).json({ ok: false, error: 'goal and model required' });
+  if (!goal) return res.status(400).json({ ok: false, error: 'goal required' });
 
-  // Optional project grouping (desktop app): {name, dir}. dir doubles as the
-  // default working directory for /run commands in this session.
-  const taskProject = project && typeof project === 'object' && project.name
-    ? { name: String(project.name).slice(0, 120), dir: String(project.dir || '') }
-    : null;
+  // Project-wise settings: a project supplies DEFAULTS its tasks inherit.
+  // Precedence: an explicit request field > the project default > the global
+  // default. A field the request OMITS inherits; a field it sends (even empty)
+  // is an explicit override.
+  let proj = null;
+  const reqProjectId = project && typeof project === 'object' ? (project.projectId || null) : null;
+  if (reqProjectId) proj = await projectsColl().findOne({ projectId: reqProjectId }, { projection: { _id: 0 } });
+  const ps = (proj && proj.settings) || {};
+
+  const effModel = model || ps.model || '';
+  if (!effModel) return res.status(400).json({ ok: false, error: 'model required (none given and the project has no default model)' });
+
+  const effPromptId = promptId || ps.promptId || null;
+  const effUseSkills = Array.isArray(useSkills) ? useSkills : (Array.isArray(ps.skillIds) ? ps.skillIds : []);
+  const effSchemaIds = Array.isArray(schemas) ? schemas : (Array.isArray(ps.schemaIds) ? ps.schemaIds : []);
+  const projInlinePrompt = (typeof ps.systemPrompt === 'string' && ps.systemPrompt.trim()) ? ps.systemPrompt.trim() : '';
+
+  // Snapshot the project onto the task (grouping survives project deletion).
+  // Prefer the stored project's identity; fall back to a bare {name,dir}.
+  const taskProject = proj
+    ? { projectId: proj.projectId, name: proj.name, dir: proj.dir || '' }
+    : (project && typeof project === 'object' && project.name
+        ? { projectId: null, name: String(project.name).slice(0, 120), dir: String(project.dir || '') }
+        : null);
 
   // Host-command session (goal starts with /run|/sh|/host): do NOT browser-plan.
   // Create an IDLE session (status 'done' so the extension never runs phases)
@@ -1109,7 +1210,7 @@ app.post('/tasks', async (req, res) => {
   const hostGoalMatch = String(goal).match(HOST_PREFIX_RX);
   if (hostGoalMatch) {
     const instruction = String(goal).slice(hostGoalMatch[0].length).trim();
-    const resolved = await resolveModel(model, instruction);
+    const resolved = await resolveModel(effModel, instruction);
     const useModel = resolved.name || model;
     const base = {
       taskId: crypto.randomUUID(),
@@ -1143,11 +1244,34 @@ app.post('/tasks', async (req, res) => {
     return res.json({ ok: true, task: base, mode: 'host', proposal });
   }
 
+  // Launch an installed app ("open chrome with my Work profile", "launch
+  // vscode"): an idle session + a launch proposal the desktop app confirms and
+  // runs via its host launcher. Never browser-planned — "open chrome" is not a
+  // navigate. The desktop validates the appId against its own registry.
+  const launchReq = detectLaunch(goal);
+  if (launchReq) {
+    const label = launchLabel(launchReq.appId, launchReq.profile, launchReq.url);
+    const base = {
+      taskId: crypto.randomUUID(),
+      goal: String(goal), model: effModel, mode: 'once', project: taskProject,
+      schemas: [], useSkills: [], systemPrompt: null,
+      status: 'done', plan: null, currentPhaseIndex: 0,
+      collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+      repeats: 0, maxRepeats: 3, messages: [],
+      chat: [{ role: 'assistant', text: `🚀 Ready to launch **${label}**. Approve to open it.`, at: nowIso(), round: 0 }],
+      queue: [], sessionSummary: '', currentInstruction: null, round: 0,
+      events: [{ at: nowIso(), kind: 'think', msg: `App-launch session: ${label}.`, round: 0 }],
+      errors: [], createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
+    };
+    await tasksColl().insertOne({ ...base });
+    return res.json({ ok: true, task: base, mode: 'launch', proposal: { appId: launchReq.appId, profile: launchReq.profile || '', url: launchReq.url || '', label, title: label } });
+  }
+
   // A question ABOUT the agent's own skills/elements is not a browser task.
   // Answer it from the database in an idle session — planning it sent the agent
   // to Facebook to RUN the very skill the user was only asking about.
   if (isIntrospection(goal)) {
-    const resolved = await resolveModel(model, String(goal));
+    const resolved = await resolveModel(effModel, String(goal));
     const useModel = resolved.name || model;
     const reply = await answerIntrospection(useModel, String(goal));
     const task = {
@@ -1169,15 +1293,21 @@ app.post('/tasks', async (req, res) => {
   // Snapshot the chosen system prompt; its bundled skills join the task's skills.
   let systemPrompt = null;
   const extraSkillIds = [];
-  if (promptId) {
-    const p = await promptsColl().findOne({ promptId }, { projection: { _id: 0 } });
+  if (effPromptId) {
+    const p = await promptsColl().findOne({ promptId: effPromptId }, { projection: { _id: 0 } });
     if (p) { systemPrompt = { promptId: p.promptId, name: p.name, content: p.content }; extraSkillIds.push(...(p.skillIds || [])); }
+  }
+  // A project's own "dynamic" system prompt applies when no named prompt was
+  // chosen — materialized into the same {name, content} shape the planner reads
+  // (see task.systemPrompt?.content in the planning path).
+  if (!systemPrompt && projInlinePrompt) {
+    systemPrompt = { promptId: null, projectId: proj?.projectId || null, name: `Project: ${taskProject?.name || 'settings'}`, content: projInlinePrompt };
   }
 
   // Snapshot the chosen schemas onto the task so tools + resume stay stable
   // even if the schema is later edited or deleted.
   let taskSchemas = [];
-  const ids = Array.isArray(schemas) ? schemas : [];
+  const ids = effSchemaIds;
   if (ids.length) {
     const docs = await collFor('schemas').find({ schemaId: { $in: ids } }, { projection: { _id: 0 } }).toArray();
     taskSchemas = docs.map(schemaSnapshot);
@@ -1185,7 +1315,7 @@ app.post('/tasks', async (req, res) => {
 
   // Snapshot explicitly chosen learned skills so planning routes to them.
   let taskUseSkills = [];
-  const skIds = [...new Set([...(Array.isArray(useSkills) ? useSkills : []), ...extraSkillIds])];
+  const skIds = [...new Set([...effUseSkills, ...extraSkillIds])];
   if (skIds.length) {
     const docs = await resolveSkills(await collFor('skills').find({ skillId: { $in: skIds } }, { projection: { _id: 0 } }).toArray());
     taskUseSkills = docs.map((s) => ({ skillId: s.skillId, name: s.name, kind: s.kind, action: s.action, fields: s.fields, steps: s.steps || null, urlPattern: s.urlPattern }));
@@ -1193,8 +1323,8 @@ app.post('/tasks', async (req, res) => {
 
   const task = {
     taskId: crypto.randomUUID(),
-    goal, model, mode: mode || 'once',
-    project: taskProject,        // desktop-app folder grouping {name, dir}
+    goal, model: effModel, mode: mode || 'once',
+    project: taskProject,        // desktop-app folder grouping {projectId, name, dir}
     schemas: taskSchemas,        // schemas this task saves collected data into
     useSkills: taskUseSkills,    // learned skills the task should use
     systemPrompt,                // standing instructions attached to this task
@@ -1286,8 +1416,9 @@ app.patch('/tasks/:id', async (req, res) => {
   // The extension marks a round finished through here — that is the moment a
   // queued prompt may start. Drain AFTER responding: a turn can call the model,
   // and the extension must not wait on it.
-  if (task && TERMINAL_STATUSES.has(task.status) && (task.queue || []).length) {
-    drainQueue(task.taskId).catch(() => {});
+  if (task && TERMINAL_STATUSES.has(task.status)) {
+    attributeLessonOutcome(task).catch(() => {}); // phase 4: did the round's lessons help?
+    if ((task.queue || []).length) drainQueue(task.taskId).catch(() => {});
   }
 });
 
@@ -1599,6 +1730,81 @@ async function routeChat(task, message) {
 // runs it in its own process. The backend never executes anything on a host.
 const HOST_PREFIX_RX = /^\/(run|sh|host)(?:\s+|$)/i;
 
+// ---- launch an installed app (desktop-app host launcher) --------------------
+// "open chrome with my Work profile", "launch vscode", "/open explorer". The
+// backend only PROPOSES an appId (+ optional profile NAME); the desktop app
+// validates it against its own registry (launch-registry.ts) and runs it. A
+// keyword map, not the model — a fixed 7-app mapping is more reliable and
+// testable than a 7B, and the desktop rejects any appId it does not know.
+const LAUNCH_PREFIX_RX = /^\/(launch|open)\s+/i;
+const LAUNCH_VERB_RX = /\b(open|launch|start|run|fire up|boot up)\b/i;
+const LAUNCH_ALIASES = [
+  [/\b(google\s*)?chrome\b/i, 'chrome'],
+  [/\b(microsoft\s*)?edge\b/i, 'edge'],
+  [/\bfirefox\b/i, 'firefox'],
+  [/\b(vs\s?code|visual studio code|vscode)\b/i, 'vscode'],
+  [/\b(file\s*)?explorer\b|\bfinder\b|\bfile manager\b/i, 'explorer'],
+  [/\bnotepad\b|\btext\s?edit\b|\btext editor\b/i, 'notepad'],
+  [/\bterminal\b|\bcommand prompt\b|\bpowershell\b|\bconsole\b/i, 'terminal'],
+];
+
+const LAUNCH_BROWSERS = new Set(['chrome', 'edge', 'firefox']);
+// A few common site words → URL, so "open chrome and go to gmail" navigates.
+// Deliberately small; anything with a real domain is handled generically.
+const SITE_ALIASES = {
+  gmail: 'https://mail.google.com', youtube: 'https://youtube.com', facebook: 'https://facebook.com',
+  twitter: 'https://x.com', x: 'https://x.com', github: 'https://github.com', reddit: 'https://reddit.com',
+  maps: 'https://maps.google.com', drive: 'https://drive.google.com', linkedin: 'https://linkedin.com',
+  whatsapp: 'https://web.whatsapp.com', chatgpt: 'https://chatgpt.com',
+};
+
+// A destination to open in a launched BROWSER: an explicit URL, a domain, or a
+// known site word after "go to / visit / open". Pure — unit-tested.
+function detectLaunchUrl(s) {
+  const explicit = s.match(/\bhttps?:\/\/[^\s"'<>]+/i);
+  if (explicit) return explicit[0];
+  const domain = s.match(/\b([a-z0-9-]+\.(?:com|org|net|io|dev|co|ai|gov|edu|app)(?:\/[^\s"'<>]*)?)\b/i);
+  if (domain) return 'https://' + domain[1];
+  const m = s.match(/\b(?:go to|goto|visit|navigate to|then open|and open|open up)\s+"?([a-z][a-z0-9-]{1,30})"?/i);
+  if (m && SITE_ALIASES[m[1].toLowerCase()]) return SITE_ALIASES[m[1].toLowerCase()];
+  return null;
+}
+
+// Returns { appId, profile, url } or null. Pure — unit-tested.
+function detectLaunch(text) {
+  const s = String(text || '').trim();
+  if (!s) return null;
+  const explicit = LAUNCH_PREFIX_RX.test(s);
+  if (!explicit && !LAUNCH_VERB_RX.test(s)) return null;
+  // "open a new chrome TAB" is a browser op, not a launch — unless the user
+  // explicitly says window/app/program.
+  if (/\btab\b/i.test(s) && !/\b(window|app|program|application)\b/i.test(s)) return null;
+
+  let appId = null;
+  for (const [rx, id] of LAUNCH_ALIASES) if (rx.test(s)) { appId = id; break; }
+  if (!appId) return null;
+
+  // Profile: "with my Work profile", "using the Default profile" (SUFFIX form,
+  // tried first — it is unambiguous), else "profile Work" (PREFIX form, a single
+  // word only, so it cannot swallow a trailing "and go to …" clause).
+  const pm =
+    s.match(/\b(?:with|using|in)\s+(?:my\s+|the\s+)?"?([A-Za-z0-9][\w .-]{0,39}?)"?\s+profile\b/i) ||
+    s.match(/\bprofile\s+"?([A-Za-z0-9][\w.-]{0,39})"?/i);
+  let profile = pm ? pm[1].trim() : null;
+  if (profile && /^(and|then|go|to|the|a|an|open|it|please|now)$/i.test(profile)) profile = null;
+  // A destination only makes sense for a browser (Phase 4: launch + navigate).
+  const url = LAUNCH_BROWSERS.has(appId) ? detectLaunchUrl(s) : null;
+  return { appId, profile, url };
+}
+
+function launchLabel(appId, profile, url) {
+  const names = { chrome: 'Google Chrome', edge: 'Microsoft Edge', firefox: 'Firefox', vscode: 'VS Code', explorer: 'File Explorer', notepad: 'Text Editor', terminal: 'Terminal' };
+  let host = '';
+  if (url) { try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { host = url; } }
+  return `${names[appId] || appId}${profile ? ` (${profile} profile)` : ''}${host ? ` → ${host}` : ''}`;
+}
+
+
 async function proposeHostCommand(model, instruction, platform) {
   const sys =
     `Translate the request into ONE safe host command for a ${platform} machine, to be run WITHOUT a shell. `
@@ -1661,6 +1867,29 @@ app.post('/tasks/:id/host-result', async (req, res) => {
     $push: {
       chat: { role: 'assistant', text: text.slice(0, 8000), at: nowIso(), round: rn },
       events: { at: nowIso(), kind, msg: `Host: ${argvStr}`.slice(0, 200), round: rn, meta: hostMeta },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  res.json({ ok: true });
+});
+
+// The desktop reports back the outcome of a launch proposal (approved/denied/
+// error), recorded in the transcript. Success = "launch requested" — a detached
+// GUI app gives no exit code, so we never claim more than that.
+app.post('/tasks/:id/launch-result', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const b = req.body || {};
+  const label = String(b.label || b.appId || 'app').slice(0, 120);
+  let text, kind;
+  if (b.denied) { text = `🚫 Launch cancelled: ${label}`; kind = 'obs'; }
+  else if (b.error) { text = `❌ Could not launch ${label} — ${String(b.error).slice(0, 300)}`; kind = 'err'; }
+  else { text = `🚀 Launch requested: ${label}. (I can start it — I can't drive that window from here.)`; kind = 'ok'; }
+  const rn = task.round || 0;
+  await tasksColl().updateOne({ taskId: req.params.id }, {
+    $push: {
+      chat: { role: 'assistant', text, at: nowIso(), round: rn },
+      events: { at: nowIso(), kind, msg: `Launch: ${label}`.slice(0, 200), round: rn, meta: { launch: true, appId: String(b.appId || ''), denied: !!b.denied } },
     },
     $set: { updatedAt: nowIso() },
   });
@@ -1764,6 +1993,19 @@ app.post('/tasks/:id/synthesize', async (req, res) => {
   // ---- REDUCE: one call over the digests only ----
   const allowed = digests.map((d) => d.index);
   const allowedSet = new Set(allowed);
+  // Phase 3: research-style lessons ("read at least 5 sources", "be concise").
+  // Host-scoped ones don't fit a multi-site research answer; global + the
+  // research task-type + the synthesize tool do.
+  const synthLessons = await injectLessons({ taskType: 'research', tools: ['synthesize'] },
+    'USER PREFERENCES (learned from past feedback — follow these):');
+  const lessonBlock = synthLessons.block;
+  // Merge into this round's attribution set (the planner may have stamped it too).
+  if (synthLessons.ids.length) {
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $set: { 'pendingLesson.round': task.round || 0 },
+      $addToSet: { 'pendingLesson.lessonIds': { $each: synthLessons.ids } },
+    });
+  }
   let answer = '';
   try {
     answer = (await askChat(model, [
@@ -1771,7 +2013,8 @@ app.post('/tasks/:id/synthesize', async (req, res) => {
         'You write a clear, well-structured answer using ONLY the numbered SOURCES below. '
         + `Cite claims with the source number in square brackets. You may ONLY use these exact numbers: ${allowed.join(', ')}. `
         + 'NEVER cite any other number, and never invent facts or sources beyond those given. '
-        + 'If the sources disagree, say so. Answer the question directly first, then the supporting detail.' },
+        + 'If the sources disagree, say so. Answer the question directly first, then the supporting detail.'
+        + lessonBlock },
       { role: 'user', content:
         `QUESTION\n${question}\n\nSOURCES (cite only these numbers: ${allowed.join(', ')})\n`
         + digests.map((d) => `[${d.index}] ${d.title}\n${d.digest}`).join('\n\n') },
@@ -2186,6 +2429,224 @@ function isPublishControlLabel(label) {
   return s.length <= 15 && PUBLISH_WORD_RX.test(s);                        // "Share now", "Post it"
 }
 
+// ---- feedback learning, phase 1: capture + storage --------------------------
+// The user corrects the agent; the correction is stored WITH the round's context
+// so it can later become a proposal (Tier 1) or a scoped lesson (Tier 2). Phase 1
+// only CAPTURES — no behaviour change yet — so real examples accumulate before
+// the risky retrieval/injection work. See plans/not-started/feedback-learning.md.
+const feedbackColl = () => collFor('feedback');
+const lessonsColl = () => collFor('lessons'); // phase 3: scoped guidance
+const FEEDBACK_SCOPES = new Set(['host', 'skill', 'tool', 'task-type', 'global']);
+
+// Build a feedback doc from a request body + the task's round context. Shared by
+// the explicit 👎/👍 endpoint and the natural-language capture path (phase 4), so
+// both store the SAME round-scoped context that makes feedback actionable later.
+function buildFeedbackDoc(task, b) {
+  const kind = b.kind === 'up' ? 'up' : b.kind === 'down' ? 'down' : 'note';
+  const whatWrong = String(b.whatWrong || '').slice(0, 1000).trim();
+  const scopeType = FEEDBACK_SCOPES.has(b.scope?.type) ? b.scope.type : 'global';
+  const host = hostOfTask(task);
+  // Feedback is on a SPECIFIC round, not the whole session (user's point,
+  // 2026-07-20) — its instruction, its turns, its events.
+  const round = Number.isInteger(b.round) ? b.round : (task.round || 0);
+  const roundChat = (task.chat || []).filter((m) => (m.round || 0) === round);
+  const roundEvents = (task.events || []).filter((e) => (e.round || 0) === round);
+  const roundInstruction = roundChat.find((m) => m.role === 'user')?.text || (round === 0 ? task.goal : '');
+  return {
+    feedbackId: crypto.randomUUID(),
+    taskId: task.taskId,
+    round,
+    messageAt: b.messageAt ? String(b.messageAt) : null,
+    kind,
+    whatWrong,
+    whatExpected: String(b.whatExpected || '').slice(0, 1000).trim(),
+    scope: { type: scopeType, value: String(b.scope?.value || (scopeType === 'host' ? host : '')).slice(0, 120) },
+    context: {
+      goal: String(task.goal || '').slice(0, 500),
+      instruction: String(roundInstruction || '').slice(0, 500),
+      host,
+      plan: (task.plan?.phases || []).map((p) => p.tool),
+      messages: roundChat.slice(-6).map((m) => ({ role: m.role, text: String(m.text || '').slice(0, 300) })),
+      events: roundEvents.slice(-15).map((e) => ({ kind: e.kind, msg: String(e.msg || '').slice(0, 200) })),
+    },
+    status: 'open',
+    source: b.source || 'button',   // 'button' (👎/👍) | 'nl' (typed correction)
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+}
+
+// Store a feedback doc + add the round note. Returns the stored doc.
+async function recordFeedback(task, b) {
+  const feedback = buildFeedbackDoc(task, b);
+  await feedbackColl().insertOne({ ...feedback });
+  const noteMsg = feedback.kind === 'up' ? 'Marked this step as correct' : `Feedback noted: ${feedback.whatWrong.slice(0, 80)}`;
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: { events: { at: nowIso(), kind: 'obs', msg: noteMsg, round: task.round || 0 } },
+    $set: { updatedAt: nowIso() },
+  });
+  return feedback;
+}
+
+// Capture feedback on a round. The context (goal, the plan's tools, the last
+// events, what was clicked/typed) is what makes it actionable later — a bare
+// "that was wrong" with no context cannot be turned into a fix.
+app.post('/tasks/:id/feedback', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const b = req.body || {};
+  const kind = b.kind === 'up' ? 'up' : b.kind === 'down' ? 'down' : 'note';
+  if (kind !== 'up' && !String(b.whatWrong || '').trim()) {
+    return res.status(400).json({ ok: false, error: 'whatWrong is required' });
+  }
+  const feedback = await recordFeedback(task, b);
+  res.json({ ok: true, feedback });
+});
+
+// Review captured feedback (a page will list these). Filter by host or status.
+app.get('/feedback', async (req, res) => {
+  const q = {};
+  if (req.query.host) q['context.host'] = String(req.query.host);
+  if (req.query.status) q.status = String(req.query.status);
+  const items = await feedbackColl().find(q, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(200).toArray();
+  res.json({ ok: true, feedback: items });
+});
+
+app.delete('/feedback/:id', async (req, res) => {
+  await feedbackColl().deleteOne({ feedbackId: req.params.id });
+  res.json({ ok: true });
+});
+
+// Dismiss a feedback item without acting on it (review page). Kept separate from
+// delete so the record survives for effectiveness tracking later.
+app.post('/feedback/:id/dismiss', async (req, res) => {
+  const r = await feedbackColl().updateOne({ feedbackId: req.params.id },
+    { $set: { status: 'dismissed', updatedAt: nowIso() } });
+  if (!r.matchedCount) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true });
+});
+
+// ---- feedback learning, phase 2: correction → approval-gated proposal --------
+// The pure validation/proposal-building lives in ./feedback-triage.js so it can
+// be unit tested without a model or DB. Here we only gather the candidates,
+// run the model, and — if the triage is actionable — push a proposal onto the
+// task exactly as a live recovery would, so it waits for the same approval gate.
+
+// The skills/elements a correction on `host` could realistically point at.
+// Compact + capped: a 7B has a small budget, and the decision is about names,
+// not markup.
+async function feedbackCandidates(host) {
+  const h = String(host || '').replace(/^www\./, '');
+  if (!h) return { elements: [], skills: [] };
+  const elements = await elementsColl()
+    .find({ host: h }, { projection: { _id: 0, elementId: 1, name: 1, type: 1, route: 1, details: 1 } })
+    .limit(40).toArray();
+  const skills = await skillsColl()
+    .find({ $or: [{ host: h }, { urlPattern: new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }] },
+      { projection: { _id: 0, skillId: 1, name: 1, kind: 1, elements: 1 } })
+    .limit(20).toArray();
+  return { elements, skills };
+}
+
+// Turn one feedback item into an approval-gated proposal (or record that it maps
+// to nothing). Returns { status, ok, proposal?, error? } where status is an HTTP
+// hint. Shared by the /analyze endpoint and the NL capture path (phase 4).
+async function runFeedbackAnalysis(fb, requestedModel) {
+  if (fb.kind === 'up') return { status: 400, ok: false, error: 'likes have nothing to fix' };
+  const task = await tasksColl().findOne({ taskId: fb.taskId }, { projection: { round: 1, taskId: 1, model: 1 } });
+  if (!task) return { status: 404, ok: false, error: 'the task this feedback came from is gone' };
+  // Resolve 'auto'/empty to a real installed model, same as the planner does.
+  const requested = String(requestedModel || task.model || '').trim();
+  let model;
+  try { model = (await resolveModel(requested, fb.whatWrong || '')).name; } catch { model = requested; }
+  if (!model) return { status: 400, ok: false, error: 'no model to analyze with' };
+  // Candidates power the data-fix kinds; a `lesson` needs none, so we run the
+  // model even when the host has nothing learned yet.
+  const candidates = await feedbackCandidates(fb.context?.host || '');
+
+  let analysis;
+  try {
+    const messages = feedbackTriage.buildTriageMessages(fb, candidates);
+    analysis = JSON.parse(await askChat(model, messages, { format: feedbackTriage.TRIAGE_FORMAT }));
+  } catch (e) {
+    return { status: 502, ok: false, error: 'could not analyze (is the model running?): ' + (e.message || e) };
+  }
+
+  const built = feedbackTriage.proposalFromAnalysis(analysis, candidates, fb);
+  if (built.error) {
+    await feedbackColl().updateOne({ feedbackId: fb.feedbackId },
+      { $set: { status: 'triaged', analysis: { kind: analysis.kind || 'none', error: built.error }, updatedAt: nowIso() } });
+    return { status: 200, ok: false, error: built.error, analysis: { kind: analysis.kind || 'none' } };
+  }
+
+  // Attach the proposal to the feedback's own task, so it surfaces in that
+  // session's transcript and rides the existing approval → applyProposal path.
+  const proposal = { proposalId: crypto.randomUUID(), status: 'pending', at: nowIso(), source: 'feedback', ...built.proposal };
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: {
+      proposals: proposal,
+      events: { at: nowIso(), kind: 'think', round: task.round || 0, msg: `From your feedback: ${proposal.summary} (waiting for your approval)`, meta: { proposal: proposal.kind } },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  await feedbackColl().updateOne({ feedbackId: fb.feedbackId },
+    { $set: { status: 'triaged', proposalId: proposal.proposalId, analysis: { kind: analysis.kind }, updatedAt: nowIso() } });
+  return { status: 200, ok: true, proposal };
+}
+
+app.post('/feedback/:id/analyze', async (req, res) => {
+  const fb = await feedbackColl().findOne({ feedbackId: req.params.id }, { projection: { _id: 0 } });
+  if (!fb) return res.status(404).json({ ok: false, error: 'not found' });
+  const r = await runFeedbackAnalysis(fb, req.body?.model);
+  const { status, ...body } = r;
+  res.status(status).json(body);
+});
+
+// Load the lessons matching `ctx` and return { block, ids }: the prompt block
+// ('' if none) and the ids injected (so the round's outcome can be attributed to
+// them — phase 4). Bumps each lesson's injectedCount. Shared by the planner and
+// synthesize sites — never throws (a lesson lookup must not break planning).
+async function injectLessons(ctx, heading) {
+  try {
+    const all = await lessonsColl()
+      .find({ active: { $ne: false } }, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 }).limit(200).toArray();
+    const picked = lessons.selectLessons(all, ctx);
+    if (!picked.length) return { block: '', ids: [] };
+    const ids = picked.map((l) => l.lessonId);
+    lessonsColl().updateMany({ lessonId: { $in: ids } },
+      { $inc: { injectedCount: 1 }, $set: { lastInjectedAt: nowIso() } }).catch(() => {});
+    return { block: '\n\n' + lessons.formatLessons(picked, heading), ids };
+  } catch { return { block: '', ids: [] }; }
+}
+
+// Credit/debit the lessons injected during a round once it reaches a terminal
+// state — the only cheap way to spot a lesson that HURTS. 'done' → success,
+// 'error' → failure; 'stopped' is the user, not the lesson, so it counts as
+// neither. Cleared after so a repeated terminal PATCH cannot double-count.
+async function attributeLessonOutcome(task) {
+  const a = lessons.attributionFor(task);
+  if (!a) return;
+  if (a.field) {
+    await lessonsColl().updateMany({ lessonId: { $in: a.lessonIds } },
+      { $inc: { [a.field]: 1 }, $set: { updatedAt: nowIso() } });
+  }
+  await tasksColl().updateOne({ taskId: task.taskId }, { $unset: { pendingLesson: '' } });
+}
+
+// Review/manage learned lessons (a page will list these).
+app.get('/lessons', async (req, res) => {
+  const q = {};
+  if (req.query.host) q['scope.value'] = String(req.query.host).replace(/^www\./, '');
+  if (req.query.active === '1') q.active = { $ne: false };
+  const items = await lessonsColl().find(q, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(200).toArray();
+  res.json({ ok: true, lessons: items });
+});
+
+app.delete('/lessons/:id', async (req, res) => {
+  await lessonsColl().deleteOne({ lessonId: req.params.id });
+  res.json({ ok: true });
+});
+
 // ---- agent-proposed changes to its own elements / skills ----
 // The agent may PROPOSE creating, repointing or deleting the knowledge it runs
 // on, but never writes it. Every proposal waits for explicit approval — this is
@@ -2193,7 +2654,7 @@ function isPublishControlLabel(label) {
 // out a task the user asked for.
 // Non-blocking by design: the task keeps running; the proposal sits in the
 // transcript until it is answered.
-const PROPOSAL_KINDS = new Set(['element.create', 'element.repoint', 'skill.update', 'skill.delete']);
+const PROPOSAL_KINDS = new Set(['element.create', 'element.repoint', 'skill.update', 'skill.delete', 'lesson.create']);
 
 app.post('/tasks/:id/propose', async (req, res) => {
   const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1, taskId: 1 } });
@@ -2309,6 +2770,30 @@ async function applyProposal(p) {
     return { ok: true, summary: `deleted skill "${d.name || d.skillId}"` };
   }
 
+  if (p.kind === 'lesson.create') {
+    const text = String(d.text || '').trim();
+    if (!text) return { ok: false, error: 'lesson text required' };
+    const scope = {
+      type: lessons.LESSON_SCOPES.has(d.scope?.type) ? d.scope.type : 'global',
+      value: String(d.scope?.value || '').replace(/^www\./, '').slice(0, 120),
+    };
+    // Supersede (not accumulate) near-duplicate active lessons in the same scope.
+    const sameScope = await lessonsColl()
+      .find({ 'scope.type': scope.type, 'scope.value': scope.value, active: { $ne: false } }).toArray();
+    const dead = lessons.supersededIds(sameScope, { text });
+    if (dead.length) await lessonsColl().updateMany({ lessonId: { $in: dead } },
+      { $set: { active: false, supersededAt: nowIso(), updatedAt: nowIso() } });
+    const lesson = {
+      lessonId: crypto.randomUUID(),
+      text: text.slice(0, 300), scope, source: 'feedback',
+      active: true, supersedes: dead, injectedCount: 0,
+      createdAt: nowIso(), updatedAt: nowIso(),
+    };
+    await lessonsColl().insertOne(lesson);
+    const where = scope.type === 'global' ? 'everywhere' : (scope.value || scope.type);
+    return { ok: true, summary: `learned a lesson for ${where}${dead.length ? ` (replaced ${dead.length})` : ''}` };
+  }
+
   return { ok: false, error: 'unknown proposal kind' };
 }
 
@@ -2400,6 +2885,22 @@ async function runChatTurn(task, message, platform, imageIds = []) {
     return { body: { ok: true, mode: 'host', proposal } };
   }
 
+  // Launch an installed app from a follow-up ("open chrome", "launch vscode").
+  // Propose only — the desktop confirms + runs. Checked before browser routing
+  // so "open chrome" is not planned as a navigate.
+  const launchReq = detectLaunch(message);
+  if (launchReq) {
+    const label = launchLabel(launchReq.appId, launchReq.profile, launchReq.url);
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: `🚀 Ready to launch **${label}**. Approve to open it.`, at: nowIso(), round },
+        events: { at: nowIso(), kind: 'think', msg: `Proposed launch: ${label}.`, round },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'launch', proposal: { appId: launchReq.appId, profile: launchReq.profile || '', url: launchReq.url || '', label, title: label } } };
+  }
+
   // Images attached to this turn → answer with a vision model. This runs before
   // routing: the answer is in the picture, not in session data or on the web.
   if (imageIds.length) {
@@ -2463,6 +2964,27 @@ async function runChatTurn(task, message, platform, imageIds = []) {
       $set: { updatedAt: nowIso() },
     });
     return { body: { ok: true, mode: 'introspect', reply } };
+  }
+
+  // Phase 4 — a typed correction ("no, that was wrong — you should have used my
+  // skill"). Captured as feedback on the PREVIOUS round and turned into a fix
+  // proposal, instead of being planned as a new browser task (which on a posting
+  // task would post again). Strict detector + a guard that the previous round
+  // actually did something, so an off-hand "that's not right" mid-chat is safe.
+  const prevRound = round - 1;
+  const prevRoundRan = (task.events || []).some((e) => (e.round || 0) === prevRound);
+  if (prevRoundRan && feedbackTriage.isCorrectionMessage(message)) {
+    const fb = await recordFeedback(task, { kind: 'down', round: prevRound, whatWrong: message, source: 'nl', scope: { type: 'host' } });
+    let reply = "Got it — I've noted that as feedback on the previous step.";
+    try {
+      const r = await runFeedbackAnalysis(fb, task.model);
+      if (r.ok && r.proposal) reply += ` I've suggested a fix to review: ${r.proposal.summary}`;
+    } catch { /* analysis is best-effort; the feedback is already stored */ }
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: { chat: { role: 'assistant', text: reply, at: nowIso(), round } },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'feedback', reply } };
   }
 
   const mode = await routeChat(task, message);
@@ -2706,6 +3228,17 @@ app.post('/tasks/:id/plan', async (req, res) => {
   if (task.useSkills && task.useSkills.length) {
     sysExtra += '\n\nThe user ATTACHED these skills to this task — prefer them: ' +
       task.useSkills.map((s) => `"${s.name}" (${s.kind === 'collection' ? 'collect_by_skill' : (s.steps && s.steps.length > 1 ? 'run_skill workflow' : 'use_skill ' + (s.action || ''))})`).join(', ') + '.';
+  }
+  // Phase 3: scoped lessons the user taught through past feedback. Host-scoped +
+  // global load here (the plan isn't built yet, so task-type/tool scopes match at
+  // most weakly); capped hard by selectLessons so a 7B's budget is protected.
+  const planLessons = await injectLessons({ host: hostOfTask(task) });
+  sysExtra += planLessons.block;
+  // Phase 4: remember which lessons shaped THIS round, to attribute its outcome
+  // when it finishes (see attributeLessonOutcome in the terminal PATCH hook).
+  if (planLessons.ids.length) {
+    await tasksColl().updateOne({ taskId: task.taskId },
+      { $set: { pendingLesson: { round: task.round || 0, lessonIds: planLessons.ids } } });
   }
   const sessionContext = task.currentInstruction
     ? [

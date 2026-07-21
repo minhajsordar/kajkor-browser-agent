@@ -3,3 +3,5 @@
 - It should be able to create, edit, and delete its elements, skills which are saved in database. but before it create, edit, delete it should ask my approval. 
 
 - Selecting elements and teaching skills become nightmare, because if the page is designed with react i see selector get confused because it may not hold the correct unique selector. so what we can do is i will give full instruction in skill like "navigate to facebook and then find a element which includes text "What's on your mind" then it will open a popup form then find contenteditable="true" div element, then put the post text there. then find "Next" button with only "Next" Text inside. then it will navigate to next "Post settings" step, in that step find "Post" button with only "Post" text. then click on it to publish post. after post is done wait for 3 seconds and then clise the tab. "
+
+- 
