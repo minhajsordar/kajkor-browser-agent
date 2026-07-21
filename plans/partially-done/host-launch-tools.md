@@ -112,7 +112,10 @@ on purpose. Options, in the open questions below. The floor, non-negotiable:
    that clicked blindly in the wrong window and failed with "Receiving end does
    not exist". Now `runChatTurn` detects a launch-status question inside a launch
    session — `sessionHasLaunch` + `isLaunchStatusQuestion` — and answers the
-   limitation directly instead of browser-planning it.)*
+   limitation directly instead of browser-planning it. A "how many tabs are
+   open?" question (`isTabQuestion`) IS answerable, though — it runs a
+   deterministic `list_tabs` round (chrome.tabs.query in the extension's own
+   Chrome) and lists the tabs rather than refusing.)*
 3. **Windows app resolution.** `start` vs direct exe vs `App Paths` registry key.
    Chrome specifically must be the real exe for `--profile-directory`.
 4. **This adds a second executor of planner phases** (desktop app), alongside the

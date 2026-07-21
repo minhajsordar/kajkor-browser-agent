@@ -1853,6 +1853,17 @@ function isLaunchStatusQuestion(text) {
   return asking && about;
 }
 
+// "how many tabs are open?", "list my tabs", "what tabs are open" — answerable by
+// the extension's list_tabs (chrome.tabs.query in its own Chrome; no content
+// script, so it avoids the 'Receiving end does not exist' failure). Distinct from
+// a launch-status question, and NOT an imperative like "open a new tab".
+function isTabQuestion(text) {
+  const s = String(text || '').toLowerCase();
+  if (!/\btabs?\b/.test(s)) return false;
+  return /\b(how many|how much|number of|count of|list|what|which)\b[^.?!]*\btabs?\b/.test(s)
+    || /\btabs?\b[^.?!]*\b(open|opened|running)\b/.test(s);
+}
+
 // The most recent thing this session launched, for the honest reply. Strips the
 // "Launch: " / "App-launch session: " prefix and any trailing period.
 function lastLaunchLabel(task) {
@@ -3060,6 +3071,27 @@ async function runChatTurn(task, message, platform, imageIds = []) {
       $set: { updatedAt: nowIso() },
     });
     return { body: { ok: true, mode: 'feedback', reply } };
+  }
+
+  // "How many tabs are open?" — the extension CAN answer this via list_tabs
+  // (chrome.tabs.query in its own Chrome; no content script, so no "Receiving
+  // end" failure). Run a deterministic single-phase list_tabs round rather than
+  // the canned launch-status answer or a guessed browser plan. metric:'actions'
+  // completes after one pass (executeLoop never repeats it). Checked BEFORE the
+  // launch-status branch so "is chrome open, how many tabs?" lists tabs.
+  if (isTabQuestion(message)) {
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $set: {
+        currentInstruction: message,
+        plan: { target: { metric: 'actions', count: 1 }, phases: [{ tool: 'list_tabs', params: {} }] },
+        status: 'running', currentPhaseIndex: 0, repeats: 0, scanY: 0, pendingQuestion: null, updatedAt: nowIso(),
+      },
+      $push: {
+        chat: { role: 'assistant', text: '🔎 Checking your open Chrome tabs…', at: nowIso(), round },
+        events: { at: nowIso(), kind: 'act', msg: 'Listing open tabs (list_tabs).', round },
+      },
+    });
+    return { body: { ok: true, mode: 'browse' } };
   }
 
   // "Did it open?" after a launch. A launch is fire-and-forget — the app starts

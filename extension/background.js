@@ -549,7 +549,13 @@ async function runTool(base, taskId, phase) {
     const list = tabs
       .filter((t) => !/^(chrome|edge|about|devtools):/i.test(t.url || ''))
       .map((t) => `- ${(t.title || '(untitled)').slice(0, 70)} — ${(t.url || '').slice(0, 120)}`);
-    await taskEvent(base, taskId, 'obs', `${list.length} tab(s) open:\n${list.join('\n')}`.slice(0, 4000));
+    // Post as a CHAT answer (5th arg), not just a flow event: "how many tabs?" is
+    // a question, and the tab list IS the reply. Note it's the tabs of the Chrome
+    // this extension runs in — a separately-launched profile isn't visible here.
+    const summary = list.length
+      ? `Chrome has ${list.length} tab(s) open:\n${list.join('\n')}`
+      : 'I don\'t see any ordinary tabs open in the Chrome I\'m connected to (only internal pages, or a separately-launched profile I can\'t see).';
+    await taskEvent(base, taskId, 'obs', summary.slice(0, 4000), true);
     return;
   }
 

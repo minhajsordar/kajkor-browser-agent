@@ -110,6 +110,28 @@ per app). Verified: 9-case :4010 run (persist / default profile / explicit wins 
 vscode+notepad refused on new session AND follow-up / empty=unrestricted). Live UI
 unverified. Approval-behaviour tie-in stays out of scope.
 
+### 2026-07-21 — "How many tabs are open?" answered via list_tabs (not the canned refusal)
+Follow-up to the launch-status fix below: that fix was TOO broad — it swallowed
+"is chrome open, how many tab open?" with the "can't verify a detached launch"
+answer, but the tab-count half IS answerable. `list_tabs` uses
+`chrome.tabs.query({})` in the extension's OWN Chrome — no content script, so it
+avoids the "Receiving end does not exist" failure that a guessed click hit.
+- `isTabQuestion(message)` (server.js) — mentions "tab(s)" + a count/list/what/…
+  intent, and NOT an imperative ("open a new tab"). Checked in `runChatTurn`
+  BEFORE the launch-status branch, so "is chrome open, how many tabs?" lists tabs.
+- On a match, `runChatTurn` sets a DETERMINISTIC plan
+  `{ target:{metric:'actions',count:1}, phases:[{tool:'list_tabs'}] }` and
+  `status:'running'` — the extension runs a pre-set plan directly (`runAgentTask`:
+  plan present + status running → straight to `executeLoop`, no LLM planning), and
+  `metric:'actions'` makes `executeLoop` complete after one pass (never repeats).
+- `list_tabs` (background.js) now posts its result as a CHAT answer (taskEvent's
+  5th `chat` arg), so the tab list IS the reply — with an honest caveat that it's
+  the tabs of the Chrome the extension runs in, not a separately-launched profile.
+- **Needs an extension reload** (background.js changed) + backend restart.
+- Pure "is it open?" (no "tab") still gets the honest launch-status answer.
+- Verified: 9-case :4010 run (tab-Q → list_tabs plan/running/actions; "list my
+  tabs" too; "is it open?" → canned answer, no plan; "open a new tab" not hijacked).
+
 ### 2026-07-21 — "Did it open?" after a launch answers honestly; edit project settings mid-session
 Two follow-ups from a real launch session (`708f95ab`, "open chrome with minhaj
 profile"): asking **"check is it opened or not?"** got planned as a browser
