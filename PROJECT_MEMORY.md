@@ -109,13 +109,16 @@ exist"*.
   of the still-deferred "drive a launched profile" hard part — we answer the
   limitation rather than pretend. Also fixed stale "Approve to open it" chat copy
   (launches auto-run now) → "🚀 Launching X…".
-- **Project settings are editable from an active session,** not just the
-  new-conversation composer. The header gains a "Project" (tune) button when the
-  session has a `project.projectId`; it opens `ProjectSettingsDialog` for that
-  session's project, resolved with its settings via `projects.getProject(id)` (the
-  task only snapshots `{projectId,name,dir}`, so the full doc is fetched). Before
-  this, the only way to reach project settings was the project menu on the empty
-  composer — unreachable once you were chatting.
+- **Project settings are editable from each sidebar folder.** Every project group
+  header in `SessionList.vue` gets a hover-revealed **tune** button (and a
+  "Project settings" context-menu item) that opens `ProjectSettingsDialog` for
+  that project, resolved with its settings via `projects.getProject(name→id)`.
+  **Placement note (user's call, from a screenshot):** first tried a "Project"
+  button in the CHAT HEADER — the user X'd it: *"I was expecting project setting
+  icon with each folder instead of in header."* So the header button was removed;
+  the per-folder icon is the entry point (the sidebar is visible in both the empty
+  and active states, so it covers the "can't reach settings mid-chat" gap too).
+  The empty-composer project-menu "Project settings" item stays as-is.
 
 ### 2026-07-21 — App launches no longer confirm ("i already told it to open")
 The "Launch this app?" card was removed. A launch proposal is ONLY ever created

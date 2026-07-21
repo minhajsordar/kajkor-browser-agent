@@ -72,6 +72,21 @@
           <div class="col ellipsis text-body2 text-weight-medium">
             {{ g.name === null ? 'No project' : g.name }}
           </div>
+          <!-- Per-folder project settings (model / skills / prompt / schemas).
+               Shown for a backend-backed project; reveals on hover like the
+               conversation menu. -->
+          <q-btn
+            v-if="g.name !== null && projectOf(g.name)?.projectId"
+            dense
+            flat
+            round
+            size="9px"
+            icon="tune"
+            class="group-menu text-grey-7"
+            @click.stop="openProjectSettings(g.name)"
+          >
+            <q-tooltip>Project settings</q-tooltip>
+          </q-btn>
           <q-icon
             :name="collapsed.has(g.key) ? 'chevron_right' : 'expand_more'"
             size="16px"
@@ -79,6 +94,9 @@
           />
           <q-menu context-menu v-if="g.name !== null">
             <q-list dense style="min-width: 170px">
+              <q-item v-if="projectOf(g.name)?.projectId" clickable v-close-popup @click="openProjectSettings(g.name)">
+                <q-item-section>Project settings</q-item-section>
+              </q-item>
               <q-item clickable v-close-popup @click="projects.setCurrent(g.name)">
                 <q-item-section>Use for new conversation</q-item-section>
               </q-item>
@@ -151,6 +169,7 @@
     </q-list>
 
     <CreateProjectDialog v-model="createOpen" />
+    <ProjectSettingsDialog v-model="settingsOpen" :project="settingsProject" />
 
     <!-- Rename a conversation -->
     <q-dialog v-model="renameOpen" @hide="renameTarget = null">
@@ -225,12 +244,27 @@ import { useQuasar } from 'quasar'
 import { useSessionsStore } from '@/stores/sessions'
 import { useProjectsStore } from '@/stores/projects'
 import CreateProjectDialog from '@/components/CreateProjectDialog.vue'
+import ProjectSettingsDialog from '@/components/ProjectSettingsDialog.vue'
 
 const $q = useQuasar()
 const store = useSessionsStore()
 const projects = useProjectsStore()
 
 const createOpen = ref(false)
+
+// Edit a project's default settings straight from its sidebar folder. The store
+// list carries settings; getProject fetches them if this folder came from a task
+// snapshot ({projectId,name,dir}) rather than the loaded project list.
+const settingsOpen = ref(false)
+const settingsProject = ref(null)
+function projectOf(name) {
+  return projects.projects.find((p) => p.name === name) || null
+}
+async function openProjectSettings(name) {
+  const p = projectOf(name)
+  settingsProject.value = p && p.settings ? p : (p?.projectId ? await projects.getProject(p.projectId) : p)
+  settingsOpen.value = true
+}
 const historyOpen = ref(false)
 const historyFilter = ref('')
 const filterEmpty = ref(false)
@@ -400,6 +434,17 @@ function ago(iso) {
    the sidebar and reintroduce the sideways scroll. */
 .group-head > .col {
   min-width: 0;
+}
+/* Quiet until you hover the folder (or focus its menu), like the conversation
+   row's overflow button — the folder row stays clean otherwise. */
+.group-menu {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.group-head:hover .group-menu,
+.group-menu:focus-within {
+  opacity: 1;
 }
 .sess {
   padding: 5px 4px 5px 30px;
