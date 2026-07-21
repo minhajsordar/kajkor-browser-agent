@@ -140,6 +140,12 @@ avoids the "Receiving end does not exist" failure that a guessed click hit.
 - `isTabQuestion(message)` (server.js) — mentions "tab(s)" + a count/list/what/…
   intent, and NOT an imperative ("open a new tab"). Checked in `runChatTurn`
   BEFORE the launch-status branch, so "is chrome open, how many tabs?" lists tabs.
+  **Also checked in `POST /tasks`** (added after the user opened a FRESH
+  conversation with that goal and the planner guessed `click "New Tab"` and
+  failed): an opening tab-question goal creates the SAME running `list_tabs` plan
+  at round 0 instead of being browser-planned. The routing must live at BOTH entry
+  points — runChatTurn only sees follow-ups. (`detectLaunch` returns null for a
+  tab question — it drops anything with "tab" — so the launch branch never eats it.)
 - On a match, `runChatTurn` sets a DETERMINISTIC plan
   `{ target:{metric:'actions',count:1}, phases:[{tool:'list_tabs'}] }` and
   `status:'running'` — the extension runs a pre-set plan directly (`runAgentTask`:

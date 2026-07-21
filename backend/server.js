@@ -1280,6 +1280,29 @@ app.post('/tasks', async (req, res) => {
     return res.json({ ok: true, task: base, mode: 'launch', proposal: { appId: launchReq.appId, profile: launchReq.profile || '', url: launchReq.url || '', label, title: label } });
   }
 
+  // "How many tabs are open?" as the OPENING goal — answer with list_tabs, same
+  // as the follow-up path in runChatTurn. Without this, a fresh conversation goes
+  // to the planner, which guesses a browser task ("click New Tab") that fails.
+  // (detectLaunch already returned null above: it drops anything mentioning "tab".)
+  if (isTabQuestion(goal)) {
+    const task = {
+      taskId: crypto.randomUUID(),
+      goal: String(goal), model: effModel, mode: 'once', project: taskProject,
+      schemas: [], useSkills: [], systemPrompt: null,
+      status: 'running',
+      plan: { target: { metric: 'actions', count: 1 }, phases: [{ tool: 'list_tabs', params: {} }], quiet: true },
+      currentPhaseIndex: 0,
+      collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+      repeats: 0, maxRepeats: 3, messages: [],
+      chat: [{ role: 'assistant', text: '🔎 Checking your open Chrome tabs…', at: nowIso(), round: 0 }],
+      queue: [], sessionSummary: '', currentInstruction: null, round: 0,
+      events: [{ at: nowIso(), kind: 'act', msg: 'Listing open tabs (list_tabs).', round: 0 }],
+      errors: [], createdAt: nowIso(), updatedAt: nowIso(),
+    };
+    await tasksColl().insertOne({ ...task });
+    return res.json({ ok: true, task, mode: 'browse' });
+  }
+
   // A question ABOUT the agent's own skills/elements is not a browser task.
   // Answer it from the database in an idle session — planning it sent the agent
   // to Facebook to RUN the very skill the user was only asking about.
