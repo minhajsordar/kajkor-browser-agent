@@ -12,10 +12,12 @@ history and reasoning behind them — the "why" and the "what's already there".
 ## Capabilities
 
 ### 2026-07-21 — Desktop UI finish: project inheritance UX, saved-prompt picker, Feedback page
-Three code-buildable remainders from the partially-done plans (runtime checks in
-the Electron app are still the only thing left on each — no vue-tsc is configured
-for the renderer, so these are manual-review only). All renderer-side; NO backend
-change (every endpoint already existed).
+Three code-buildable remainders from the partially-done plans (live GUI
+click-through in the Electron app is the only thing left on each). All
+renderer-side; NO backend change (every endpoint already existed).
+**Compile-verified:** `electron-vite build` transforms all 279 renderer modules
+clean, so the Vue is sound — but there is no vue-tsc/eslint-vue here, and a build
+does not exercise runtime behaviour, so the actual click-through is still human.
 - **Composer inheritance UX** (`plans/.../project-settings.md` phase 3): a caption
   under the new-session composer (`ChatThread.vue` `projectHint`) reads "Model &
   skills from project X" when the composer matches the project's defaults, or

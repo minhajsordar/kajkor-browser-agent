@@ -148,8 +148,10 @@ identically — not in the desktop store, where only one client benefits.
   `store.model`/`store.newSessionSkillIds` against `projects.current.settings`;
   Reset re-runs `projects.applySettings`. Only shown for a backend-backed project
   that sets a model or skills (no noise for "No Project" or an empty project).
-- **Left:** runtime verification in the Electron app (all renderer changes are
-  JS/Vue — no vue-tsc configured, so unvalidated here beyond manual review).
+- **Left:** live GUI click-through in the Electron app. Compilation IS verified —
+  `electron-vite build` compiles all 279 renderer modules clean (2026-07-21), so
+  the Vue templates/scripts are sound; only the runtime behaviour (does the hint
+  toggle, does the picker save) needs a human at the app.
 
 **Known caveat:** `applySettings` writes the GLOBAL model picker, so selecting a
 project changes the app's current model; switching to "No Project" leaves it on
