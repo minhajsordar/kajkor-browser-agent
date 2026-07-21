@@ -202,11 +202,10 @@
               >
                 <q-tooltip>Something wrong in this step? Tell the agent</q-tooltip>
               </q-btn>
-              <!-- Regenerate: re-run the last round in place. Only on the last
-                   round, and only when it did NOT act (re-running a post/click
-                   would repeat it). -->
+              <!-- Regenerate: re-run the last round in place — any round,
+                   including the initial task (round 0) and rounds that acted. -->
               <q-btn
-                v-if="ri === rounds.length - 1 && !r.acted && r.replies.length"
+                v-if="ri === rounds.length - 1"
                 dense
                 flat
                 round
@@ -750,18 +749,7 @@ function finalizeRounds(out, t, isLast) {
     r.duration = Math.max(0, (r.running ? Date.now() : Math.max(evEnd, repEnd)) - start)
     r.failed = last && t.status === 'error'
     r.chips = chipsFor(r)
-    r.acted = roundActed(r.events)
   })
-}
-
-// Did this round fire side effects (click/type/post/launch/host)? Such a round
-// must NOT show Regenerate — re-running would repeat the action. Mirrors the
-// backend's roundActed + executeLoop's SIDE_EFFECT set.
-const SIDE_EFFECT_RE = /Phase \d+\/\d+: (click|type|press_key|generate_text|use_skill|run_skill|ask_user)/i
-const PROPOSAL_RE = /proposed launch|app-launch session|proposed host command/i
-function roundActed(events) {
-  return (events || []).some((e) =>
-    e.meta?.launch || e.meta?.host || SIDE_EFFECT_RE.test(e.msg || '') || PROPOSAL_RE.test(e.msg || ''))
 }
 
 // Outcome chips — prefer structured event `meta` (Phase 2, exact); fall back to

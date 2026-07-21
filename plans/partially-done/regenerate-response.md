@@ -15,12 +15,19 @@ last response re-runs that round.
 1. **Replace in place.** Regenerate removes the last round's response (and its
    activity) and re-runs the same instruction as the SAME round — not a second
    attempt appended below.
-2. **Answers only — never a round that acted.** A round that fired side effects
-   (click / type / post / use_skill / launch / host command) must NOT be
-   re-runnable: re-running would repeat the action (double-post). The button is
-   hidden on such rounds, AND the backend refuses them (defense in depth).
-   Read-only rounds (a chat answer, a launch-status answer, a tab list, a
-   read-only research round) are regenerable — repeating them is harmless.
+2. **EVERYTHING is regenerable (revised 2026-07-21).** Originally "answers only"
+   (no round that acted), to avoid a re-post. The user reversed it — *"Everything
+   can rerun/regenerate. I need this feature."* — so the button shows on every
+   last round and the backend re-runs it regardless of side effects. A regenerate
+   click is an explicit "do it again"; if the round posted, re-running may post
+   again, which is the user's intent. (The double-post guards elsewhere protect
+   AUTOMATIC retries — this is a deliberate manual action.) The old `roundActed`
+   gate was removed from both the endpoint and the UI.
+3. **Round 0 (the whole task) regenerates too.** The original bug: a stopped/failed
+   initial task showed "nothing to regenerate" because the endpoint required
+   `round≥1`. Round 0's instruction is the GOAL; regenerating it restarts the task
+   (clears collected data + counters) and re-runs the goal through the same
+   routing (re-plans a browse task, re-answers an answer, re-launches, …).
 
 ## Approach
 
@@ -53,17 +60,18 @@ when the round is the last one, has a reply, is not running, and did NOT act.
   is stamped with its round (round 0 = the goal, never regenerated). Rewinding
   `round` to `R-1` lets `runChatTurn` rebuild round R with its own logic.
 
-## Built (2026-07-21)
+## Built (2026-07-21, revised)
 
-- Backend `POST /tasks/:id/regenerate` (server.js): 409 if busy, 400 if `round<1`
-  or the round acted (`roundActed` — meta.launch/host, side-effect phases, launch/
-  host proposals) or no user message; else `$pull` round R, rewind `round`, re-run
-  `runChatTurn`.
-- `sessions.regenerate()` + a refresh icon on the last round in `ChatThread.vue`,
-  shown only when `!r.acted && r.replies.length` (rounds carry `r.acted` via the
-  same `roundActed`).
-- Verified: 10-case :4010 run — replace-in-place (round stays, one user + one
-  assistant), round 0 preserved, acted launch round refused, round-0-only refused.
+- Backend `POST /tasks/:id/regenerate` (server.js): 409 if busy, else re-run the
+  last round. Instruction = `task.goal` for round 0, else the round's user message.
+  `$pull` round R (turns + events), rewind `round` to R-1 (so round 0 → -1, which
+  makes `runChatTurn` rebuild round 0), clear plan state; round 0 also wipes
+  collected/counters (full restart). No side-effect gate — every round regenerates.
+- `sessions.regenerate()` + a refresh icon on the LAST round in `ChatThread.vue`
+  (no `acted` condition).
+- Verified: 9-case :4010 run — round 0 re-runs (the reported bug), replace-in-place
+  keeps one user + one assistant, round stays N, an acted (launch) round now
+  regenerates instead of being refused.
 
 ## Left
 

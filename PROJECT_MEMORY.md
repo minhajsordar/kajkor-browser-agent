@@ -110,24 +110,26 @@ per app). Verified: 9-case :4010 run (persist / default profile / explicit wins 
 vscode+notepad refused on new session AND follow-up / empty=unrestricted). Live UI
 unverified. Approval-behaviour tie-in stays out of scope.
 
-### 2026-07-21 — Regenerate the last response (replace in place; answers only)
+### 2026-07-21 — Regenerate the last response (replace in place; EVERYTHING regenerable)
 Plan: `plans/partially-done/regenerate-response.md`. A refresh icon on the last
-round re-runs its instruction. User's decisions: **replace in place** (not a second
-attempt), and **answers only** — a round that acted must never re-run (double-post).
-- `POST /tasks/:id/regenerate` (server.js): `$pull` the whole round R (its user +
-  assistant turns + events), rewind `task.round` to R-1, clear plan state, and call
-  the existing `runChatTurn` — which rebuilds round R through the SAME routing (so
-  a tab question becomes a `list_tabs` round, an answer re-answers). 409 if busy;
-  400 if `round<1`, no user message, or `roundActed`.
-- `roundActed(events)` (server + `ChatThread.vue`, mirrored): a round acted if any
-  event has `meta.launch`/`meta.host`, a side-effect phase (`Phase n/m:
-  click|type|press_key|generate_text|use_skill|run_skill|ask_user` — executeLoop's
-  SIDE_EFFECT set), or a launch/host PROPOSAL (`proposed launch|app-launch
-  session|proposed host command` — the executed marker may not be back yet).
-- Desktop: `sessions.regenerate()` + a refresh icon next to 👍/👎, shown only on the
-  LAST round when `!r.acted && r.replies.length` (rounds carry `r.acted`).
-- Verified: 10-case :4010 run (replace-in-place keeps round N with one user + one
-  assistant; round 0 preserved; acted launch round refused; round-0-only refused).
+round re-runs its instruction in place. **User's decisions (revised same day):**
+replace in place, and **everything is regenerable** — the first cut was "answers
+only" (no acted round) but the user reversed it: *"Everything can rerun/regenerate.
+I need this feature."* A regenerate click is an explicit manual "do it again"; the
+double-post guards elsewhere are about AUTOMATIC retries, not this.
+- `POST /tasks/:id/regenerate` (server.js): 409 if busy. Instruction = `task.goal`
+  for round 0, else the round's user message. `$pull` round R (turns + events),
+  rewind `task.round` to R-1 (round 0 → -1, so `runChatTurn` rebuilds round 0),
+  clear plan state; round 0 ALSO wipes collected/counters (full task restart). Then
+  call `runChatTurn`, which rebuilds the round through the SAME routing (browse
+  re-plans, answer re-answers, launch re-launches, tab-Q → list_tabs). NO
+  side-effect gate — `roundActed` was removed from server + `ChatThread.vue`.
+- **The round-0 bug** it fixes: a stopped/failed initial task showed "nothing to
+  regenerate" because the endpoint required `round≥1`. Round 0 = the goal.
+- Desktop: `sessions.regenerate()` + a refresh icon next to 👍/👎, shown on the LAST
+  round unconditionally.
+- Verified: 9-case :4010 run (round 0 re-runs; replace-in-place keeps one user +
+  one assistant at round N; an acted launch round now regenerates, not refused).
 
 ### 2026-07-21 — "How many tabs are open?" answered via list_tabs (not the canned refusal)
 Follow-up to the launch-status fix below: that fix was TOO broad — it swallowed
