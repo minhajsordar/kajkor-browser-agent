@@ -1121,6 +1121,14 @@ function cleanProjectSettings(s) {
   if (Array.isArray(o.schemaIds)) out.schemaIds = o.schemaIds.map(String).slice(0, 50);
   // The project's own "dynamic" system prompt — free text applied to its tasks.
   if (typeof o.systemPrompt === 'string') out.systemPrompt = o.systemPrompt.slice(0, 8000);
+  // Project-scoped launchable apps (Phase 4): [{ appId, profile }]. appId must be
+  // a known launchable app; profile is a free string (a Chrome profile NAME).
+  if (Array.isArray(o.launchApps)) {
+    out.launchApps = o.launchApps
+      .filter((a) => a && typeof a === 'object' && LAUNCH_APP_IDS.has(String(a.appId || '').toLowerCase()))
+      .slice(0, 20)
+      .map((a) => ({ appId: String(a.appId).toLowerCase(), profile: String(a.profile || '').slice(0, 60) }));
+  }
   return out;
 }
 
@@ -1248,8 +1256,13 @@ app.post('/tasks', async (req, res) => {
   // vscode"): an idle session + a launch proposal the desktop app confirms and
   // runs via its host launcher. Never browser-planned — "open chrome" is not a
   // navigate. The desktop validates the appId against its own registry.
-  const launchReq = detectLaunch(goal);
-  if (launchReq) {
+  const launchReq0 = detectLaunch(goal);
+  if (launchReq0) {
+    // Phase 4: scope to the project's launchable apps (allowlist + default
+    // profile). Empty/absent list = unrestricted.
+    const scoped = scopeLaunchToProject(launchReq0, ps.launchApps);
+    if (scoped.error) return res.json({ ok: false, error: scoped.error });
+    const launchReq = scoped.launch;
     const label = launchLabel(launchReq.appId, launchReq.profile, launchReq.url);
     const base = {
       taskId: crypto.randomUUID(),
@@ -1749,6 +1762,25 @@ const LAUNCH_ALIASES = [
 ];
 
 const LAUNCH_BROWSERS = new Set(['chrome', 'edge', 'firefox']);
+// Known launchable appIds (mirrors the desktop registry) — used to validate a
+// project's launchApps allowlist.
+const LAUNCH_APP_IDS = new Set(['chrome', 'edge', 'firefox', 'vscode', 'explorer', 'notepad', 'terminal']);
+
+// Apply a project's launchApps scope to a detected launch (Phase 4).
+// Empty/absent list = no restriction (the "empty = all" convention). Otherwise
+// the appId must be listed (ALLOWLIST), and a browser launched with no named
+// profile inherits the list entry's profile (DEFAULT PROFILE — an explicit
+// profile in the message still wins because launchReq.profile is set already).
+function scopeLaunchToProject(launchReq, launchApps) {
+  const list = Array.isArray(launchApps) ? launchApps : [];
+  if (!list.length) return { launch: launchReq };
+  const entry = list.find((a) => a && a.appId === launchReq.appId);
+  if (!entry) {
+    return { error: `${launchLabel(launchReq.appId)} isn't in this project's launchable apps. Add it in the project's settings (the tune icon on the folder) to open it here.` };
+  }
+  const profile = launchReq.profile || entry.profile || null;
+  return { launch: { ...launchReq, profile } };
+}
 // A few common site words → URL, so "open chrome and go to gmail" navigates.
 // Deliberately small; anything with a real domain is handled generically.
 const SITE_ALIASES = {
@@ -2915,8 +2947,24 @@ async function runChatTurn(task, message, platform, imageIds = []) {
   // Launch an installed app from a follow-up ("open chrome", "launch vscode").
   // Propose only — the desktop confirms + runs. Checked before browser routing
   // so "open chrome" is not planned as a navigate.
-  const launchReq = detectLaunch(message);
-  if (launchReq) {
+  const launchReq0 = detectLaunch(message);
+  if (launchReq0) {
+    // Phase 4: scope to the session's project launchable apps. The task only
+    // snapshots {projectId,name,dir}, so fetch the project's settings.
+    let projLaunchApps = [];
+    if (task.project?.projectId) {
+      const proj = await projectsColl().findOne({ projectId: task.project.projectId }, { projection: { 'settings.launchApps': 1 } });
+      projLaunchApps = proj?.settings?.launchApps || [];
+    }
+    const scoped = scopeLaunchToProject(launchReq0, projLaunchApps);
+    if (scoped.error) {
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: { chat: { role: 'assistant', text: `🚫 ${scoped.error}`, at: nowIso(), round } },
+        $set: { updatedAt: nowIso() },
+      });
+      return { body: { ok: true, mode: 'answer', reply: scoped.error } };
+    }
+    const launchReq = scoped.launch;
     const label = launchLabel(launchReq.appId, launchReq.profile, launchReq.url);
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $push: {

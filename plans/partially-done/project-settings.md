@@ -107,8 +107,58 @@ identically — not in the desktop store, where only one client benefits.
    **← DONE (2026-07-21: dialog now also picks a SAVED prompt `promptId`).**
 3. Composer shows inherited-vs-overridden; per-session override.
    **← DONE (2026-07-21, code): a hint under the new-session composer.**
-4. Tie-ins (later): project-scoped host-launch apps [[host-launch-tools]],
-   approval behaviour.
+4. **Project-scoped launchable apps** [[host-launch-tools]] — **DONE (2026-07-21):
+   backend verified (9-case :4010 run), renderer compiles clean, live UI
+   unverified.** Decided with the user: **default profile + allowlist**,
+   Chrome-only for now (other apps later). Approval behaviour stays out of scope.
+
+## Phase 4 — project-scoped launchable apps (design, 2026-07-21)
+
+**Why:** the user works in one project against one Chrome profile ("minhaj"), and
+having to name the profile every time ("open chrome with my minhaj profile") is
+friction. A project should carry its apps + profile.
+
+**Decision (user):** *Default profile + allowlist.* When a project lists apps:
+- `open chrome` with no profile → uses the project's configured profile.
+- an explicit profile in the message still wins.
+- only the project's listed apps may launch; anything else is refused with a
+  pointer to Project settings.
+- an **empty** list = no restriction (any known app, no profile default) — the
+  same "empty = all" convention as skills.
+
+**Data:** new project setting `launchApps: [{ appId, profile }]` (e.g.
+`[{ appId:'chrome', profile:'minhaj' }]`). Whitelisted in `cleanProjectSettings`,
+`appId` validated against a backend `LAUNCH_APP_IDS` set (chrome/edge/firefox/
+vscode/explorer/notepad/terminal), profile a free string (the desktop resolves a
+NAME→Chrome dir at launch, as it already does).
+
+**Backend:** `scopeLaunchToProject(launchReq, launchApps)` → `{launch}` or
+`{error}`. Applied at BOTH launch entry points:
+- `POST /tasks` launch branch — `ps.launchApps` (settings already in scope).
+- `runChatTurn` launch branch — fetch the project by `task.project.projectId`
+  (the task snapshots only `{projectId,name,dir}`, so settings are looked up).
+A refusal posts an assistant message instead of a launch proposal.
+
+**Desktop:** a "Launchable apps" section in `ProjectSettingsDialog.vue` — add an
+app (Chrome only in the picker for now, extensible) + a profile chosen from
+`window.api.launch.profiles()`, list current entries with remove; `launchApps`
+rides the existing `PATCH /projects/:id`. Hidden when there's no launch bridge
+(non-desktop). The GLOBAL Settings "Launchable apps" pane stays — it's the
+OS/registry level; the project list is an additional per-project scope.
+
+**Hard part:** the backend needs project settings at launch time. For a NEW
+session it has `proj` already; for a follow-up it must fetch by projectId. Kept a
+single `scopeLaunchToProject` so both paths behave identically.
+
+**Built (2026-07-21):** `scopeLaunchToProject` + `LAUNCH_APP_IDS`, `launchApps`
+whitelisted in `cleanProjectSettings`, applied at both launch branches (POST
+/tasks uses `ps.launchApps`; `runChatTurn` fetches the project by projectId).
+Dialog "Launchable apps" section (Chrome + a profile from
+`window.api.launch.profiles()`, add/remove, one entry per app). Verified by
+scratch `proj-launch-scope-test.js`: launchApps persist, default profile applied,
+explicit profile wins, vscode/notepad refused (new session AND follow-up), empty
+list = unrestricted. 9/9; docs cleaned up, instance shut down.
+**Left:** live UI (add an app in the dialog, then "open chrome" in that project).
 
 ## Build progress
 

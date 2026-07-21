@@ -94,6 +94,22 @@ link can expose the next. Read the whole event log before concluding the model
 "stopped following commands" — here the model planned fine; the deterministic
 rewrite mangled the query.
 
+### 2026-07-21 — Project-scoped launchable apps (project-settings phase 4)
+A project can carry `settings.launchApps: [{appId, profile}]` (Chrome-only in the
+UI for now; other apps later). User's decision: **default profile + allowlist**.
+`scopeLaunchToProject(launchReq, launchApps)` (server.js): empty/absent list = no
+restriction (the "empty = all" convention); otherwise the appId must be listed
+(ALLOWLIST → refusal message if not) and a browser with no named profile inherits
+the entry's profile (DEFAULT PROFILE; an explicit profile in the message still
+wins). Applied at BOTH launch branches — `POST /tasks` uses the already-fetched
+`ps.launchApps`; `runChatTurn` fetches the project by `task.project.projectId`
+(the task snapshots only `{projectId,name,dir}`). `launchApps` whitelisted in
+`cleanProjectSettings`, appId validated against `LAUNCH_APP_IDS`. Dialog gains a
+"Launchable apps" section (profiles from `window.api.launch.profiles()`, one entry
+per app). Verified: 9-case :4010 run (persist / default profile / explicit wins /
+vscode+notepad refused on new session AND follow-up / empty=unrestricted). Live UI
+unverified. Approval-behaviour tie-in stays out of scope.
+
 ### 2026-07-21 — "Did it open?" after a launch answers honestly; edit project settings mid-session
 Two follow-ups from a real launch session (`708f95ab`, "open chrome with minhaj
 profile"): asking **"check is it opened or not?"** got planned as a browser
