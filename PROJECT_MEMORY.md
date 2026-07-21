@@ -845,6 +845,14 @@ map-reduce summarization and `[n]` citations; sources hidden behind
 
 ## Gotchas
 
+- **`desktop-app/` source is tracked directly in THIS repo** (like `backend/` and
+  `extension/`). It used to be a dangling gitlink submodule — no `.gitmodules`,
+  the pointer object wasn't even present — so from 2026-07-18 to 2026-07-21 the
+  entire Electron/Vue source was silently UNtracked (`git add -A` in the root
+  skipped it as a submodule boundary; committing lost every desktop change). Fixed
+  2026-07-21 with `git rm --cached desktop-app` then `git add desktop-app/`. If a
+  future `git status` ever shows `desktop-app` as one gitlink entry again, the
+  submodule state has come back — don't commit until it's re-flattened.
 - **The backend does not hot-reload.** Editing `server.js` changes nothing
   until the :34730 process is restarted. When a task behaves like old code,
   compare `server.js` mtime against the process start time before debugging:
