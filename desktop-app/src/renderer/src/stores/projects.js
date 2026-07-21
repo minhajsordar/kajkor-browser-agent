@@ -119,6 +119,22 @@ export const useProjectsStore = defineStore('projects', () => {
     }
   }
 
+  // Resolve a project (WITH its settings) by id — from the loaded list, or by
+  // fetching it. A task carries only {projectId, name, dir}, so editing an active
+  // session's project needs the full doc looked up here.
+  async function getProject(projectId) {
+    if (!projectId) return null
+    const local = projects.value.find((p) => p.projectId === projectId)
+    if (local && local.settings) return local
+    try {
+      const { data } = await api.get(`/projects/${projectId}`)
+      if (!data.project) return local || null
+      return { projectId: data.project.projectId, name: data.project.name, dir: data.project.dir || '', settings: data.project.settings || {} }
+    } catch {
+      return local || null
+    }
+  }
+
   async function remove(name) {
     const p = projects.value.find((x) => x.name === name)
     projects.value = projects.value.filter((x) => x.name !== name)
@@ -143,6 +159,6 @@ export const useProjectsStore = defineStore('projects', () => {
 
   return {
     projects, currentName, current, loaded,
-    loadProjects, applySettings, setCurrent, pickFolder, addFolder, updateSettings, remove, ensure,
+    loadProjects, applySettings, setCurrent, pickFolder, addFolder, updateSettings, getProject, remove, ensure,
   }
 })

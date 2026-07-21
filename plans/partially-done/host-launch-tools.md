@@ -108,6 +108,11 @@ on purpose. Options, in the open questions below. The floor, non-negotiable:
    is launch; browsing that window is a separate, unsolved step. Say so plainly.
 2. **"Successful launch" is ambiguous.** Detached spawn returns instantly; we
    cannot know the app truly opened. Report "launch requested", not "opened".
+   *(2026-07-21: a follow-up "did it open?" used to be planned as a browser task
+   that clicked blindly in the wrong window and failed with "Receiving end does
+   not exist". Now `runChatTurn` detects a launch-status question inside a launch
+   session — `sessionHasLaunch` + `isLaunchStatusQuestion` — and answers the
+   limitation directly instead of browser-planning it.)*
 3. **Windows app resolution.** `start` vs direct exe vs `App Paths` registry key.
    Chrome specifically must be the real exe for `--profile-directory`.
 4. **This adds a second executor of planner phases** (desktop app), alongside the

@@ -148,6 +148,16 @@ identically — not in the desktop store, where only one client benefits.
   `store.model`/`store.newSessionSkillIds` against `projects.current.settings`;
   Reset re-runs `projects.applySettings`. Only shown for a backend-backed project
   that sets a model or skills (no noise for "No Project" or an empty project).
+- **Editable mid-session (2026-07-21):** project settings were only reachable from
+  the project menu on the new-conversation composer — unreachable once you were in
+  a session. The active-session header now has a "Project" (tune) button (shown
+  when the session has a `project.projectId`) that opens `ProjectSettingsDialog`
+  for that session's project, resolved via `projects.getProject(id)` (the task
+  snapshots only `{projectId,name,dir}`, so the settings are fetched).
+- **Backend inheritance re-proven (2026-07-21):** a 10-case :4010 integration run
+  (scratch `proj-settings-test.js`) confirms explicit model > project default,
+  inline `systemPrompt` materialises, saved `promptId` > inline, skills/schemas
+  inherit, and no-model+no-project → 400. Docs cleaned up; instance shut down.
 - **Left:** live GUI click-through in the Electron app. Compilation IS verified —
   `electron-vite build` compiles all 279 renderer modules clean (2026-07-21), so
   the Vue templates/scripts are sound; only the runtime behaviour (does the hint

@@ -29,7 +29,7 @@
                 v-if="projects.current?.projectId"
                 clickable
                 v-close-popup
-                @click="settingsOpen = true"
+                @click="openProjectSettings(projects.current)"
               >
                 <q-item-section avatar><q-icon name="tune" size="16px" /></q-item-section>
                 <q-item-section>Project settings</q-item-section>
@@ -105,7 +105,7 @@
       <div v-if="store.notice" class="text-caption text-negative q-mt-sm">{{ store.notice }}</div>
     </div>
     <CreateProjectDialog v-model="createOpen" />
-    <ProjectSettingsDialog v-model="settingsOpen" :project="projects.current" />
+    <ProjectSettingsDialog v-model="settingsOpen" :project="settingsProject" />
   </div>
 
   <!-- Active session.
@@ -114,6 +114,7 @@
        than the window. -->
   <div v-else class="col column full-height thread-pane">
     <FeedbackDialog v-model="feedbackOpen" :round="feedbackRound" :message-at="feedbackMessageAt" />
+    <ProjectSettingsDialog v-model="settingsOpen" :project="settingsProject" />
     <!-- header -->
     <div class="row items-center q-px-md q-py-sm thread-head">
       <!-- min-width:0 is load-bearing: `.ellipsis` is white-space:nowrap, and a
@@ -134,6 +135,18 @@
           <span v-if="current?.sessionSummary" class="q-ml-sm">· compacted</span>
         </div>
       </div>
+      <q-btn
+        v-if="current?.project?.projectId"
+        dense
+        flat
+        no-caps
+        icon="tune"
+        label="Project"
+        class="text-grey-7"
+        @click="openProjectSettings(current.project)"
+      >
+        <q-tooltip>Edit this project's settings</q-tooltip>
+      </q-btn>
       <q-btn
         dense
         flat
@@ -485,6 +498,15 @@ const draft = ref('')
 const scrollArea = ref(null)
 const createOpen = ref(false)
 const settingsOpen = ref(false)
+// The project whose settings the dialog edits. For the new-session composer it's
+// the selected project; from an active session it's that session's project,
+// resolved (with its settings) by id since the task only snapshots {projectId,
+// name, dir}.
+const settingsProject = ref(null)
+async function openProjectSettings(p) {
+  settingsProject.value = p && p.settings ? p : (p?.projectId ? await projects.getProject(p.projectId) : p)
+  settingsOpen.value = true
+}
 const feedbackOpen = ref(false)
 const feedbackRound = ref(0)
 const feedbackMessageAt = ref(null)

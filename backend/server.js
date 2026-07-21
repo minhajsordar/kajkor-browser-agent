@@ -1258,7 +1258,7 @@ app.post('/tasks', async (req, res) => {
       status: 'done', plan: null, currentPhaseIndex: 0,
       collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
       repeats: 0, maxRepeats: 3, messages: [],
-      chat: [{ role: 'assistant', text: `🚀 Ready to launch **${label}**. Approve to open it.`, at: nowIso(), round: 0 }],
+      chat: [{ role: 'assistant', text: `🚀 Launching **${label}**…`, at: nowIso(), round: 0 }],
       queue: [], sessionSummary: '', currentInstruction: null, round: 0,
       events: [{ at: nowIso(), kind: 'think', msg: `App-launch session: ${label}.`, round: 0 }],
       errors: [], createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
@@ -1802,6 +1802,33 @@ function launchLabel(appId, profile, url) {
   let host = '';
   if (url) { try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { host = url; } }
   return `${names[appId] || appId}${profile ? ` (${profile} profile)` : ''}${host ? ` → ${host}` : ''}`;
+}
+
+// This session started (or has since performed) an app launch. Used to answer a
+// "did it open?" follow-up honestly rather than plan a doomed browser task.
+function sessionHasLaunch(task) {
+  return (task.events || []).some((e) =>
+    e.meta?.launch === true || /(app-launch session|proposed launch|^launch:)/i.test(e.msg || ''));
+}
+
+// A "did the app I launched open / is it running?" question. Deliberately narrow
+// AND only consulted inside a launch session (sessionHasLaunch), so a real browse
+// follow-up ("is the page loaded?") does not match.
+function isLaunchStatusQuestion(text) {
+  const s = String(text || '').toLowerCase().trim();
+  const asking = /\b(is|are|did|has|have|was|does|do|check|confirm)\b/.test(s) || s.endsWith('?');
+  const about = /\b(open(ed|ing)?|launch(ed|ing)?|start(ed|ing)?|run(ning)?|work(ing|ed|s)?|show(ed|ing|n)?\s*up)\b/.test(s);
+  return asking && about;
+}
+
+// The most recent thing this session launched, for the honest reply. Strips the
+// "Launch: " / "App-launch session: " prefix and any trailing period.
+function lastLaunchLabel(task) {
+  const evs = (task.events || []).filter((e) =>
+    e.meta?.launch === true || /(app-launch session|proposed launch|^launch):?/i.test(e.msg || ''));
+  const e = evs[evs.length - 1];
+  const m = e && /(?:app-launch session|proposed launch|launch)\s*:?\s*(.+)$/i.exec(e.msg || '');
+  return (m && m[1] ? m[1] : '').replace(/\.\s*$/, '').trim() || 'the app';
 }
 
 
@@ -2893,7 +2920,7 @@ async function runChatTurn(task, message, platform, imageIds = []) {
     const label = launchLabel(launchReq.appId, launchReq.profile, launchReq.url);
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $push: {
-        chat: { role: 'assistant', text: `🚀 Ready to launch **${label}**. Approve to open it.`, at: nowIso(), round },
+        chat: { role: 'assistant', text: `🚀 Launching **${label}**…`, at: nowIso(), round },
         events: { at: nowIso(), kind: 'think', msg: `Proposed launch: ${label}.`, round },
       },
       $set: { updatedAt: nowIso() },
@@ -2985,6 +3012,27 @@ async function runChatTurn(task, message, platform, imageIds = []) {
       $set: { updatedAt: nowIso() },
     });
     return { body: { ok: true, mode: 'feedback', reply } };
+  }
+
+  // "Did it open?" after a launch. A launch is fire-and-forget — the app starts
+  // in a detached window we don't control, and the extension isn't present in a
+  // freshly-launched Chrome profile — so this CANNOT be verified, and must not be
+  // planned as a browser task (which clicks blindly in the wrong window: the real
+  // failure that motivated this — "element 'Minhaj' not found / Receiving end
+  // does not exist"). Answer honestly instead.
+  if (sessionHasLaunch(task) && isLaunchStatusQuestion(message)) {
+    const label = lastLaunchLabel(task);
+    const reply = `I launched **${label}** on your machine, but I can't confirm from here whether the window actually opened. `
+      + `I start apps in a detached process I don't keep a handle on, and I can't see into a freshly-launched Chrome profile — `
+      + `so please check your screen. (Reading or driving a launched profile window isn't something I can do yet.)`;
+    await tasksColl().updateOne({ taskId: task.taskId }, {
+      $push: {
+        chat: { role: 'assistant', text: reply, at: nowIso(), round },
+        events: { at: nowIso(), kind: 'obs', msg: 'Launch-status question — answered directly (a detached launch cannot be verified).', round },
+      },
+      $set: { updatedAt: nowIso() },
+    });
+    return { body: { ok: true, mode: 'answer', reply } };
   }
 
   const mode = await routeChat(task, message);

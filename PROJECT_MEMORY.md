@@ -94,6 +94,29 @@ link can expose the next. Read the whole event log before concluding the model
 "stopped following commands" — here the model planned fine; the deterministic
 rewrite mangled the query.
 
+### 2026-07-21 — "Did it open?" after a launch answers honestly; edit project settings mid-session
+Two follow-ups from a real launch session (`708f95ab`, "open chrome with minhaj
+profile"): asking **"check is it opened or not?"** got planned as a browser
+`click` for element "Minhaj", which the extension couldn't even reach (the freshly
+launched profile has no extension) → 15s of retries then *"Receiving end does not
+exist"*.
+- **Launch-status questions now answer directly.** `runChatTurn` (before
+  `routeChat`) checks `sessionHasLaunch(task) && isLaunchStatusQuestion(message)`
+  and replies that a detached launch can't be verified from here — instead of
+  planning a doomed browser task. `isLaunchStatusQuestion` is narrow (asking-word +
+  open/launch/run/work word) and only consulted INSIDE a launch session, so a real
+  browse follow-up ("is the page loaded?") doesn't match. This is the browser-side
+  of the still-deferred "drive a launched profile" hard part — we answer the
+  limitation rather than pretend. Also fixed stale "Approve to open it" chat copy
+  (launches auto-run now) → "🚀 Launching X…".
+- **Project settings are editable from an active session,** not just the
+  new-conversation composer. The header gains a "Project" (tune) button when the
+  session has a `project.projectId`; it opens `ProjectSettingsDialog` for that
+  session's project, resolved with its settings via `projects.getProject(id)` (the
+  task only snapshots `{projectId,name,dir}`, so the full doc is fetched). Before
+  this, the only way to reach project settings was the project menu on the empty
+  composer — unreachable once you were chatting.
+
 ### 2026-07-21 — App launches no longer confirm ("i already told it to open")
 The "Launch this app?" card was removed. A launch proposal is ONLY ever created
 from the user's own explicit instruction (`detectLaunch` parses their message), so
