@@ -1,0 +1,3 @@
+provider: generic
+url: https://easypos.softrking.com/desktop/
+updaterCacheDirName: imployee.app-updater
