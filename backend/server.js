@@ -3115,7 +3115,10 @@ async function runChatTurn(task, message, platform, imageIds = []) {
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $set: {
         currentInstruction: message,
-        plan: { target: { metric: 'actions', count: 1 }, phases: [{ tool: 'list_tabs', params: {} }] },
+        // `quiet`: list_tabs posts the tab list itself as the chat answer, so the
+        // generic "Task complete" line should NOT also post to chat (executeLoop
+        // reads this) — otherwise the completion noise buries the answer.
+        plan: { target: { metric: 'actions', count: 1 }, phases: [{ tool: 'list_tabs', params: {} }], quiet: true },
         status: 'running', currentPhaseIndex: 0, repeats: 0, scanY: 0, pendingQuestion: null, updatedAt: nowIso(),
       },
       $push: {

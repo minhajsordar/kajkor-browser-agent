@@ -1151,7 +1151,9 @@ async function executeLoop(base, taskId) {
       const why = have >= count ? `${have}/${count} ${metric}`
         : acted && metric !== 'actions' ? `all ${task.plan.phases.length} phases ran (${have}/${count} ${metric}; not repeating — the plan already acted on a page)`
         : `all ${task.plan.phases.length} phases ran`;
-      await taskEvent(base, taskId, 'ok', `Task complete: ${why}.`, true);
+      // A "quiet" plan (e.g. a list_tabs answer) posts its OWN chat reply, so the
+      // generic completion goes to the flow only — otherwise it buries the answer.
+      await taskEvent(base, taskId, 'ok', `Task complete: ${why}.`, !task.plan.quiet);
       return;
     }
 

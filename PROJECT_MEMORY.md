@@ -148,7 +148,18 @@ avoids the "Receiving end does not exist" failure that a guessed click hit.
 - `list_tabs` (background.js) now posts its result as a CHAT answer (taskEvent's
   5th `chat` arg), so the tab list IS the reply — with an honest caveat that it's
   the tabs of the Chrome the extension runs in, not a separately-launched profile.
+- **The `quiet` plan flag** (added after the user saw "Task complete: all 1 phases
+  ran" show as the chat instead of the answer): the backend stamps
+  `plan.quiet = true` on the list_tabs round, and `executeLoop` then posts its
+  generic "Task complete" line to the FLOW only (`chat = !task.plan.quiet`), not as
+  a chat bubble — so list_tabs's own answer is the visible reply. Reusable for any
+  future single-shot info plan that speaks for itself.
 - **Needs an extension reload** (background.js changed) + backend restart.
+- **Two environmental limits that are NOT bugs:** (a) list_tabs sees only the
+  extension's OWN Chrome — a separately-launched profile shows as its own tabs
+  (e.g. "1 untitled tab"), the same reason a launch can't be verified; (b) latency
+  is the extension's 30s poll, and UNBOUNDED if the extension's Chrome is
+  closed/asleep (a 7-min gap was observed when only the launched window was open).
 - Pure "is it open?" (no "tab") still gets the honest launch-status answer.
 - Verified: 9-case :4010 run (tab-Q → list_tabs plan/running/actions; "list my
   tabs" too; "is it open?" → canned answer, no plan; "open a new tab" not hijacked).
