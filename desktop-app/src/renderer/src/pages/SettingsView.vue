@@ -103,9 +103,9 @@
       <q-card-section>
         <div class="text-subtitle1">Launchable apps</div>
         <div class="text-caption text-grey">
-          Apps the agent may open (e.g. "open chrome with my Work profile"). The
-          first launch of each app asks you to confirm; toggle one here to always
-          allow it without a prompt.
+          Apps the agent may open (e.g. "open chrome with my Work profile"). A
+          launch you ask for runs without a prompt — only these known apps can be
+          started. Toggle one to keep it pre-approved.
         </div>
       </q-card-section>
       <q-card-section>

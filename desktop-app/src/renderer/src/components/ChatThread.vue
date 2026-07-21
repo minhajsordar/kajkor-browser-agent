@@ -327,23 +327,8 @@
       </q-card-actions>
     </q-card>
 
-    <!-- pending app-launch proposal -->
-    <q-card v-if="store.pendingLaunch" flat bordered class="q-ma-sm host-card">
-      <q-card-section class="q-pb-none">
-        <div class="text-caption text-weight-medium row items-center">
-          <q-icon name="rocket_launch" size="16px" class="q-mr-xs" />
-          Launch this app?
-        </div>
-        <pre class="cmd">{{ store.pendingLaunch.label }}</pre>
-        <div class="text-caption text-grey q-mb-xs">
-          Opens the app on your machine. I can start it, but I can't control that window from here.
-        </div>
-      </q-card-section>
-      <q-card-actions align="right">
-        <q-btn flat dense no-caps label="Cancel" color="negative" @click="store.denyLaunch()" />
-        <q-btn unelevated dense no-caps color="primary" label="Launch" @click="store.runLaunch()" />
-      </q-card-actions>
-    </q-card>
+    <!-- App launches run immediately (the instruction already asked for it); the
+         outcome shows in the transcript, so there is no confirmation card. -->
 
     <!-- pending confirmation -->
     <q-banner v-if="pendingQuestion" dense class="bg-amber-2 q-ma-sm rounded-borders">

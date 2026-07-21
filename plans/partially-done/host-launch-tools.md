@@ -181,10 +181,19 @@ on purpose. Options, in the open questions below. The floor, non-negotiable:
 
 ## Decisions (user, 2026-07-20)
 
-1. **Gate = allowlist + confirm-first-time.** Only apps on a user-managed launch
-   list may start. The first launch of a given app asks to confirm and offers
-   "always allow this app"; remembered apps launch without a prompt afterwards.
-   A destructive launch (installer/script) always confirms regardless.
+1. **Gate = the known-app registry; NO per-launch confirmation** (revised
+   2026-07-21). Originally "allowlist + confirm-first-time": the first launch of
+   an app showed a "Launch this app?" card. The user removed that —
+   *"i already told it to open"* — because a launch proposal is only ever created
+   from the user's OWN explicit instruction (`detectLaunch` parses their message),
+   so the card re-asked something they had just asked for. Now an asked-for launch
+   runs immediately (`sessions.runLaunch` is called directly from
+   `createSession`/`sendChat`, passing `approved:true`); the outcome shows in the
+   transcript. The real safety boundary remains the **registry** — only known apps
+   (chrome, edge, firefox, vscode, explorer/finder, notepad, terminal…) can start,
+   never an arbitrary path. The main-process `needsConfirm` gate and the Settings
+   "always allow" list are now vestigial (the renderer always approves) but left
+   in place; the confirmation card was removed from `ChatThread.vue`.
 2. **Curated registry**, not arbitrary exe paths. The model may only pick an
    `appId` from a known registry (chrome, edge, firefox, vscode, explorer/finder,
    notepad, terminal…), which the user extends in Settings. Never a raw path

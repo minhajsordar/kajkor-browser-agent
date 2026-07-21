@@ -158,7 +158,10 @@ export const useSessionsStore = defineStore('sessions', () => {
         if (!data.proposal.cwd && workDir.value) data.proposal.cwd = workDir.value
         pendingHost.value = data.proposal
       } else if (data.mode === 'launch' && data.proposal) {
-        pendingLaunch.value = data.proposal
+        // The user's own message asked to open this app, so there is nothing to
+        // re-confirm — launch it straight away (still gated to the known-app
+        // registry in the main process). The result lands in the transcript.
+        await runLaunch(data.proposal)
       } else if (!data.ok) notice.value = data.error || 'Could not create session.'
     } catch {
       notice.value = 'Backend not reachable.'
@@ -206,7 +209,8 @@ export const useSessionsStore = defineStore('sessions', () => {
         if (!data.proposal.cwd && workDir.value) data.proposal.cwd = workDir.value
         pendingHost.value = data.proposal
       } else if (data.mode === 'launch' && data.proposal) {
-        pendingLaunch.value = data.proposal
+        // Asked-for launch → run it, no confirmation (see createSession).
+        await runLaunch(data.proposal)
       } else if (!data.ok) notice.value = data.error || 'Message failed.'
       await refreshCurrent()
     } catch {
@@ -266,11 +270,13 @@ export const useSessionsStore = defineStore('sessions', () => {
     }
   }
 
-  // Approve a pending app-launch proposal: launch via the Electron main process
-  // (never the backend). Resolves a profile display name ("Work") to its Chrome
-  // directory first, then records the outcome in the transcript.
-  async function runLaunch() {
-    const p = pendingLaunch.value
+  // Run an app-launch via the Electron main process (never the backend).
+  // Resolves a profile display name ("Work") to its Chrome directory first, then
+  // records the outcome in the transcript. Takes the proposal directly (the
+  // instruction already authorised it — no confirmation card); falls back to
+  // `pendingLaunch` for any legacy caller.
+  async function runLaunch(proposal = null) {
+    const p = proposal || pendingLaunch.value
     if (!p) return
     pendingLaunch.value = null
     const appId = String(p.appId || '')

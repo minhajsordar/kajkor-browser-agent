@@ -94,6 +94,19 @@ link can expose the next. Read the whole event log before concluding the model
 "stopped following commands" — here the model planned fine; the deterministic
 rewrite mangled the query.
 
+### 2026-07-21 — App launches no longer confirm ("i already told it to open")
+The "Launch this app?" card was removed. A launch proposal is ONLY ever created
+from the user's own explicit instruction (`detectLaunch` parses their message), so
+the card re-asked something they'd just asked for. Now `sessions.runLaunch(proposal)`
+is called straight from `createSession`/`sendChat` (mode `launch`), passing
+`approved:true`; the outcome lands in the transcript instead of a card. Reverses
+the 2026-07-20 "confirm-first-time" decision. **The safety boundary is unchanged:**
+the main-process `launchApp` is still gated by `isKnownApp` (the curated registry —
+chrome/edge/firefox/vscode/explorer/notepad/terminal…), never an arbitrary path
+from the model. The `needsConfirm` gate + Settings "always allow" list are now
+vestigial (renderer always approves) but left in place; Settings copy updated so it
+no longer claims a first-launch prompt.
+
 ### 2026-07-20 — Host-launch tools (open Chrome/apps) — phase 1 built
 Plan: `plans/partially-done/host-launch-tools.md`. The agent should open Chrome
 (by profile) and installed apps. **Critical split:** the extension runs INSIDE
