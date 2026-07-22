@@ -1890,10 +1890,13 @@ function isTabQuestion(text) {
 // The most recent thing this session launched, for the honest reply. Strips the
 // "Launch: " / "App-launch session: " prefix and any trailing period.
 function lastLaunchLabel(task) {
+  // Require the "keyword: label" colon so this does NOT match the launch-status
+  // OBS event ("…launch-status question…") — that produced a garbled label
+  // ("-status question — answered directly…") on a re-run.
   const evs = (task.events || []).filter((e) =>
-    e.meta?.launch === true || /(app-launch session|proposed launch|^launch):?/i.test(e.msg || ''));
+    e.meta?.launch === true || /(app-launch session|proposed launch|^launch):\s/i.test(e.msg || ''));
   const e = evs[evs.length - 1];
-  const m = e && /(?:app-launch session|proposed launch|launch)\s*:?\s*(.+)$/i.exec(e.msg || '');
+  const m = e && /(?:app-launch session|proposed launch|launch):\s*(.+)$/i.exec(e.msg || '');
   return (m && m[1] ? m[1] : '').replace(/\.\s*$/, '').trim() || 'the app';
 }
 
@@ -3166,7 +3169,7 @@ async function runChatTurn(task, message, platform, imageIds = []) {
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $push: {
         chat: { role: 'assistant', text: reply, at: nowIso(), round },
-        events: { at: nowIso(), kind: 'obs', msg: 'Launch-status question — answered directly (a detached launch cannot be verified).', round },
+        events: { at: nowIso(), kind: 'obs', msg: 'Answered a launch-status question directly (a detached launch cannot be verified).', round },
       },
       $set: { updatedAt: nowIso() },
     });
