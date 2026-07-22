@@ -350,33 +350,22 @@ export const useSessionsStore = defineStore('sessions', () => {
     }
   }
 
-  // Re-run the last round in place. The backend re-runs the instruction through
-  // the same routing, so the response can be a launch/host proposal — handle those
-  // exactly like a normal turn (auto-run a launch, surface a host proposal), or the
-  // re-run silently does nothing for a launch/host round.
+  // Run again = re-send the last round's instruction as a NEW turn — exactly like
+  // re-typing it (the user's choice: a fresh response appears below, and launch/
+  // host/browse are handled identically because it goes through sendChat). Round
+  // 0's instruction is the goal; a later round's is its user message.
   async function regenerate() {
-    if (!selectedId.value) return false
-    sending.value = true
-    notice.value = ''
-    try {
-      const platform = (await window.api?.host?.platform?.()) || undefined
-      const { data } = await api.post(`/tasks/${selectedId.value}/regenerate`, { platform })
-      if (data.mode === 'host' && data.proposal) {
-        if (!data.proposal.cwd && workDir.value) data.proposal.cwd = workDir.value
-        pendingHost.value = data.proposal
-      } else if (data.mode === 'launch' && data.proposal) {
-        await runLaunch(data.proposal)
-      } else if (!data.ok && data.error) {
-        notice.value = data.error
-      }
-      await refreshCurrent()
-      return !!data.ok
-    } catch (e) {
-      notice.value = e?.response?.data?.error || 'Could not run again.'
-      return false
-    } finally {
-      sending.value = false
-    }
+    const t = current.value
+    if (!t) return false
+    const R = t.round || 0
+    const text = String(
+      R === 0
+        ? t.goal
+        : (([...(t.chat || [])].reverse().find((m) => (m.round || 0) === R && m.role === 'user')) || {}).text || ''
+    ).trim()
+    if (!text) { notice.value = 'Nothing to run again.'; return false }
+    await sendChat(text)
+    return true
   }
 
   // Confirm a round was right — a like. No form: a positive example needs no

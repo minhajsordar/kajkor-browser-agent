@@ -12,9 +12,14 @@ last response re-runs that round.
 
 ## Decisions (user, 2026-07-21)
 
-1. **Replace in place.** Regenerate removes the last round's response (and its
-   activity) and re-runs the same instruction as the SAME round — not a second
-   attempt appended below.
+1. **Append a new response below (revised).** First built as "replace in place",
+   but on testing the in-place swap looked like nothing happened (a re-run of a
+   canned answer updates silently). The user asked for it to "work like if I give
+   a new prompt" → **Run again now re-sends the last instruction as a NEW turn**
+   (via the normal `sendChat`), so a fresh prompt+response appears below and
+   launch/host/browse are handled identically. No backend endpoint — it's a
+   client convenience. (The old `POST /tasks/:id/regenerate` replace endpoint was
+   removed.)
 2. **EVERYTHING is regenerable (revised 2026-07-21).** Originally "answers only"
    (no round that acted), to avoid a re-post. The user reversed it — *"Everything
    can rerun/regenerate. I need this feature."* — so the button shows on every
@@ -60,26 +65,20 @@ when the round is the last one, has a reply, is not running, and did NOT act.
   is stamped with its round (round 0 = the goal, never regenerated). Rewinding
   `round` to `R-1` lets `runChatTurn` rebuild round R with its own logic.
 
-## Built (2026-07-21, revised)
+## Built (2026-07-21, final)
 
-- Backend `POST /tasks/:id/regenerate` (server.js): 409 if busy, else re-run the
-  last round. Instruction = `task.goal` for round 0, else the round's user message.
-  `$pull` round R (turns + events), rewind `round` to R-1 (so round 0 → -1, which
-  makes `runChatTurn` rebuild round 0), clear plan state; round 0 also wipes
-  collected/counters (full restart). No side-effect gate — every round regenerates.
-- `sessions.regenerate()` + a refresh icon on the LAST round in `ChatThread.vue`
-  (no `acted` condition).
-- **UI label is "Run again", not "Regenerate"** (user's call — "regenerate" implies
-  re-generating text, but this RE-RUNS the round, incl. re-launching an app or
-  redoing browser actions).
-- **`sessions.regenerate()` handles the response mode** (fix 2026-07-21): the
-  backend re-runs through the same routing, so the reply can be a `launch`/`host`
-  proposal. It now auto-runs a launch / surfaces a host proposal exactly like a
-  normal turn — without this, "run again" on a launch/host round silently did
-  nothing (the round was re-created but the action never fired).
-- Verified: 9-case :4010 run — round 0 re-runs (the reported bug), replace-in-place
-  keeps one user + one assistant, round stays N, an acted (launch) round now
-  regenerates instead of being refused.
+- **"Run again" = re-send the last instruction as a new turn.** `sessions.regenerate()`
+  computes the last round's instruction (`task.goal` for round 0, else the round's
+  user message) and calls `sendChat(text)` — so it appends a visible prompt+response
+  and reuses all of sendChat's mode handling (queue if busy, auto-run a launch,
+  surface a host proposal, re-plan a browse round). No backend endpoint.
+- A refresh icon on the LAST round in `ChatThread.vue` (tooltip **"Run again"**,
+  toast "Running again…"); any round, any kind.
+- **Label**: "Run again", not "Regenerate" (user — this re-RUNS, incl. re-launching).
+- **Bug fixed en route:** `lastLaunchLabel` matched the "…launch-status question…"
+  obs event and produced a garbled app name on a re-run; it now requires the
+  "keyword: label" colon, and the obs event was renamed so it can't be mistaken
+  for a launch.
 
 ## Left
 

@@ -2930,38 +2930,6 @@ app.post('/tasks/:id/chat', async (req, res) => {
   res.status(out.status || 200).json(out.body);
 });
 
-// Regenerate the LAST round: re-run its instruction in place. Works for ANY round
-// — round 0 (the goal, i.e. the whole task) OR a follow-up chat round — and for
-// any kind of round, including one that acted (the user's explicit choice: a
-// regenerate click means "do it again"). We drop the round, rewind the counter,
-// and re-run runChatTurn, which rebuilds the round through the same routing.
-// Round 0: task.round is set to -1 so runChatTurn re-creates round 0 from the goal
-// (and we clear the collected data + counters so the task truly starts over).
-app.post('/tasks/:id/regenerate', async (req, res) => {
-  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
-  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
-  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'still working — stop it first, then regenerate' });
-  const R = task.round || 0;
-  // Round 0's instruction is the goal; a later round's is its user message.
-  const instruction = R === 0
-    ? String(task.goal || '')
-    : String((([...(task.chat || [])].reverse().find((m) => (m.round || 0) === R && m.role === 'user')) || {}).text || '');
-  if (!instruction.trim()) return res.status(400).json({ ok: false, error: 'nothing to regenerate' });
-
-  // A full task restart (round 0) also wipes collected data + counters so the
-  // re-run starts clean; a follow-up round keeps the session's cumulative state.
-  const reset = R === 0
-    ? { collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0, repeats: 0, summary: '', generatedText: '', lastTypedText: '' }
-    : {};
-  await tasksColl().updateOne({ taskId: task.taskId }, {
-    $pull: { chat: { round: R }, events: { round: R } },
-    $set: { round: R - 1, plan: null, currentInstruction: null, currentPhaseIndex: 0, pendingQuestion: null, status: 'done', updatedAt: nowIso(), ...reset },
-  });
-  const fresh = await tasksColl().findOne({ taskId: task.taskId }, { projection: { _id: 0 } });
-  const out = await runChatTurn(fresh, instruction, req.body?.platform, []);
-  res.status(out.status || 200).json(out.body);
-});
-
 // One conversational turn. Returns { status?, body } rather than writing to a
 // response, so the queue drainer can run a turn with no HTTP request in flight.
 async function runChatTurn(task, message, platform, imageIds = []) {

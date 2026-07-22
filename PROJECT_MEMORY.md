@@ -110,29 +110,26 @@ per app). Verified: 9-case :4010 run (persist / default profile / explicit wins 
 vscode+notepad refused on new session AND follow-up / empty=unrestricted). Live UI
 unverified. Approval-behaviour tie-in stays out of scope.
 
-### 2026-07-21 — Regenerate the last response (replace in place; EVERYTHING regenerable)
-Plan: `plans/partially-done/regenerate-response.md`. A refresh icon on the last
-round re-runs its instruction in place. **User's decisions (revised same day):**
-replace in place, and **everything is regenerable** — the first cut was "answers
-only" (no acted round) but the user reversed it: *"Everything can rerun/regenerate.
-I need this feature."* A regenerate click is an explicit manual "do it again"; the
-double-post guards elsewhere are about AUTOMATIC retries, not this.
-- `POST /tasks/:id/regenerate` (server.js): 409 if busy. Instruction = `task.goal`
-  for round 0, else the round's user message. `$pull` round R (turns + events),
-  rewind `task.round` to R-1 (round 0 → -1, so `runChatTurn` rebuilds round 0),
-  clear plan state; round 0 ALSO wipes collected/counters (full task restart). Then
-  call `runChatTurn`, which rebuilds the round through the SAME routing (browse
-  re-plans, answer re-answers, launch re-launches, tab-Q → list_tabs). NO
-  side-effect gate — `roundActed` was removed from server + `ChatThread.vue`.
-- **The round-0 bug** it fixes: a stopped/failed initial task showed "nothing to
-  regenerate" because the endpoint required `round≥1`. Round 0 = the goal.
-- Desktop: `sessions.regenerate()` + a refresh icon next to 👍/👎, shown on the LAST
-  round unconditionally. **UI label is "Run again"** (user's call — "regenerate"
-  implies re-generating text; this re-runs the round, incl. re-launching an app).
-  **`regenerate()` handles the response mode** — the re-run can return a `launch`/
-  `host` proposal, so it auto-runs a launch / surfaces a host proposal like a
-  normal turn; without that, "run again" on a launch/host round re-created the
-  round but never fired the action (the visible "it didn't re-run" bug).
+### 2026-07-21 — "Run again" = re-send the last instruction as a new turn
+Plan: `plans/partially-done/regenerate-response.md`. A refresh icon (tooltip **"Run
+again"**) on the LAST round re-runs it. **Final design (after two reversals):**
+- **Append, not replace.** First built as replace-in-place (removed the round,
+  rewound `task.round`, re-ran `runChatTurn`). But in-place swap looked like nothing
+  happened. The user asked it to "work like if I give a new prompt", so it now
+  simply **re-sends the last instruction via `sendChat`** — `sessions.regenerate()`
+  takes `task.goal` (round 0) or the round's user message and calls `sendChat(text)`.
+  A fresh prompt+response appears below, and launch/host/browse/queue are all
+  handled because it IS a normal turn. **The `POST /tasks/:id/regenerate` endpoint
+  was removed** — Run again is now purely client-side.
+- **Everything is regenerable** (no side-effect gate — a "Run again" click is an
+  explicit manual "do it again"; the double-post guards are about AUTOMATIC retries).
+- **Label** is "Run again", not "Regenerate" (this re-RUNS, incl. re-launching).
+- **`lastLaunchLabel` bug fixed:** it matched the "…launch-status question…" obs
+  event and produced a garbled app name ("-status question — answered directly…")
+  on a re-run. Now requires the "keyword: label" colon; the obs event was renamed.
+- **Why the first cuts looked broken:** re-running "check is it opened?" always
+  returns the same canned launch-status answer (a detached launch can't be
+  verified), so a silent in-place swap read as "nothing happened".
 - Verified: 9-case :4010 run (round 0 re-runs; replace-in-place keeps one user +
   one assistant at round N; an acted launch round now regenerates, not refused).
 
