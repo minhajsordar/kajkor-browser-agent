@@ -69,6 +69,14 @@ when the round is the last one, has a reply, is not running, and did NOT act.
   collected/counters (full restart). No side-effect gate — every round regenerates.
 - `sessions.regenerate()` + a refresh icon on the LAST round in `ChatThread.vue`
   (no `acted` condition).
+- **UI label is "Run again", not "Regenerate"** (user's call — "regenerate" implies
+  re-generating text, but this RE-RUNS the round, incl. re-launching an app or
+  redoing browser actions).
+- **`sessions.regenerate()` handles the response mode** (fix 2026-07-21): the
+  backend re-runs through the same routing, so the reply can be a `launch`/`host`
+  proposal. It now auto-runs a launch / surfaces a host proposal exactly like a
+  normal turn — without this, "run again" on a launch/host round silently did
+  nothing (the round was re-created but the action never fired).
 - Verified: 9-case :4010 run — round 0 re-runs (the reported bug), replace-in-place
   keeps one user + one assistant, round stays N, an acted (launch) round now
   regenerates instead of being refused.

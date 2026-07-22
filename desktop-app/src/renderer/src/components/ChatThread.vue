@@ -202,7 +202,7 @@
               >
                 <q-tooltip>Something wrong in this step? Tell the agent</q-tooltip>
               </q-btn>
-              <!-- Regenerate: re-run the last round in place — any round,
+              <!-- Run again: re-run the last round in place — any round,
                    including the initial task (round 0) and rounds that acted. -->
               <q-btn
                 v-if="ri === rounds.length - 1"
@@ -215,7 +215,7 @@
                 :disable="store.currentBusy || store.sending"
                 @click="regenerate"
               >
-                <q-tooltip>Not satisfied? Regenerate this response</q-tooltip>
+                <q-tooltip>Run this again</q-tooltip>
               </q-btn>
             </template>
             <q-chip
@@ -525,11 +525,11 @@ async function likeStep(r) {
   const okDone = await store.likeRound({ round, messageAt: lastReply?.at || null })
   if (okDone) $q.notify({ message: 'Marked this step as right', color: 'grey-8', timeout: 1200, position: 'top' })
 }
-// Regenerate the last round in place (replace its response). Backend re-runs the
-// same instruction through the same routing; refreshCurrent shows the result.
+// Run the last round again in place. Backend re-runs the same instruction through
+// the same routing (re-launches, re-plans, re-answers); refreshCurrent shows it.
 async function regenerate() {
   const ok = await store.regenerate()
-  if (ok) $q.notify({ message: 'Regenerated', color: 'grey-8', timeout: 1000, position: 'top' })
+  if (ok) $q.notify({ message: 'Running again…', color: 'grey-8', timeout: 1000, position: 'top' })
 }
 
 // Images staged for the next turn: [{name, dataUrl}]. Uploaded on send.

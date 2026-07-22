@@ -127,7 +127,12 @@ double-post guards elsewhere are about AUTOMATIC retries, not this.
 - **The round-0 bug** it fixes: a stopped/failed initial task showed "nothing to
   regenerate" because the endpoint required `round≥1`. Round 0 = the goal.
 - Desktop: `sessions.regenerate()` + a refresh icon next to 👍/👎, shown on the LAST
-  round unconditionally.
+  round unconditionally. **UI label is "Run again"** (user's call — "regenerate"
+  implies re-generating text; this re-runs the round, incl. re-launching an app).
+  **`regenerate()` handles the response mode** — the re-run can return a `launch`/
+  `host` proposal, so it auto-runs a launch / surfaces a host proposal like a
+  normal turn; without that, "run again" on a launch/host round re-created the
+  round but never fired the action (the visible "it didn't re-run" bug).
 - Verified: 9-case :4010 run (round 0 re-runs; replace-in-place keeps one user +
   one assistant at round N; an acted launch round now regenerates, not refused).
 
