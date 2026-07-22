@@ -550,11 +550,15 @@ async function runTool(base, taskId, phase) {
       .filter((t) => !/^(chrome|edge|about|devtools):/i.test(t.url || ''))
       .map((t) => `- ${(t.title || '(untitled)').slice(0, 70)} — ${(t.url || '').slice(0, 120)}`);
     // Post as a CHAT answer (5th arg), not just a flow event: "how many tabs?" is
-    // a question, and the tab list IS the reply. Note it's the tabs of the Chrome
-    // this extension runs in — a separately-launched profile isn't visible here.
-    const summary = list.length
+    // a question, and the tab list IS the reply. Always note the source Chrome —
+    // list_tabs sees only the profile the extension runs in, so a separately
+    // launched profile/window (e.g. an "open chrome" with another profile) is
+    // invisible here; without this the answer looks wrong ("I launched x.com but
+    // it shows phpMyAdmin").
+    const note = '\n\n(These are the tabs of the Chrome I run in — a separately-launched profile or window is not visible to me.)';
+    const summary = (list.length
       ? `Chrome has ${list.length} tab(s) open:\n${list.join('\n')}`
-      : 'I don\'t see any ordinary tabs open in the Chrome I\'m connected to (only internal pages, or a separately-launched profile I can\'t see).';
+      : 'I don\'t see any ordinary tabs open in the Chrome I run in.') + note;
     await taskEvent(base, taskId, 'obs', summary.slice(0, 4000), true);
     return;
   }
