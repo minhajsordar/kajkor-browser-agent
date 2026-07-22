@@ -215,7 +215,7 @@
                 :disable="store.currentBusy || store.sending"
                 @click="regenerate"
               >
-                <q-tooltip>Run this again</q-tooltip>
+                <q-tooltip>Run again</q-tooltip>
               </q-btn>
             </template>
             <q-chip
