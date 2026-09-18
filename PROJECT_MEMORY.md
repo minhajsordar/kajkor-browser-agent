@@ -11,6 +11,215 @@ history and reasoning behind them — the "why" and the "what's already there".
 
 ## Capabilities
 
+### 2026-09-18 — Security + observability hardening pass, and the first real test runner
+A review pass over the whole repo. Five changes, none of them behavioural for a
+normal run; the reasons matter more than the diffs.
+
+- **Credentials are no longer in the repo.** `MONGODB_URI` was hardcoded in
+  `backend/server.js` **with a live shared-cluster password**; the backend now
+  **refuses to boot** without it in the environment. `AUTH_SECRET` no longer falls
+  back to the public `'browser-agent-dev-secret'` — an attacker who read this repo
+  could mint valid admin JWTs for any exposed instance. Unset now means a random
+  in-memory secret (tokens do not survive a restart — deliberate: a broken login
+  beats a forgeable one). The connect log no longer prints the URI.
+  **The old password should be treated as compromised and rotated.**
+- **CORS is enumerated, not `*`.** `app.use(cors())` sent
+  `Access-Control-Allow-Origin: *`, so **any page the user was browsing could read
+  this backend** — every record ever collected, and `POST /tasks` acts on their
+  logged-in accounts. Now: no-Origin (extension fetch / curl / `file://`
+  renderer), `chrome-extension://` + `moz-extension://` (the executor's id varies
+  per install, so the SCHEME is what can be pinned), and loopback origins on any
+  port (electron-vite dev). Anything else needs `CORS_ALLOWED_ORIGINS`. A refused
+  origin gets a JSON 403 from a new terminal error handler, not Express's HTML 500.
+- **`/auth/login|register` are throttled** (20 per 15 min per IP, in-memory,
+  **loopback exempt** — throttling the user's own machine would lock them out of
+  their own app). They are the only endpoints reachable without a token.
+- **`backend/http-guard.js` is a new PURE module** holding both decisions above.
+  Same reason as `todos.js` / `lessons.js` / `app-commands.js`: `require`ing
+  server.js boots Mongo and calls `app.listen`, so security logic living in there
+  is untestable — and untestable security logic is how a policy gets quietly
+  widened by a future "the extension broke" fix.
+- **`npm test` exists** (`backend/`, `node --test`, 169 cases, no new deps). The
+  `.scratch-*-test.js` suites had good assertions but no RUNNER, so nothing
+  re-ran them. `test/helpers.js` keeps their exact `eq(name, actual, expected)`
+  shape and JSON.stringify comparison, so porting them was a header swap rather
+  than a change of assertion semantics. New coverage for `lessons.js` (scope
+  matching, caps, supersede, attribution) and `http-guard.js`.
+- **Silent `catch {}` now log.** ~15 sites across `server.js`,
+  `extension/background.js` and `extension/content.js`. NOT all of them: the
+  selector/strategy fallback loops (`resolveOne`, `findField`, per-candidate
+  `querySelectorAll` probes) stay silent on purpose — a miss there is the normal
+  path, and logging it floods the page console so the one real failure becomes
+  impossible to find. `content.js` got a `baWarn(where, e)` helper used only for
+  failures AFTER a target was resolved.
+
+Also written, not built: `plans/not-started/failure-tracking-self-improvement.md`
+— the self-improvement loop does not close today. Failures land in `task.errors[]`
+and are never aggregated (so "this button has failed 9 times" needs nine task docs
+read by hand), and `attributeLessonOutcome` has been writing `successCount` /
+`failCount` on every lesson all along while `selectLessons` ranks by `createdAt`
+alone — a lesson with 1 success and 12 failures is still injected into prompts,
+and outranks a proven one for being newer.
+
+Same-day follow-up: **`backend/frontend/` is gone** — it was an unrelated POS app
+(Vue 2, its own .env/Dockerfile/stores) accidentally carried inside the backend;
+nothing referenced it and it would have shipped inside the packaged Electron
+bundle. Deleted via `git rm -r`, so it stays recoverable from history. The two
+`.scratch-*-api-test.js` suites were NOT deleted — they hold the only end-to-end
+coverage (app-commands and todos/routines against a live backend) and are now
+committed as `backend/test/api-*.js` behind **`npm run test:api`**, which boots a
+second instance on port 4010 and needs `MONGODB_URI`. The two pure-unit scratch
+files were deleted — their assertions live verbatim in `backend/test/*.test.js`.
+
+### 2026-07-28 — Daily todos: routines → lists → items (phases 1–2 built, no clock yet)
+Plan: `plans/partially-done/daily-todos-scheduler.md`. New **Todos** tab. A
+routine is repeated work; materialising it builds a day's checklist; each item is
+ONE instruction the agent runs. **The engine is GENERAL** — the user's affiliate
+posting was only the example (their correction). It never knows what the work is,
+because running an item is just `POST /tasks`, which already routes host commands
+/ launches / questions / browse by the text.
+- **Files:** `backend/todos.js` (PURE — rotation, materialisation, missed-run
+  rules; 64 unit cases), routines/todolists API in `server.js` (45 integration
+  cases on :4010), `desktop-app` `stores/todos.js` + `pages/TodosView.vue`.
+  Renderer builds clean; **live click-through NOT done**.
+- **The model belongs to the RUN, not the caller.** "Run all" starts item 1 from
+  the request that pressed it; item 2 starts from whatever polls next, and phase
+  3's tick loop has no request at all. Every item after the first died with
+  "model required" until it was stamped on the list (`list.model`) and read back
+  in `reconcileList`. Do not remove it — phase 3 depends on it.
+- **`GET /todolists/:id` is NOT a read.** It reconciles items against their tasks
+  and starts the next item of a "Run all" chain — that is what makes the chain
+  sequential without a clock. The renderer's 2.5s poll is load-bearing.
+- **Item runs go through our OWN `POST /tasks` over loopback** (a self-call, not
+  an extracted helper) so every existing guard applies and no second creation
+  path can drift. A browser item with Chrome closed is REFUSED
+  (`needsExecutor` + `executorOnline`) rather than creating a task that would
+  hang "running" forever — the 2026-07-22 bug.
+- **Double-start is impossible by construction:** items leave `todo` via an
+  atomic `findOneAndUpdate` pinned to a startable status, and one list per
+  `(routineId, occurrenceKey)` is enforced by a unique index.
+- **A missed run is never auto-skipped** (user's requirement): lateness will gate
+  only *auto*-running; the item stays `todo` and pressable until the next
+  occurrence, and a finished list can be reset and re-run. Everything is manually
+  runnable — routine, list, item, even a `done` item (`force:true`) — because the
+  user has to be able to press it to check it works.
+- **`interval` trigger** ("every 1h / 5h") keys occurrences to the minute, not the
+  date. After the machine is off a day it fires ONCE on wake, never a replay.
+- **Not built:** the clock. Nothing fires by itself; `mode:'auto'|'draft'` and
+  `runAt` are stored and shown but gate nothing yet. Also unbuilt: sub-agents
+  (child tasks) and `decide` steps — when they land, the safety lines are that
+  only the acting child may have side effects, depth is 1, and a decide step may
+  reorder/skip but NEVER widen scope (add templates, raise a cap, flip
+  draft→auto). Enforce those in code, not in the prompt.
+- **Phase 0 is not optional:** a schedule multiplies the underlying flow's failure
+  rate and runs it unattended. Only schedule work already proven by hand.
+- The sidebar's "Scheduled Tasks" stub now opens the Todos page.
+
+### 2026-07-28 — Todos from chat: `/todo` and `/routine` (chat-app-control phase 1)
+Plan: `plans/partially-done/chat-app-control.md`. The user wants to control the
+app by chatting. Phase 1 ships the safe half: an EXPLICIT prefix.
+- **The motivating message was a hazard, not just a gap.** *"Open chrome, go to
+  amazon, post it on facebook **and add this task as todo**"* routed to `browse`,
+  so the agent did the work NOW on a live account and silently dropped the save
+  clause — the recurring "planner drops what it has no tool for, then reports
+  success" bug, where the dropped clause was the one that changed the meaning.
+- **`backend/app-commands.js` is PURE and consults NO model** (like
+  `feedback-triage.js`, for the same reason: a 7B intent classifier misfired
+  twice here, and a mis-route re-runs a posting flow). A prefix cannot be
+  misclassified. Natural phrasing is phase 2 and is the risky part.
+- **Routed at BOTH entry points and FIRST** — `POST /tasks` (a `/todo` typed into
+  an empty composer) and `runChatTurn` (a follow-up), ahead of host/launch/browse.
+  One-entry-point routing is a bug this repo has shipped twice.
+- **Writes ride the existing approval gate** (`proposals[]` + `applyProposal`),
+  with new kinds `todo.add` / `routine.create`. The card offers **Save** and
+  **Save & run now** because "do this AND save it as a todo" is genuinely
+  ambiguous — guessing "run" posts live. Declining writes nothing.
+- **A chat-created routine is always `trigger:'manual'`**, template `mode:'draft'`,
+  whatever the sentence says; scheduling is a deliberate act in the Todos page.
+  The instruction is stored **verbatim** minus the trailing save clause (that
+  clause is an instruction to us, not to the browser agent).
+- `/todo` items land on one "From chat — <date>" list per day (`source:'chat'`).
+- Verified: 38 pure + 36 integration cases; the hazard message now yields an idle
+  session with `plan:null` and a pending proposal.
+
+### 2026-07-22 — "Chrome isn't open" is answered, not hung (executor-presence heartbeat)
+A tab question ("is chrome open, how many tabs?") routed to a single-phase
+`list_tabs` round. The extension — the ONLY executor — runs only while Chrome is
+open, so with Chrome CLOSED nothing ever polled the round and it hung forever
+("running · Checking your open Chrome tabs…"). Root cause: the question is
+circular — it's answered by a tool that can only run when the answer is "yes".
+- **Fix — an executor heartbeat.** The extension's standing poll now carries
+  `GET /tasks?executor=1` (`background.js resumeUnfinished`); the backend stamps
+  `lastExecutorSeenAt` on that flag only (the desktop app lists tasks WITHOUT it,
+  so it never counts). `executorOnline()` = seen within 70s (~2 missed 30s polls).
+- **Where it's used:** both tab-question dispatch sites (POST /tasks creation +
+  `runChatTurn` follow-up) check `executorOnline()` first — if offline, they post
+  `CHROME_NOT_OPEN_REPLY` in an idle/answer round instead of a running list_tabs
+  round. Plus a **self-heal** in `GET /tasks/:id`: a still-running quiet
+  single-phase list_tabs round with 0 actions while offline is resolved to done
+  with the same reply (atomic `findOneAndUpdate` pinned to status:'running' so
+  concurrent 1.5s polls can't double-resolve). The self-heal also recovers rounds
+  that were already stuck before this change.
+- **REQUIRES an extension reload.** An un-reloaded extension polls WITHOUT
+  `?executor=1`, so the backend reads it as offline and wrongly answers "Chrome
+  isn't open" even when Chrome is open. Reload the unpacked extension after pulling.
+- **Gotcha:** `lastExecutorSeenAt` is in-memory → after a backend restart it reads
+  offline until the extension next polls (≤30s). Deliberate: a brief honest "not
+  open" beats an infinite spinner. Plan: `plans/done/chrome-not-open-answer.md`.
+
+### 2026-07-22 — Version switcher: regenerate the last round IN PLACE, keep every attempt
+**Supersedes the append-below "Run again" below it.** ↺ now regenerates the last
+round *in place* and keeps each attempt as a version you flip through with a
+`‹ n/m ›` control — not a new turn appended below. User asked for the ChatGPT-style
+behaviour. Backend-persisted; backend verified (18-case :4010), renderer builds
+clean; live click-through still to do. Plan: `plans/partially-done/version-switcher.md`.
+- **Data model** (the load-bearing idea): the NEWEST attempt of every round is
+  always the LIVE flat arrays (`task.chat`/`task.events`) — untouched, so
+  executeLoop / feedback / compaction / the extension keep working. Older attempts
+  are FROZEN in `task.variants[R] = { archived:[{chat,events,at}], viewIndex }`.
+  Total versions = `archived.length + 1`; index `archived.length` = the live one.
+- **Why never snapshot the new attempt:** a browse round finishes ASYNC (the
+  extension executes over 30s polls, appending to round R for minutes), so a
+  freeze-on-return would capture a half-done round. Only PREVIOUS attempts freeze;
+  the current one streams live.
+- **`POST /tasks/:id/regenerate`:** freeze round R → wipe it from flat arrays →
+  rewind `task.round` to R−1 (−1 for round 0) so `runChatTurn` rebuilds round R
+  through the SAME routing (re-answers/re-plans/re-launches). Round 0 also clears
+  collected/extracted/counters (a restart). Busy-guarded (409).
+- **`POST /tasks/:id/round/:r/view {index}`:** VIEW-ONLY — moves `viewIndex`, never
+  mutates the flat arrays (so it can't fight a live-updating browse round). The
+  renderer (`ChatThread.vue applyVariants`) overlays the archived attempt's
+  chat/events for display when `viewIndex` isn't the live one.
+- **Mongo gotcha:** `$set variants.R.viewIndex` + `$push variants.R.archived` in
+  ONE update is fine — sibling sub-paths don't trigger a path-conflict, even when
+  `variants` is absent. (A conflict only fires when one path prefixes the other.)
+- **v1 limits:** 👍/👎 rate the LIVE attempt, so they're disabled while viewing an
+  archived one; the switcher shows on the LAST round only.
+
+### 2026-07-22 — "Run again" (regenerate the last round) — DONE, verified live
+> SUPERSEDED 2026-07-22 by the version switcher above — ↺ no longer appends a new
+> turn; it regenerates in place and keeps versions. Kept for the history of why.
+Ships as a client convenience, no backend endpoint. A refresh icon on the LAST
+round in `ChatThread.vue` (tooltip "Run again") calls `sessions.regenerate()`,
+which computes the last round's instruction (`task.goal` for round 0, else the
+round's user message) and re-sends it as a NEW turn via the normal `sendChat`.
+So a fresh prompt+response appends below and every mode (launch/host/browse/
+answer) is handled identically — including re-launching, which is the user's
+intent. Label is "Run again", not "Regenerate", to signal it re-RUNS side effects.
+- **Why no in-place replace:** first built as `POST /tasks/:id/regenerate` that
+  removed round R and re-ran `runChatTurn`; the in-place swap looked like nothing
+  happened when a canned answer re-ran silently. User: make it "work like a new
+  prompt". That endpoint was REMOVED.
+- **Why everything is regenerable (not answers-only):** originally gated to rounds
+  that didn't act, to avoid a re-post. User reversed it — a manual click is a
+  deliberate "do it again"; the automatic double-post guards still protect
+  automatic retries.
+- **Bug fixed en route:** `lastLaunchLabel` matched a launch-status OBSERVATION
+  event and produced a garbled app name on re-run; now requires a "keyword: label"
+  colon and the obs event was renamed so it can't be mistaken for a launch.
+- Plan: `plans/done/regenerate-response.md`. Deferred: regenerate an OLDER round
+  (invalidates later rounds); a version switcher (< 1/2 >) keeping both attempts.
+
 ### 2026-07-21 — Desktop UI finish: project inheritance UX, saved-prompt picker, Feedback page
 Three code-buildable remainders from the partially-done plans (live GUI
 click-through in the Electron app is the only thing left on each). All

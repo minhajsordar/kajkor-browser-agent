@@ -5,6 +5,15 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Report a failure that happened AFTER a target was already resolved — an
+// action that should have worked and did not. Deliberately NOT used for the
+// selector/strategy fallback loops (resolveOne, findField, querySelectorAll
+// probes): a miss there is the normal path, and logging it floods the page
+// console so the one real failure is impossible to find.
+function baWarn(where, e) {
+  console.warn(`[kajkor:${where}] ${e?.message || e}`);
+}
+
 // The main content region, when a page marks one; else the whole body. Used as
 // the scroll scope by the scroll/collect tools.
 function getMainScope() {
@@ -70,7 +79,7 @@ function waitForEl(selector, timeout = 8000, interval = 200) {
 function focusEditor(el) {
   el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
   el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-  try { el.click(); } catch {}
+  try { el.click(); } catch (e) { baWarn('focusEditor.click', e); }
   el.focus();
   const sel = window.getSelection();
   const range = document.createRange();
@@ -87,7 +96,7 @@ function editorText(el) {
 // Empty the editor so a re-run never appends to leftover text.
 function clearEditor(editor) {
   focusEditor(editor);
-  try { document.execCommand('selectAll', false); document.execCommand('delete', false); } catch {}
+  try { document.execCommand('selectAll', false); document.execCommand('delete', false); } catch (e) { baWarn('clearEditor', e); }
 }
 
 // Insert text into a Lexical contenteditable. Lexical ignores direct DOM writes
@@ -103,13 +112,13 @@ async function insertIntoLexical(editor, text) {
     const dt = new DataTransfer();
     dt.setData('text/plain', text);
     editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-  } catch {}
+  } catch (e) { baWarn('insertIntoLexical.paste', e); }
   await sleep(200);
   if (editorText(editor)) return 'paste';
 
   // 2) execCommand insertText (fires native beforeinput).
   focusEditor(editor);
-  try { document.execCommand('insertText', false, text); } catch {}
+  try { document.execCommand('insertText', false, text); } catch (e) { baWarn('insertIntoLexical.execCommand', e); }
   await sleep(200);
   if (editorText(editor)) return 'execCommand';
 
@@ -218,7 +227,7 @@ async function collectBySkill(skill, target = 20, delay = 1200, maxScrolls = 200
       if (keyField && !readField(item, keyField)) continue;   // not a real item (or not hydrated yet) → skip, retry later
       // Click actions FIRST (e.g. expand "See more") so reads get full text…
       let clicked = false;
-      for (const f of clickFields) { const el = resolveOne(item, f.selectors); if (el) { try { el.click(); clicked = true; } catch {} } }
+      for (const f of clickFields) { const el = resolveOne(item, f.selectors); if (el) { try { el.click(); clicked = true; } catch (e) { baWarn(`collectBySkill.click(${f.name})`, e); } } }
       if (clicked) await sleep(400);                          // …then wait for the expansion/action to render
       const rec = {};
       for (const f of readFields) rec[f.name] = readField(item, f);
@@ -892,7 +901,7 @@ async function hoverElement(selector, text, descriptor) {
   try { el.scrollIntoView({ block: 'center' }); } catch {}
   await sleep(120);
   for (const type of ['pointerover', 'mouseover', 'mouseenter', 'mousemove']) {
-    try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch {}
+    try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (e) { baWarn(`hoverElement.${type}`, e); }
   }
   return { ok: true, matched: norm(el.getAttribute('aria-label') || el.innerText || el.textContent).slice(0, 60) || (selector || text) };
 }
@@ -1009,7 +1018,7 @@ function pressKeyOn(el, key = 'Enter') {
   el.dispatchEvent(new KeyboardEvent('keypress', opts));
   el.dispatchEvent(new KeyboardEvent('keyup', opts));
   if (k === 'Enter' && unhandled && el.form && typeof el.form.requestSubmit === 'function') {
-    try { el.form.requestSubmit(); } catch {}
+    try { el.form.requestSubmit(); } catch (e) { baWarn('pressKeyOn.requestSubmit', e); }
   }
 }
 

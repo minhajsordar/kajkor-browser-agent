@@ -46,7 +46,7 @@ async function readUrl(url, message, { settle = 2500, timeout = 30000 } = {}) {
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   } finally {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch (e) { console.warn('[readUrl] remove tab failed:', e?.message || e); } }
   }
 }
 
@@ -302,7 +302,7 @@ function ownedByOthers(taskId) {
 async function currentTab(taskId) {
   const st = AGENT[taskId] || {};
   if (st.tabId != null) {
-    try { const t = await chrome.tabs.get(st.tabId); if (t) return st.tabId; } catch {}
+    try { const t = await chrome.tabs.get(st.tabId); if (t) return st.tabId; } catch (e) { console.warn('[currentTab] get stored tab failed:', e?.message || e); }
   }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab) return tab.id;
@@ -361,7 +361,7 @@ async function msgTab(tabId, message) {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch (e) {
     if (!/Receiving end does not exist|Could not establish connection/i.test(e?.message || '')) throw e;
-    try { await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }); } catch {}
+    try { await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }); } catch (e) { console.warn('[msgTab] inject content.js failed:', e?.message || e); }
     await new Promise((r) => setTimeout(r, 400));
     return await chrome.tabs.sendMessage(tabId, message);
   }
@@ -385,7 +385,7 @@ async function runTool(base, taskId, phase) {
     const url = p.url;
     if (!url) throw new Error('navigate needs a url');
     let host = '';
-    try { host = new URL(url).hostname.replace(/^www\./, ''); } catch {}
+    try { host = new URL(url).hostname.replace(/^www\./, ''); } catch (e) { console.warn('[navigate] bad url:', url, e?.message || e); }
 
     // Reuse an already-open tab on the same site (so repeated tasks don't pile
     // up tabs) UNLESS the user explicitly asked for a new tab.
@@ -448,7 +448,7 @@ async function runTool(base, taskId, phase) {
     const tabId = p.match ? tab?.id : AGENT[taskId]?.tabId;
     if (!tabId) throw new Error(p.match ? `no tab found matching "${p.match}"` : 'no tab to close — this task has not opened one');
     let label = '';
-    try { label = hostOfTab(await chrome.tabs.get(tabId)); } catch {}
+    try { label = hostOfTab(await chrome.tabs.get(tabId)); } catch (e) { console.warn('[close_tab] get tab label failed:', e?.message || e); }
     try {
       await chrome.tabs.remove(tabId);
     } catch (e) {
@@ -538,7 +538,7 @@ async function runTool(base, taskId, phase) {
     const tab = await findTabByMatch(match);
     if (!tab) throw new Error(`no open tab found matching "${match}"`);
     await chrome.tabs.update(tab.id, { active: true });
-    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) { console.warn('[switch_tab] focus window failed:', e?.message || e); }
     AGENT[taskId] = { ...(AGENT[taskId] || {}), tabId: tab.id };
     await taskEvent(base, taskId, 'obs', `Switched to "${(tab.title || '').slice(0, 60)}" (${hostOfTab(tab)}).`);
     return;
@@ -578,7 +578,7 @@ async function runTool(base, taskId, phase) {
     await waitForTabLoad(tabId);
     await new Promise((r) => setTimeout(r, 800));
     let where = '';
-    try { where = hostOfTab(await chrome.tabs.get(tabId)); } catch {}
+    try { where = hostOfTab(await chrome.tabs.get(tabId)); } catch (e) { console.warn('[go_back] get tab host failed:', e?.message || e); }
     await taskEvent(base, taskId, 'obs', `Went back${where ? ` to ${where}` : ''}.`);
     return;
   }
@@ -1238,14 +1238,18 @@ async function runAgentTask(taskId, base = BACKEND_URL) {
 async function resumeUnfinished(base = BACKEND_URL) {
   let active = 0;
   try {
-    const j = await jf(`${base}/tasks`);
+    // ?executor=1 is our heartbeat: it tells the backend a browser executor (an
+    // open Chrome) is present, so it won't answer "Chrome isn't open" while we
+    // are here to run browser rounds (e.g. list_tabs). The desktop app lists
+    // tasks WITHOUT this flag, so only the extension counts as an executor.
+    const j = await jf(`${base}/tasks?executor=1`);
     for (const t of (j?.tasks || [])) {
       if (['running', 'checking', 'planning', 'waiting'].includes(t.status)) {
         active++;
         if (!AGENT[t.taskId]?.running) runAgentTask(t.taskId); // orphaned -> revive
       }
     }
-  } catch {}
+  } catch (e) { console.warn('[resumeUnfinished] poll failed:', e?.message || e); }
   if (active) startKeepAlive(); else stopKeepAlive();
   return active;
 }
@@ -1282,7 +1286,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           await patchTask(BACKEND_URL, msg.taskId, { status: 'stopped', finishedAt: new Date().toISOString() });
           await taskEvent(BACKEND_URL, msg.taskId, 'err', 'Stopped by user.');
-        } catch {}
+        } catch (e) { console.warn('[STOP_TASK] backend update failed:', e?.message || e); }
         sendResponse({ ok: true });
       } else if (msg?.type === 'START_LEARN') {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
