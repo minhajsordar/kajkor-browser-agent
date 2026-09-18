@@ -61,7 +61,16 @@ read by hand), and `attributeLessonOutcome` has been writing `successCount` /
 alone — a lesson with 1 success and 12 failures is still injected into prompts,
 and outranks a proven one for being newer.
 
-Same-day follow-up: **`backend/frontend/` is gone** — it was an unrelated POS app
+Same-day follow-ups: **`backend/.env` + build-time URI injection.** Removing the
+hardcoded URI broke `npm run dev`, so `server.js` now loads a gitignored
+`backend/.env` itself (no dotenv dep — plain KEY=VALUE parse; real env vars win).
+For packaged builds the URI is baked in at BUILD time, not committed:
+`desktop-app/scripts/build-server.cjs` (replaces the esbuild CLI one-liner)
+reads `../backend/.env` and `--define`s `EMBEDDED_MONGODB_URI` into
+`server.cjs`, where a `typeof`-guarded fallback picks it up. The shipped bundle
+contains the credential either way — unavoidable for a client app that talks to
+Mongo directly — but it never touches git, and `backend-config.json` in
+userData still overrides it. **`backend/frontend/` is gone** — it was an unrelated POS app
 (Vue 2, its own .env/Dockerfile/stores) accidentally carried inside the backend;
 nothing referenced it and it would have shipped inside the packaged Electron
 bundle. Deleted via `git rm -r`, so it stays recoverable from history. The two

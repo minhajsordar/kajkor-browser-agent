@@ -77,13 +77,15 @@ over-wide parent slides off-screen and the pane looks **completely empty**.
 Cost real debugging twice (sidebar sideways scroll; blank chat transcript).
 
 ### NO SECRETS IN THE REPO, AND NO SECRET DEFAULTS
-`MONGODB_URI` and `AUTH_SECRET` are read from the environment with **no
-fallback value** — the backend refuses to boot without a Mongo URI, and an unset
-`AUTH_SECRET` generates a random one per process. Do NOT "helpfully" restore a
-default for either: the previous hardcoded URI shipped a live database password
-in git, and the previous `'browser-agent-dev-secret'` meant anyone who read this
-repo could mint admin JWTs. Never log the URI. Per-install config for a packaged
-build goes in `backend-config.json` in userData, never in source.
+`MONGODB_URI` is resolved in this order: real env var → `backend/.env`
+(gitignored, dev convenience) → `EMBEDDED_MONGODB_URI` (an esbuild `--define`
+baked into `resources/server/server.cjs` by `desktop-app/scripts/build-server.cjs`
+— the packaged app's default). No URI may appear in committed source: the
+previous hardcoded one shipped a live database password in git. An unset
+`AUTH_SECRET` generates a random one per process — do NOT "helpfully" restore a
+default; the previous `'browser-agent-dev-secret'` let anyone who read this repo
+mint admin JWTs. Never log the URI. Per-install override stays
+`backend-config.json` in userData — it still wins over the baked default.
 
 ### CORS IS AN ALLOWLIST — WIDEN IT ONLY VIA `CORS_ALLOWED_ORIGINS`
 `http-guard.originAllowed` permits no-Origin callers, `chrome-extension://` /

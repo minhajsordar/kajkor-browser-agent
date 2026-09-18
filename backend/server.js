@@ -19,10 +19,29 @@ const todos = require('./todos');
 const appCommands = require('./app-commands');
 const httpGuard = require('./http-guard');
 
+// --- backend/.env (dev convenience) ------------------------------------------
+// Fills in vars NOT already in the environment — real env always wins. No
+// dotenv dependency; a plain KEY=VALUE parse is enough. Packaged builds do not
+// ship this file — they get EMBEDDED_MONGODB_URI baked in at build time, or
+// backend-config.json in userData.
+try {
+  for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (m && m[2] !== '' && !process.env[m[1]]) {
+      process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    }
+  }
+} catch { /* no .env — fine */ }
+
 const PORT = process.env.PORT || 34730;
-const MONGODB_URI = process.env.MONGODB_URI;
+// EMBEDDED_MONGODB_URI is an esbuild --define substituted at build time by
+// desktop-app/scripts/build-server.cjs. In plain `node server.js` the
+// identifier is undefined — the typeof guard keeps that path safe. It is a
+// DEFAULT only: an explicit MONGODB_URI still wins.
+const MONGODB_URI = process.env.MONGODB_URI
+  || (typeof EMBEDDED_MONGODB_URI !== 'undefined' ? EMBEDDED_MONGODB_URI : null);
 if (!MONGODB_URI) {
-  console.error('MONGODB_URI is required. Set it as an environment variable (or in backend-config.json for packaged builds).');
+  console.error('MONGODB_URI is required. Set it as an environment variable, in backend/.env, or in backend-config.json for packaged builds.');
   process.exit(1);
 }
 const DB_NAME = process.env.MONGODB_DB || 'browser_agent';

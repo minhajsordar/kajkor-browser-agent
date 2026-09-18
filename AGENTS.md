@@ -10,12 +10,13 @@ Start here, then read the two files that actually carry the project's knowledge:
 
 ## Required environment
 
-The backend reads these from the environment and has **no fallback** for the
-first one — it exits if it is missing (see CLAUDE.md, "no secrets in the repo"):
+The backend reads these from the environment — or from `backend/.env`
+(gitignored) for anything the environment doesn't already set. Packaged builds
+get `MONGODB_URI` baked into `server.cjs` by `build-server` instead:
 
 | var | required | notes |
 |---|---|---|
-| `MONGODB_URI` | **yes** | shared remote Mongo. Never commit it. |
+| `MONGODB_URI` | **yes** | shared remote Mongo. Keep it in `backend/.env`, never in source. |
 | `AUTH_SECRET` | no | unset ⇒ random per process, so tokens die on restart |
 | `MONGODB_DB` | no | defaults to `browser_agent` |
 | `OLLAMA_URL` | no | defaults to `http://localhost:11434` |

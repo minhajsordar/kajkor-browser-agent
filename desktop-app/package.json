@@ -10,7 +10,7 @@
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck": "npm run typecheck:node",
-    "build-server": "esbuild ../backend/server.js --bundle --platform=node --target=node20 --outfile=resources/server/server.cjs --format=cjs --external:mongodb-client-encryption --external:aws4 --external:kerberos --external:@mongodb-js/zstd --external:snappy --external:bson-ext --external:gcp-metadata --external:socks --external:@aws-sdk/*",
+    "build-server": "node scripts/build-server.cjs",
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
