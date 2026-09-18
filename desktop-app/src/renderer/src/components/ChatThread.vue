@@ -180,6 +180,8 @@
             <!-- per-round feedback, LEFT-aligned: was this step right or wrong?
                  Feedback is on the round, not the whole session. -->
             <template v-if="(r.replies.length || r.events.length) && !r.running">
+              <!-- Feedback rates the LIVE attempt, so it is disabled while an
+                   older version is being viewed (r.viewingArchived). -->
               <q-btn
                 dense
                 flat
@@ -187,9 +189,10 @@
                 size="10px"
                 :icon="likedRounds.has(r.round) ? 'thumb_up' : 'thumb_up_off_alt'"
                 :class="likedRounds.has(r.round) ? 'text-primary round-fb' : 'text-grey-5 round-fb'"
+                :disable="r.viewingArchived"
                 @click="likeStep(r)"
               >
-                <q-tooltip>This step was right</q-tooltip>
+                <q-tooltip>{{ r.viewingArchived ? 'Switch to the latest version to rate it' : 'This step was right' }}</q-tooltip>
               </q-btn>
               <q-btn
                 dense
@@ -198,12 +201,14 @@
                 size="10px"
                 icon="thumb_down_off_alt"
                 class="text-grey-5 round-fb"
+                :disable="r.viewingArchived"
                 @click="openFeedback(r)"
               >
-                <q-tooltip>Something wrong in this step? Tell the agent</q-tooltip>
+                <q-tooltip>{{ r.viewingArchived ? 'Switch to the latest version to rate it' : 'Something wrong in this step? Tell the agent' }}</q-tooltip>
               </q-btn>
-              <!-- Run again: re-run the last round in place — any round,
-                   including the initial task (round 0) and rounds that acted. -->
+              <!-- Run again: regenerate the last round in place — any round,
+                   including the initial task (round 0) and rounds that acted.
+                   Keeps the previous attempt as a version. -->
               <q-btn
                 v-if="ri === rounds.length - 1"
                 dense
@@ -217,6 +222,34 @@
               >
                 <q-tooltip>Run again</q-tooltip>
               </q-btn>
+              <!-- Version switcher: flip between the attempts of this round. -->
+              <template v-if="r.versions">
+                <q-btn
+                  dense
+                  flat
+                  round
+                  size="10px"
+                  icon="chevron_left"
+                  class="text-grey-6 round-fb"
+                  :disable="r.versions.index === 0 || store.currentBusy"
+                  @click="setView(r, r.versions.index - 1)"
+                >
+                  <q-tooltip>Previous version</q-tooltip>
+                </q-btn>
+                <span class="text-caption text-grey-6 version-count">{{ r.versions.index + 1 }}/{{ r.versions.total }}</span>
+                <q-btn
+                  dense
+                  flat
+                  round
+                  size="10px"
+                  icon="chevron_right"
+                  class="text-grey-6 round-fb"
+                  :disable="r.versions.index === r.versions.total - 1 || store.currentBusy"
+                  @click="setView(r, r.versions.index + 1)"
+                >
+                  <q-tooltip>Next version</q-tooltip>
+                </q-btn>
+              </template>
             </template>
             <q-chip
               v-for="(c, ci) in r.chips"
@@ -365,7 +398,16 @@
       </div>
       <template #action>
         <q-btn flat dense no-caps label="Not now" class="text-grey-7" @click="store.decideProposal(p.proposalId, 'decline')" />
-        <q-btn unelevated dense no-caps color="primary" label="Save it" @click="store.decideProposal(p.proposalId, 'approve')" />
+        <!-- "…and do it now" is the user's answer to a genuinely ambiguous
+             sentence ("do this AND save it as a todo"), so it is a separate
+             button rather than a guess. Save stays the primary — it is the
+             reversible one. -->
+        <q-btn
+          v-if="isAppProposal(p)"
+          flat dense no-caps label="Save & run now" class="text-primary"
+          @click="store.decideProposal(p.proposalId, 'approve', { run: true })"
+        />
+        <q-btn unelevated dense no-caps color="primary" :label="isAppProposal(p) ? 'Save' : 'Save it'" @click="store.decideProposal(p.proposalId, 'approve')" />
       </template>
     </q-banner>
 
@@ -531,6 +573,10 @@ async function regenerate() {
   const ok = await store.regenerate()
   if (ok) $q.notify({ message: 'Running again…', color: 'grey-8', timeout: 1000, position: 'top' })
 }
+// Flip to another attempt of a round (view-only; the live attempt is untouched).
+async function setView(r, index) {
+  await store.setRoundView(r.round, index)
+}
 
 // Images staged for the next turn: [{name, dataUrl}]. Uploaded on send.
 const pending = ref([])
@@ -556,6 +602,9 @@ const queued = computed(() => current.value?.queue || [])
 const pendingProposals = computed(() =>
   (current.value?.proposals || []).filter((p) => p.status === 'pending')
 )
+// A `/todo` or `/routine` proposal — the only kind that can also be run on the
+// spot, so it is the only one that gets the extra button.
+const isAppProposal = (p) => p.kind === 'todo.add' || p.kind === 'routine.create'
 const sessionSkillIds = computed(() =>
   (current.value?.useSkills || []).map((s) => s.skillId).filter(Boolean)
 )
@@ -686,8 +735,38 @@ const rounds = computed(() => {
   const evs = events.value
   const stamped =
     chat.some((m) => typeof m.round === 'number') || evs.some((e) => typeof e.round === 'number')
-  return stamped ? roundsByIndex(t, chat, evs) : roundsByTime(t, chat, evs)
+  const out = stamped ? roundsByIndex(t, chat, evs) : roundsByTime(t, chat, evs)
+  return applyVariants(out, t)
 })
+
+// Version switcher overlay. The LAST round may have earlier attempts frozen in
+// `variants[R].archived`; the live attempt is the flat arrays we just grouped.
+// If the round's `viewIndex` points at a frozen attempt, swap that attempt's
+// chat/events in for rendering (view-only — the live arrays are untouched). We
+// annotate the round with `versions` (drives the `< n/m >` control) and
+// `viewingArchived` (gates feedback — you only rate the live attempt).
+function applyVariants(out, t) {
+  if (!out.length) return out
+  const last = out[out.length - 1]
+  const v = (t.variants || {})[String(last.round)]
+  if (!v || !Array.isArray(v.archived) || !v.archived.length) return out
+  const total = v.archived.length + 1 // frozen attempts + the live one
+  const idx = Number.isInteger(v.viewIndex) ? Math.min(Math.max(v.viewIndex, 0), total - 1) : total - 1
+  last.versions = { total, index: idx }
+  if (idx < v.archived.length) {
+    const a = v.archived[idx] || {}
+    const aChat = a.chat || []
+    const au = aChat.find((m) => m.role === 'user')
+    if (au) last.user = { text: au.text, at: au.at }
+    last.replies = aChat.filter((m) => m.role !== 'user')
+    last.events = a.events || []
+    last.running = false
+    last.failed = false
+    last.viewingArchived = true
+    last.chips = chipsFor(last)
+  }
+  return out
+}
 
 // Exact: group by the server `round` field. Round 0 is headed by the goal;
 // round N (N≥1) by the Nth user chat turn. Compaction may drop an old round's
@@ -1034,6 +1113,11 @@ watch(
   max-width: min(860px, 100%);
   margin: 0 auto;
   width: 100%;
+}
+.version-count {
+  min-width: 26px;
+  text-align: center;
+  user-select: none;
 }
 .chip-ok {
   background: #eef1f4;

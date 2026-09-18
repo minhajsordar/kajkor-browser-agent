@@ -240,6 +240,7 @@
 
 <script setup>
 import { ref, computed, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useQuasar } from 'quasar'
 import { useSessionsStore } from '@/stores/sessions'
 import { useProjectsStore } from '@/stores/projects'
@@ -247,6 +248,7 @@ import CreateProjectDialog from '@/components/CreateProjectDialog.vue'
 import ProjectSettingsDialog from '@/components/ProjectSettingsDialog.vue'
 
 const $q = useQuasar()
+const router = useRouter()
 const store = useSessionsStore()
 const projects = useProjectsStore()
 
@@ -318,8 +320,9 @@ async function quickStart() {
   store.newSession()
 }
 
+// Routines and their day-lists now live on the Todos page.
 function scheduledSoon() {
-  $q.notify({ message: 'Scheduled tasks are coming soon.', color: 'grey-8', timeout: 1500 })
+  router.push('/todos')
 }
 
 // Group sessions under their project; registered-but-empty projects still show.

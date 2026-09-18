@@ -3,6 +3,7 @@ import ChatView from '@/pages/ChatView.vue'
 import DataView from '@/pages/DataView.vue'
 import SkillsView from '@/pages/SkillsView.vue'
 import ElementsView from '@/pages/ElementsView.vue'
+import TodosView from '@/pages/TodosView.vue'
 import FeedbackView from '@/pages/FeedbackView.vue'
 import ConnectionView from '@/pages/ConnectionView.vue'
 import LoginView from '@/pages/LoginView.vue'
@@ -13,6 +14,7 @@ import { useAuthStore } from '@/stores/auth'
 const routes = [
   { path: '/', redirect: '/chat' },
   { path: '/chat', name: 'chat', component: ChatView },
+  { path: '/todos', name: 'todos', component: TodosView },
   { path: '/data', name: 'data', component: DataView },
   { path: '/skills', name: 'skills', component: SkillsView },
   { path: '/elements', name: 'elements', component: ElementsView },

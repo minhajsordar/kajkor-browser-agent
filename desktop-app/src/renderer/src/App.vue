@@ -6,6 +6,7 @@
         <q-toolbar-title class="text-body1 text-weight-medium">Kajkor Agent</q-toolbar-title>
         <q-tabs v-if="!isAuthPage" dense shrink stretch active-color="primary" indicator-color="primary" class="text-grey-7">
           <q-route-tab to="/chat" label="Chat" no-caps />
+          <q-route-tab to="/todos" label="Todos" no-caps />
           <q-route-tab to="/data" label="Data" no-caps />
           <q-route-tab to="/skills" label="Skills" no-caps />
           <q-route-tab to="/elements" label="Elements" no-caps />

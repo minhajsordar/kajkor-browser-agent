@@ -350,22 +350,36 @@ export const useSessionsStore = defineStore('sessions', () => {
     }
   }
 
-  // Run again = re-send the last round's instruction as a NEW turn — exactly like
-  // re-typing it (the user's choice: a fresh response appears below, and launch/
-  // host/browse are handled identically because it goes through sendChat). Round
-  // 0's instruction is the goal; a later round's is its user message.
+  // Run again = regenerate the LAST round IN PLACE, keeping every attempt as a
+  // version. The backend freezes the current attempt, re-runs the same
+  // instruction through the same routing (re-answers / re-plans / re-launches),
+  // and the round's `< n/m >` switcher lets the user flip between attempts.
   async function regenerate() {
-    const t = current.value
-    if (!t) return false
-    const R = t.round || 0
-    const text = String(
-      R === 0
-        ? t.goal
-        : (([...(t.chat || [])].reverse().find((m) => (m.round || 0) === R && m.role === 'user')) || {}).text || ''
-    ).trim()
-    if (!text) { notice.value = 'Nothing to run again.'; return false }
-    await sendChat(text)
-    return true
+    if (!selectedId.value) return false
+    try {
+      const { data } = await api.post(`/tasks/${selectedId.value}/regenerate`, {})
+      if (data && data.ok === false) { notice.value = data.error || 'Could not run again.'; return false }
+      await refreshCurrent()
+      return true
+    } catch (e) {
+      notice.value = e?.response?.data?.error || 'Could not run again.'
+      return false
+    }
+  }
+
+  // Show a different attempt of a round. View-only on the backend — it just
+  // moves the round's `viewIndex`; the newest attempt stays live.
+  async function setRoundView(round, index) {
+    if (!selectedId.value) return false
+    try {
+      const { data } = await api.post(`/tasks/${selectedId.value}/round/${round}/view`, { index })
+      if (data && data.ok === false) { notice.value = data.error || 'Could not switch version.'; return false }
+      if (data?.task) current.value = data.task
+      return true
+    } catch {
+      notice.value = 'Could not switch version.'
+      return false
+    }
   }
 
   // Confirm a round was right — a like. No form: a positive example needs no
@@ -431,10 +445,11 @@ export const useSessionsStore = defineStore('sessions', () => {
 
   // Approve or decline a change the agent wants to make to its own saved
   // elements/skills. Nothing is written until this returns approved.
-  async function decideProposal(proposalId, decision) {
+  // `options.run` = the "Save & run now" button on a /todo or /routine card.
+  async function decideProposal(proposalId, decision, options = undefined) {
     if (!selectedId.value || !proposalId) return
     try {
-      const { data } = await api.post(`/tasks/${selectedId.value}/proposals/${proposalId}`, { decision })
+      const { data } = await api.post(`/tasks/${selectedId.value}/proposals/${proposalId}`, { decision, ...(options ? { options } : {}) })
       if (!data.ok && data.error) notice.value = data.error
       await refreshCurrent()
     } catch {
@@ -544,6 +559,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     submitFeedback,
     likeRound,
     analyzeFeedback,
-    regenerate
+    regenerate,
+    setRoundView
   }
 })

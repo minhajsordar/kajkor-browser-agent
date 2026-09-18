@@ -15,15 +15,32 @@ const bcrypt = require('bcryptjs');
 const { MongoClient } = require('mongodb');
 const feedbackTriage = require('./feedback-triage');
 const lessons = require('./lessons');
+const todos = require('./todos');
+const appCommands = require('./app-commands');
+const httpGuard = require('./http-guard');
 
 const PORT = process.env.PORT || 34730;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://minhaj:m1nh8j@mdb.softrking.com:27017/browser_agent?authSource=admin&directConnection=true';
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('MONGODB_URI is required. Set it as an environment variable (or in backend-config.json for packaged builds).');
+  process.exit(1);
+}
 const DB_NAME = process.env.MONGODB_DB || 'browser_agent';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const DEBUG_DIR = path.join(__dirname, '..', 'sample', 'debug');
 
 const app = express();
-app.use(cors()); // allow the extension (any origin) to POST
+
+// --- CORS -------------------------------------------------------------------
+// The origin policy lives in `http-guard.js` (pure, unit-tested) — see the
+// comment there for WHY a blanket `cors()` was unsafe.
+const EXTRA_ORIGINS = httpGuard.parseAllowedOrigins(process.env.CORS_ALLOWED_ORIGINS);
+app.use(cors({
+  origin: (origin, cb) => (httpGuard.originAllowed(origin, EXTRA_ORIGINS)
+    ? cb(null, true)
+    : cb(new Error(`origin ${origin} is not allowed — add it to CORS_ALLOWED_ORIGINS`))),
+}));
+
 app.use(express.json({ limit: '25mb' })); // large HTML payloads for debug saves
 
 // --- authentication (JWT) ----------------------------------------------------
@@ -31,15 +48,47 @@ app.use(express.json({ limit: '25mb' })); // large HTML payloads for debug saves
 // machine) pass without a token, so local workflows are unchanged. Anything
 // arriving over the network needs `Authorization: Bearer <jwt>` from
 // /auth/login. Set AUTH_ENFORCE_LOCAL=1 to require tokens locally too.
-const AUTH_SECRET = process.env.AUTH_SECRET || 'browser-agent-dev-secret';
+let AUTH_SECRET = process.env.AUTH_SECRET;
 const AUTH_ENFORCE_LOCAL = process.env.AUTH_ENFORCE_LOCAL === '1';
-if (AUTH_SECRET === 'browser-agent-dev-secret') {
-  console.warn('[auth] Using the built-in dev secret — set AUTH_SECRET before exposing this backend beyond localhost.');
+if (!AUTH_SECRET) {
+  AUTH_SECRET = crypto.randomBytes(48).toString('hex');
+  console.warn('[auth] AUTH_SECRET not set; using a random in-memory secret. Set AUTH_SECRET so tokens survive restarts.');
 }
 const usersColl = () => collFor('users');
 const isLoopback = (req) => /^(::1$|::ffff:127\.|127\.)/.test(String(req.ip || ''));
 const AUTH_EXEMPT = [/^\/health$/, /^\/auth\/(login|register)$/];
 const publicUser = (u) => ({ userId: u.userId, name: u.name, email: u.email, role: u.role });
+
+// --- login throttle ---------------------------------------------------------
+// /auth/login and /auth/register are the only endpoints reachable WITHOUT a
+// token, so they are the only ones a remote attacker can hammer. A fixed window
+// per IP is enough to make password guessing impractical; it is kept in memory
+// on purpose (no new dependency, and a restart clearing it is harmless — the
+// window is 15 minutes). Loopback is exempt: that is the user's own machine, and
+// throttling it would lock them out of their own app.
+// The window arithmetic itself is `httpGuard.throttleDecision` (pure, tested).
+const AUTH_RATE_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_RATE_MAX = 20;
+const authHits = new Map(); // ip -> { count, resetAt }
+function throttleAuth(req, res, next) {
+  if (isLoopback(req)) return next();
+  const ip = String(req.ip || 'unknown');
+  const { allowed, state } = httpGuard.throttleDecision(authHits.get(ip), Date.now(), {
+    windowMs: AUTH_RATE_WINDOW_MS, max: AUTH_RATE_MAX,
+  });
+  authHits.set(ip, state);
+  if (!allowed) {
+    console.warn(`[auth] rate limit hit for ${ip}`);
+    return res.status(429).json({ ok: false, error: 'too many attempts — try again later' });
+  }
+  next();
+}
+// Drop expired windows so a long-running backend cannot be memory-grown by
+// spraying requests from many source addresses.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, hit] of authHits) if (now > hit.resetAt) authHits.delete(ip);
+}, AUTH_RATE_WINDOW_MS).unref();
 
 app.use((req, res, next) => {
   if (AUTH_EXEMPT.some((rx) => rx.test(req.path))) return next();
@@ -52,7 +101,7 @@ app.use((req, res, next) => {
 
 // First user ever registered becomes admin. After that, only an admin (or a
 // trusted local caller) can create accounts — no open signup.
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', throttleAuth, async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password required' });
   if (String(password).length < 6) return res.status(400).json({ ok: false, error: 'password must be at least 6 characters' });
@@ -77,7 +126,7 @@ app.post('/auth/register', async (req, res) => {
   res.json({ ok: true, user: publicUser(user) });
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', throttleAuth, async (req, res) => {
   const { email, password } = req.body || {};
   const user = await usersColl().findOne({ email: String(email || '').trim().toLowerCase() });
   if (!user || !(await bcrypt.compare(String(password || ''), user.passwordHash))) {
@@ -121,7 +170,17 @@ async function connectDb() {
   await collFor('debug_items').createIndex({ taskId: 1 });
   await collFor('task_shots').createIndex({ taskId: 1 });
   await collFor('users').createIndex({ email: 1 }, { unique: true });
-  console.log(`Mongo connected: ${MONGODB_URI} / ${DB_NAME}`);
+  await collFor('routines').createIndex({ routineId: 1 }, { unique: true });
+  await collFor('todolists').createIndex({ listId: 1 }, { unique: true });
+  await collFor('todolists').createIndex({ date: -1 });
+  // The idempotency guarantee for materialising: one list per routine per
+  // occurrence, enforced by the DB so two callers racing cannot both win.
+  // Sparse — ad-hoc lists have no routine and no occurrence key.
+  await collFor('todolists').createIndex(
+    { routineId: 1, occurrenceKey: 1 },
+    { unique: true, partialFilterExpression: { routineId: { $type: 'string' }, occurrenceKey: { $type: 'string' } } },
+  );
+  console.log(`Mongo connected: ${DB_NAME}`);
   await migrateLegacyDataCollections();
 }
 
@@ -1091,14 +1150,41 @@ async function resolveModel(requested, goal) {
 
 // ---- Tasks store ----
 app.get('/tasks', async (req, res) => {
+  // The extension's standing poll carries ?executor=1 — that is our heartbeat
+  // that a browser executor (an open Chrome) is present. The desktop app also
+  // lists tasks here, WITHOUT the flag, so it never counts as an executor.
+  if (req.query.executor) lastExecutorSeenAt = Date.now();
   const tasks = await tasksColl().find({}, { projection: { _id: 0 } })
     .sort({ createdAt: -1 }).limit(50).toArray();
   res.json({ ok: true, tasks });
 });
 
 app.get('/tasks/:id', async (req, res) => {
-  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  let task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
   if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  // Self-heal a tab-listing round that no executor will ever run — e.g. Chrome
+  // was closed after it was dispatched (or the round predates this guard). If it
+  // is still running with nothing done and we haven't heard from an executor in
+  // a while, answer honestly instead of spinning forever. The filter pins
+  // status:'running' so concurrent polls can't double-resolve it.
+  if (task.status === 'running' && task.plan?.quiet
+      && Array.isArray(task.plan?.phases) && task.plan.phases.length === 1
+      && task.plan.phases[0]?.tool === 'list_tabs'
+      && !(task.actions > 0) && !executorOnline()) {
+    const r = task.round || 0;
+    const upd = await tasksColl().findOneAndUpdate(
+      { taskId: task.taskId, status: 'running' },
+      {
+        $set: { status: 'done', finishedAt: nowIso(), updatedAt: nowIso() },
+        $push: {
+          chat: { role: 'assistant', text: CHROME_NOT_OPEN_REPLY, at: nowIso(), round: r },
+          events: { at: nowIso(), kind: 'obs', msg: 'No browser executor connected — resolved the tab question without listing tabs.', round: r },
+        },
+      },
+      { returnDocument: 'after', projection: { _id: 0 } }
+    );
+    if (upd?.value || upd) task = upd.value || upd;
+  }
   res.json({ ok: true, task });
 });
 
@@ -1183,6 +1269,480 @@ app.delete('/projects/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ============================ DAILY TODOS ====================================
+// Routines → per-day todo lists → items. Plan:
+// plans/partially-done/daily-todos-scheduler.md. Phases 1-2 (build the list +
+// run items by hand) are here; the clock is phase 3.
+//
+// The engine is GENERAL: an item is "one instruction the agent runs". It never
+// knows what the work is — `POST /tasks` already routes on the instruction text
+// (host command / launch / question / browse), so a routine can mix all of them.
+const routinesColl = () => collFor('routines');
+const todoListsColl = () => collFor('todolists');
+
+// Run an item by POSTing to our OWN /tasks. Deliberately a self-call rather than
+// an extracted helper: every guard that matters (placeholder refusal, publish
+// verification, lessons, project inheritance, launch/host routing) lives on that
+// path, and a second creation path would drift from it — and be the one that
+// does damage. Loopback is auth-exempt; the caller's token is forwarded anyway
+// in case AUTH_ENFORCE_LOCAL is on.
+async function createTaskForItem(item, ctx = {}) {
+  const body = {
+    goal: item.instruction,
+    model: ctx.model || undefined,
+    useSkills: (item.skillIds && item.skillIds.length) ? item.skillIds : undefined,
+    project: ctx.projectId ? { projectId: ctx.projectId } : undefined,
+  };
+  const r = await fetch(`http://127.0.0.1:${PORT}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(ctx.auth ? { authorization: ctx.auth } : {}) },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!j || !j.task) throw new Error(j?.error || `task creation failed (${r.status})`);
+  return j.task;
+}
+
+// Turn a parsed `/todo` or `/routine` into a pending proposal on the session,
+// with the assistant turn that explains it. One helper, used by BOTH entry
+// points — routing that lives at only one of them is a bug this repo has
+// already shipped twice (the tab question, the launch branch).
+async function pushAppProposal(task, cmd, round) {
+  const { summary, detail } = appCommands.describeCommand(cmd);
+  const proposal = {
+    proposalId: crypto.randomUUID(),
+    kind: cmd.kind,
+    summary, detail,
+    payload: { name: cmd.name, instruction: cmd.instruction, projectId: task.project?.projectId || null },
+    status: 'pending', at: nowIso(),
+  };
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $push: {
+      proposals: proposal,
+      chat: { role: 'assistant', text: `${summary}\n\n${detail}`, at: nowIso(), round },
+      events: { at: nowIso(), kind: 'think', msg: `Proposed: ${summary} (waiting for your approval)`, round, meta: { proposal: cmd.kind } },
+    },
+    $set: { updatedAt: nowIso() },
+  });
+  return proposal;
+}
+
+// Call one of our own endpoints over loopback. Same reasoning as
+// `createTaskForItem`: reuse the real path (with its claim, its executor check
+// and its guards) instead of a second copy that can drift.
+async function selfPost(path, body, auth) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(auth ? { authorization: auth } : {}) },
+      body: JSON.stringify(body || {}),
+    });
+    return await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+// Today's catch-all list for todos created from chat. One per day, created on
+// first use — so "/todo …" three times in a morning builds one list, not three.
+async function chatTodoList(projectId = null) {
+  const date = todos.localDate();
+  const existing = await todoListsColl().findOne({ source: 'chat', date }, { projection: { _id: 0 } });
+  if (existing) return existing;
+  const list = {
+    listId: crypto.randomUUID(), routineId: null, occurrenceKey: null,
+    projectId: projectId || null, source: 'chat', date,
+    title: `From chat — ${date}`,
+    items: [], autoRun: false, note: '',
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await todoListsColl().insertOne({ ...list });
+  return list;
+}
+
+// A browser item cannot run with Chrome closed — creating the task anyway is
+// what left a round hung "running" forever (PROJECT_MEMORY 2026-07-22). Host
+// commands, launches and questions need no executor, so only browse work is
+// gated. Detection mirrors the routing in POST /tasks.
+function needsExecutor(instruction) {
+  const g = String(instruction || '');
+  if (HOST_PREFIX_RX.test(g)) return false;
+  if (detectLaunch(g)) return false;
+  return true;
+}
+
+// Mirror each running item's task status onto the item, then — if the list is in
+// "Run all" mode — start the next one. This is what makes "Run all" SEQUENTIAL
+// without a clock: nothing advances until the current item reaches a terminal
+// state. It runs on GET, which the desktop polls, so the chain is driven by the
+// UI watching it. Phase 3's tick loop will call the same function.
+async function reconcileList(list, ctx = {}) {
+  if (!list || !Array.isArray(list.items)) return list;
+  let changed = false;
+  // The model belongs to the RUN, not to whoever happens to be polling: the
+  // request that pressed "Run all" is long gone by the time item 3 starts, and
+  // phase 3's tick loop has no request context at all. So it is stamped on the
+  // list when a run starts and read back here. (Without this, every item after
+  // the first died with "model required".)
+  ctx = { ...ctx, model: ctx.model || list.model || '' };
+
+  const runningIds = list.items.filter((i) => i.taskId && (i.status === 'running' || i.status === 'queued')).map((i) => i.taskId);
+  if (runningIds.length) {
+    const tasks = await tasksColl().find({ taskId: { $in: runningIds } }, { projection: { _id: 0, taskId: 1, status: 1 } }).toArray();
+    const byId = new Map(tasks.map((t) => [t.taskId, t.status]));
+    for (const it of list.items) {
+      if (!it.taskId || !byId.has(it.taskId)) continue;
+      const next = todos.itemStatusFromTask(byId.get(it.taskId));
+      if (!next || next === it.status) continue;
+      it.status = next;
+      if (['done', 'failed', 'skipped'].includes(next)) it.finishedAt = nowIso();
+      changed = true;
+    }
+  }
+
+  if (list.autoRun) {
+    const busy = list.items.some((i) => i.status === 'running' || i.status === 'queued');
+    if (!busy) {
+      // Auto-advance takes only untouched items: a `failed` one is NOT retried
+      // automatically (its side effect may already have fired — the RETRY RULE),
+      // and a `skipped` one was a decision.
+      const next = list.items.find((i) => i.status === 'todo');
+      if (!next) { list.autoRun = false; changed = true; }
+      else if (needsExecutor(next.instruction) && !executorOnline()) {
+        // Wait rather than fail: Chrome may come back. The list stays in
+        // autoRun, so the next poll retries.
+        if (next.note !== 'Waiting for Chrome to be open…') { next.note = 'Waiting for Chrome to be open…'; changed = true; }
+      } else {
+        try {
+          const task = await createTaskForItem(next, ctx);
+          Object.assign(next, { status: 'running', taskId: task.taskId, startedAt: nowIso(), note: '' });
+        } catch (e) {
+          Object.assign(next, { status: 'failed', note: `Could not start: ${e.message || e}`, finishedAt: nowIso() });
+          list.autoRun = false;      // stop the chain rather than fail every item
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    await todoListsColl().updateOne(
+      { listId: list.listId },
+      { $set: { items: list.items, autoRun: !!list.autoRun, updatedAt: nowIso() } },
+    );
+    list.updatedAt = nowIso();
+  }
+  return list;
+}
+
+app.get('/routines', async (_req, res) => {
+  const routines = await routinesColl().find({}, { projection: { _id: 0 } }).sort({ createdAt: 1 }).toArray();
+  res.json({ ok: true, routines });
+});
+
+app.get('/routines/:id', async (req, res) => {
+  const routine = await routinesColl().findOne({ routineId: req.params.id }, { projection: { _id: 0 } });
+  if (!routine) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, routine });
+});
+
+app.post('/routines', async (req, res) => {
+  const routine = {
+    routineId: crypto.randomUUID(),
+    ...todos.cleanRoutine(req.body),
+    lastMaterialisedDate: null,
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await routinesColl().insertOne({ ...routine });
+  res.json({ ok: true, routine });
+});
+
+app.patch('/routines/:id', async (req, res) => {
+  const prev = await routinesColl().findOne({ routineId: req.params.id }, { projection: { _id: 0 } });
+  if (!prev) return res.status(404).json({ ok: false, error: 'not found' });
+  const set = { ...todos.cleanRoutine(req.body, prev), updatedAt: nowIso() };
+  const doc = await routinesColl().findOneAndUpdate(
+    { routineId: req.params.id }, { $set: set },
+    { returnDocument: 'after', projection: { _id: 0 } },
+  );
+  res.json({ ok: true, routine: doc?.value || doc });
+});
+
+app.delete('/routines/:id', async (req, res) => {
+  await routinesColl().deleteOne({ routineId: req.params.id });
+  // Lists keep their routineId so past days stay readable; they are history.
+  res.json({ ok: true });
+});
+
+// Build one occurrence's list. Idempotent by (routineId, occurrenceKey): asking
+// twice returns the SAME list rather than a second one — the unique index makes
+// a duplicate impossible even if two callers race. A daily routine has one
+// occurrence per date; an `interval` routine has one per fire.
+app.post('/routines/:id/materialise', async (req, res) => {
+  const routine = await routinesColl().findOne({ routineId: req.params.id }, { projection: { _id: 0 } });
+  if (!routine) return res.status(404).json({ ok: false, error: 'not found' });
+  const now = new Date();
+  const date = todos.DATE_RX.test(req.body?.date || '') ? req.body.date : todos.localDate(now);
+  const key = req.body?.date ? date : todos.occurrenceKey(routine, now);
+
+  const existing = await todoListsColl().findOne({ routineId: routine.routineId, occurrenceKey: key }, { projection: { _id: 0 } });
+  if (existing) return res.json({ ok: true, list: existing, already: true });
+
+  const { list, usedRowIds } = todos.buildList(routine, { now, date, occurrenceKey: key });
+  if (!list.items.length) return res.status(400).json({ ok: false, error: 'nothing to build — the routine has no enabled templates' });
+  list.autoRun = false;
+  try {
+    await todoListsColl().insertOne({ ...list });
+  } catch (e) {
+    if (e && e.code === 11000) {                 // raced — return the winner
+      const won = await todoListsColl().findOne({ routineId: routine.routineId, occurrenceKey: key }, { projection: { _id: 0 } });
+      return res.json({ ok: true, list: won, already: true });
+    }
+    throw e;
+  }
+  // Rotation bookkeeping: stamp the rows this occurrence consumed so the next
+  // one picks different ones. Done AFTER the insert, so a failed build never
+  // burns inputs. `lastFiredAt` is what paces an interval routine.
+  const rows = (routine.inputs?.rows || []).map((r) => (
+    usedRowIds.includes(r.id) ? { ...r, lastUsedAt: nowIso(), useCount: (r.useCount || 0) + 1 } : r
+  ));
+  await routinesColl().updateOne(
+    { routineId: routine.routineId },
+    { $set: { 'inputs.rows': rows, lastMaterialisedDate: date, lastFiredAt: nowIso(), updatedAt: nowIso() } },
+  );
+  res.json({ ok: true, list });
+});
+
+// "Run it now" for a whole routine, whatever its trigger — the test button.
+// Builds this occurrence's list if it does not exist yet (reusing it if it
+// does), then starts it. A `schedule` routine can therefore be proven by hand
+// before it is ever left to fire on its own, which is the only responsible way
+// to turn one on.
+app.post('/routines/:id/run-now', async (req, res) => {
+  const routine = await routinesColl().findOne({ routineId: req.params.id }, { projection: { _id: 0 } });
+  if (!routine) return res.status(404).json({ ok: false, error: 'not found' });
+  const now = new Date();
+  const key = todos.occurrenceKey(routine, now);
+  let list = await todoListsColl().findOne({ routineId: routine.routineId, occurrenceKey: key }, { projection: { _id: 0 } });
+
+  if (!list) {
+    const built = todos.buildList(routine, { now, occurrenceKey: key });
+    if (!built.list.items.length) return res.status(400).json({ ok: false, error: 'nothing to run — the routine has no enabled templates' });
+    built.list.autoRun = false;
+    try { await todoListsColl().insertOne({ ...built.list }); list = built.list; }
+    catch (e) {
+      if (e && e.code !== 11000) throw e;
+      list = await todoListsColl().findOne({ routineId: routine.routineId, occurrenceKey: key }, { projection: { _id: 0 } });
+    }
+    const rows = (routine.inputs?.rows || []).map((r) => (
+      built.usedRowIds.includes(r.id) ? { ...r, lastUsedAt: nowIso(), useCount: (r.useCount || 0) + 1 } : r
+    ));
+    await routinesColl().updateOne({ routineId: routine.routineId },
+      { $set: { 'inputs.rows': rows, lastMaterialisedDate: todos.localDate(now), lastFiredAt: nowIso(), updatedAt: nowIso() } });
+  }
+
+  // A test press on a finished list should actually re-run it, not report
+  // "nothing to do".
+  if (req.body?.reset && !list.items.some((i) => ['running', 'queued'].includes(i.status))) {
+    list.items = todos.resetItems(list.items, req.body.reset === true ? 'all' : String(req.body.reset));
+  }
+  const runnable = list.items.filter((i) => i.status === 'todo');
+  if (!runnable.length) return res.json({ ok: true, list, started: 0, note: 'Nothing left to run — reset the list to run it again.' });
+
+  // scope 'first' runs a single item (the cheap way to test a routine without
+  // firing the whole day's work); default runs the list sequentially.
+  const runModel = String(req.body?.model || list.model || '');
+  await todoListsColl().updateOne({ listId: list.listId }, { $set: { autoRun: true, model: runModel, items: list.items, updatedAt: nowIso() } });
+  list.autoRun = true; list.model = runModel;   // 'first' clears it again below
+  const ctx = { projectId: list.projectId, model: runModel, auth: req.headers.authorization };
+  const after = await reconcileList(list, ctx);
+  if (req.body?.scope === 'first') {
+    await todoListsColl().updateOne({ listId: list.listId }, { $set: { autoRun: false, updatedAt: nowIso() } });
+    after.autoRun = false;
+  }
+  res.json({ ok: true, list: after, started: after.items.filter((i) => i.status === 'running').length });
+});
+
+app.get('/todolists', async (req, res) => {
+  const q = {};
+  if (req.query.date) q.date = String(req.query.date);
+  if (req.query.routineId) q.routineId = String(req.query.routineId);
+  const lists = await todoListsColl().find(q, { projection: { _id: 0 } })
+    .sort({ date: -1, createdAt: -1 }).limit(Math.min(60, Number(req.query.limit) || 30)).toArray();
+  res.json({ ok: true, lists });
+});
+
+app.get('/todolists/:id', async (req, res) => {
+  const list = await todoListsColl().findOne({ listId: req.params.id }, { projection: { _id: 0 } });
+  if (!list) return res.status(404).json({ ok: false, error: 'not found' });
+  const ctx = { projectId: list.projectId, model: req.query.model || '', auth: req.headers.authorization };
+  res.json({ ok: true, list: await reconcileList(list, ctx) });
+});
+
+// Ad-hoc list — a todo list with no routine behind it (the `manual` mode).
+app.post('/todolists', async (req, res) => {
+  const b = req.body || {};
+  const now = new Date();
+  const items = (Array.isArray(b.items) ? b.items : [])
+    .map((i) => {
+      const instruction = String(i?.instruction || '').trim().slice(0, 8000);
+      if (!instruction) return null;
+      return {
+        itemId: crypto.randomUUID(), templateId: null,
+        label: String(i.label || '').slice(0, 80) || instruction.slice(0, 60),
+        instruction, inputId: null, values: {}, mode: i.mode === 'auto' ? 'auto' : 'draft',
+        skillIds: Array.isArray(i.skillIds) ? i.skillIds.slice(0, 20) : [],
+        runAt: null, status: 'todo', taskId: null, startedAt: null, finishedAt: null,
+        note: '', reason: '', missing: todos.unfilledPlaceholders(instruction),
+      };
+    }).filter(Boolean).slice(0, 200);
+  if (!items.length) return res.status(400).json({ ok: false, error: 'at least one item with an instruction is required' });
+  const list = {
+    listId: crypto.randomUUID(), routineId: null,
+    projectId: b.projectId ? String(b.projectId) : null,
+    date: todos.DATE_RX.test(b.date || '') ? b.date : todos.localDate(now),
+    occurrenceKey: null,                       // ad-hoc lists have no occurrence
+    title: String(b.title || 'Todo list').slice(0, 120),
+    items, autoRun: false, note: '',
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  await todoListsColl().insertOne({ ...list });
+  res.json({ ok: true, list });
+});
+
+app.delete('/todolists/:id', async (req, res) => {
+  await todoListsColl().deleteOne({ listId: req.params.id });
+  res.json({ ok: true });
+});
+
+// Re-run a list that already ran — the "my computer was off at 09:00" case.
+// A missed or finished list is NEVER cleaned up behind the user's back: it stays
+// there, and this puts its items back to `todo` so ▶ / Run all work again, right
+// up until the routine's next occurrence builds a fresh list.
+// `scope`: 'failed' (default — retry what broke) | 'unfinished' | 'all'.
+app.post('/todolists/:id/reset', async (req, res) => {
+  const list = await todoListsColl().findOne({ listId: req.params.id }, { projection: { _id: 0 } });
+  if (!list) return res.status(404).json({ ok: false, error: 'not found' });
+  if ((list.items || []).some((i) => i.status === 'running' || i.status === 'queued')) {
+    return res.status(409).json({ ok: false, error: 'an item is still running — stop it first' });
+  }
+  const scope = ['failed', 'unfinished', 'all'].includes(req.body?.scope) ? req.body.scope : 'failed';
+  const items = todos.resetItems(list.items, scope);
+  const changed = items.filter((it, i) => it.status !== list.items[i].status).length;
+  await todoListsColl().updateOne({ listId: list.listId }, { $set: { items, autoRun: false, updatedAt: nowIso() } });
+  res.json({ ok: true, list: { ...list, items, autoRun: false }, reset: changed });
+});
+
+// Edit one item: its text, its label, its time, or reset it back to `todo`.
+app.patch('/todolists/:id/items/:itemId', async (req, res) => {
+  const b = req.body || {};
+  const list = await todoListsColl().findOne({ listId: req.params.id }, { projection: { _id: 0 } });
+  if (!list) return res.status(404).json({ ok: false, error: 'not found' });
+  const it = (list.items || []).find((i) => i.itemId === req.params.itemId);
+  if (!it) return res.status(404).json({ ok: false, error: 'item not found' });
+  if (it.status === 'running' || it.status === 'queued') return res.status(409).json({ ok: false, error: 'item is running' });
+
+  if (typeof b.instruction === 'string' && b.instruction.trim()) {
+    it.instruction = b.instruction.trim().slice(0, 8000);
+    it.missing = todos.unfilledPlaceholders(it.instruction);
+  }
+  if (typeof b.label === 'string' && b.label.trim()) it.label = b.label.trim().slice(0, 80);
+  if (typeof b.note === 'string') it.note = b.note.slice(0, 500);
+  if (b.runAt === null || todos.HHMM_RX.test(b.runAt || '')) it.runAt = b.runAt || null;
+  // Reset for a retry — the run endpoint is what actually starts it, so this
+  // never fires a side effect on its own.
+  if (b.status === 'todo') Object.assign(it, { status: 'todo', taskId: null, startedAt: null, finishedAt: null, note: '' });
+
+  await todoListsColl().updateOne({ listId: list.listId }, { $set: { items: list.items, updatedAt: nowIso() } });
+  res.json({ ok: true, list });
+});
+
+app.post('/todolists/:id/items/:itemId/skip', async (req, res) => {
+  const r = await todoListsColl().findOneAndUpdate(
+    { listId: req.params.id, items: { $elemMatch: { itemId: req.params.itemId, status: { $in: ['todo', 'failed'] } } } },
+    { $set: { 'items.$[it].status': 'skipped', 'items.$[it].finishedAt': nowIso(), 'items.$[it].reason': String(req.body?.reason || 'Skipped by hand').slice(0, 200), updatedAt: nowIso() } },
+    { arrayFilters: [{ 'it.itemId': req.params.itemId }], returnDocument: 'after', projection: { _id: 0 } },
+  );
+  const list = r?.value || r;
+  if (!list) return res.status(409).json({ ok: false, error: 'item not found, or not in a skippable state' });
+  res.json({ ok: true, list });
+});
+
+// Start ONE item. The claim is an atomic findOneAndUpdate pinned to a startable
+// status, so a double-click (or, later, a tick racing a manual press) can never
+// start the same work twice — this is the double-post guard for the whole
+// feature, and it lives in the query, not in a check-then-write.
+//
+// EVERYTHING is manually runnable, including an item that already ran: send
+// `force:true` to re-run a `done` one. The user needs to press things to check
+// they work — same reasoning as "Run again" in chat (PROJECT_MEMORY 2026-07-21):
+// a manual press is a deliberate "do it again", and the automatic double-post
+// guards are about AUTOMATIC retries, not human ones.
+app.post('/todolists/:id/items/:itemId/run', async (req, res) => {
+  const startable = req.body?.force ? [...todos.STARTABLE, 'done'] : [...todos.STARTABLE];
+  const claimed = await todoListsColl().findOneAndUpdate(
+    { listId: req.params.id, items: { $elemMatch: { itemId: req.params.itemId, status: { $in: startable } } } },
+    { $set: { 'items.$[it].status': 'queued', 'items.$[it].startedAt': nowIso(), 'items.$[it].finishedAt': null, 'items.$[it].note': '', updatedAt: nowIso() } },
+    { arrayFilters: [{ 'it.itemId': req.params.itemId }], returnDocument: 'after', projection: { _id: 0 } },
+  );
+  const list = claimed?.value || claimed;
+  if (!list) return res.status(409).json({ ok: false, error: 'item not found, or already running' });
+  const it = list.items.find((i) => i.itemId === req.params.itemId);
+
+  const release = async (status, note) => {
+    await todoListsColl().updateOne(
+      { listId: list.listId },
+      { $set: { 'items.$[it].status': status, 'items.$[it].note': note, updatedAt: nowIso() }, },
+      { arrayFilters: [{ 'it.itemId': it.itemId }] },
+    );
+    it.status = status; it.note = note;
+  };
+
+  if (needsExecutor(it.instruction) && !executorOnline()) {
+    await release('todo', 'Chrome is not open — this item needs the extension to run it.');
+    return res.status(409).json({ ok: false, error: 'Chrome is not open — open it (with the extension loaded) and press ▶ again.', list });
+  }
+
+  try {
+    const model = String(req.body?.model || list.model || '');
+    if (model && model !== list.model) await todoListsColl().updateOne({ listId: list.listId }, { $set: { model } });
+    const task = await createTaskForItem(it, {
+      projectId: list.projectId, model, auth: req.headers.authorization,
+    });
+    await todoListsColl().updateOne(
+      { listId: list.listId },
+      { $set: { 'items.$[it].status': 'running', 'items.$[it].taskId': task.taskId, updatedAt: nowIso() } },
+      { arrayFilters: [{ 'it.itemId': it.itemId }] },
+    );
+    it.status = 'running'; it.taskId = task.taskId;
+    res.json({ ok: true, list, taskId: task.taskId });
+  } catch (e) {
+    await release('failed', `Could not start: ${e.message || e}`);
+    res.status(500).json({ ok: false, error: String(e.message || e), list });
+  }
+});
+
+// "Run all" — starts the FIRST untouched item and sets `autoRun`, which
+// `reconcileList` uses to start the next one only once this one is terminal.
+// Never parallel: two browser items at once means two tabs driving two flows,
+// which is how the wrong dialog gets clicked.
+app.post('/todolists/:id/run', async (req, res) => {
+  const list = await todoListsColl().findOne({ listId: req.params.id }, { projection: { _id: 0 } });
+  if (!list) return res.status(404).json({ ok: false, error: 'not found' });
+  if (!list.items.some((i) => i.status === 'todo')) return res.status(400).json({ ok: false, error: 'nothing left to run' });
+  const runModel = String(req.body?.model || list.model || '');
+  await todoListsColl().updateOne({ listId: list.listId }, { $set: { autoRun: true, model: runModel, updatedAt: nowIso() } });
+  list.autoRun = true; list.model = runModel;
+  const ctx = { projectId: list.projectId, model: runModel, auth: req.headers.authorization };
+  res.json({ ok: true, list: await reconcileList(list, ctx) });
+});
+
+app.post('/todolists/:id/stop', async (req, res) => {
+  await todoListsColl().updateOne({ listId: req.params.id }, { $set: { autoRun: false, updatedAt: nowIso() } });
+  const list = await todoListsColl().findOne({ listId: req.params.id }, { projection: { _id: 0 } });
+  res.json({ ok: true, list });   // a task already running is left alone — stop it in Chat
+});
+
 app.post('/tasks', async (req, res) => {
   const { goal, model, mode, schemas, useSkills, promptId, project } = req.body || {};
   if (!goal) return res.status(400).json({ ok: false, error: 'goal required' });
@@ -1211,6 +1771,34 @@ app.post('/tasks', async (req, res) => {
     : (project && typeof project === 'object' && project.name
         ? { projectId: null, name: String(project.name).slice(0, 120), dir: String(project.dir || '') }
         : null);
+
+  // App command as the OPENING goal ("/todo open chrome and …"). Must be routed
+  // here too, not only in runChatTurn — runChatTurn never sees a first turn, and
+  // a `/todo` typed into an empty composer would otherwise be browser-planned
+  // and EXECUTED, which is the exact outcome the command exists to avoid.
+  const appCmd0 = appCommands.parseAppCommand(goal);
+  if (appCmd0) {
+    const base = {
+      taskId: crypto.randomUUID(),
+      goal: String(goal), model: effModel, mode: 'once', project: taskProject,
+      schemas: [], useSkills: [], systemPrompt: null,
+      status: 'done', plan: null, currentPhaseIndex: 0,
+      collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+      repeats: 0, maxRepeats: 3, messages: [],
+      chat: [], queue: [], sessionSummary: '', currentInstruction: null, round: 0,
+      events: [], errors: [], proposals: [],
+      createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
+    };
+    if (appCmd0.error) {
+      base.chat.push({ role: 'assistant', text: appCmd0.error, at: nowIso(), round: 0 });
+      await tasksColl().insertOne({ ...base });
+      return res.json({ ok: false, task: base, error: appCmd0.error });
+    }
+    await tasksColl().insertOne({ ...base });
+    const proposal = await pushAppProposal(base, appCmd0, 0);
+    const task = await tasksColl().findOne({ taskId: base.taskId }, { projection: { _id: 0 } });
+    return res.json({ ok: true, task, mode: 'app-command', proposal });
+  }
 
   // Host-command session (goal starts with /run|/sh|/host): do NOT browser-plan.
   // Create an IDLE session (status 'done' so the extension never runs phases)
@@ -1285,6 +1873,24 @@ app.post('/tasks', async (req, res) => {
   // to the planner, which guesses a browser task ("click New Tab") that fails.
   // (detectLaunch already returned null above: it drops anything mentioning "tab".)
   if (isTabQuestion(goal)) {
+    // No browser executor connected → list_tabs could never run (it would hang
+    // "running" forever). Answer honestly in an idle session instead.
+    if (!executorOnline()) {
+      const task = {
+        taskId: crypto.randomUUID(),
+        goal: String(goal), model: effModel, mode: 'once', project: taskProject,
+        schemas: [], useSkills: [], systemPrompt: null,
+        status: 'done', plan: null, currentPhaseIndex: 0,
+        collected: [], extracted: [], scrolls: 0, scanY: 0, actions: 0,
+        repeats: 0, maxRepeats: 3, messages: [],
+        chat: [{ role: 'assistant', text: CHROME_NOT_OPEN_REPLY, at: nowIso(), round: 0 }],
+        queue: [], sessionSummary: '', currentInstruction: null, round: 0,
+        events: [{ at: nowIso(), kind: 'obs', msg: 'No browser executor connected — answered the tab question without listing tabs.', round: 0 }],
+        errors: [], createdAt: nowIso(), updatedAt: nowIso(), finishedAt: nowIso(),
+      };
+      await tasksColl().insertOne({ ...task });
+      return res.json({ ok: true, task, mode: 'answer' });
+    }
     const task = {
       taskId: crypto.randomUUID(),
       goal: String(goal), model: effModel, mode: 'once', project: taskProject,
@@ -1432,6 +2038,87 @@ app.post('/tasks/:id/rerun', async (req, res) => {
   res.json({ ok: true, task });
 });
 
+// ---- Version switcher: regenerate the last round in place, keep every attempt --
+// The newest attempt is always the LIVE flat arrays (task.chat / task.events);
+// older attempts live frozen in `variants[R].archived`, and `variants[R].viewIndex`
+// records which attempt the UI shows. Regenerating freezes the current attempt,
+// wipes round R from the flat arrays, rewinds `round`, and re-runs the SAME
+// instruction through runChatTurn — so the round is rebuilt through the same
+// routing (re-answers / re-plans a browse / re-proposes a launch). Because a
+// browse round finishes asynchronously (the extension executes over polls), we
+// NEVER snapshot the new attempt: it stays live in the flat arrays and streams in.
+app.post('/tasks/:id/regenerate', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  if (BUSY_STATUSES.has(task.status)) return res.status(409).json({ ok: false, error: 'Task is busy — wait for it to finish.' });
+
+  const R = task.round || 0;
+  // The instruction that opened round R: the goal for round 0, else round R's
+  // user turn. Re-running it reproduces the round through the same routing.
+  const instruction = R === 0
+    ? String(task.goal || '').trim()
+    : String((([...(task.chat || [])].reverse().find((m) => (m.round || 0) === R && m.role === 'user')) || {}).text || '').trim();
+  if (!instruction) return res.status(400).json({ ok: false, error: 'Nothing to run again.' });
+
+  // Freeze the CURRENT attempt of round R as a version.
+  const frozen = {
+    at: nowIso(),
+    chat: (task.chat || []).filter((m) => (m.round || 0) === R),
+    events: (task.events || []).filter((e) => (e.round || 0) === R),
+  };
+  // archived holds previous attempts; the live one sits at index archived.length.
+  const prevArchived = task.variants?.[String(R)]?.archived?.length || 0;
+  const newLiveIndex = prevArchived + 1;
+
+  // Wipe round R from the flat arrays and rewind so runChatTurn rebuilds it.
+  // round: R-1 → runChatTurn bumps back to R (−1 → 0 for round 0).
+  const reset = {
+    chat: (task.chat || []).filter((m) => (m.round || 0) !== R),
+    events: (task.events || []).filter((e) => (e.round || 0) !== R),
+    round: R - 1,
+    plan: null, currentInstruction: null, currentPhaseIndex: 0,
+    repeats: 0, scanY: 0, pendingQuestion: null, updatedAt: nowIso(),
+  };
+  // Regenerating the whole task (round 0) is a RESTART: drop collected data +
+  // counters so the re-run starts clean. Later rounds keep the cumulative
+  // session data earlier rounds gathered (it is not round-stamped).
+  if (R === 0) { reset.collected = []; reset.extracted = []; reset.scrolls = 0; reset.actions = 0; }
+
+  await tasksColl().updateOne({ taskId: task.taskId }, {
+    $set: { ...reset, [`variants.${R}.viewIndex`]: newLiveIndex },
+    $push: { [`variants.${R}.archived`]: frozen },
+  });
+
+  // Bring the in-memory task in line with the wipe, then re-run the round.
+  Object.assign(task, reset);
+  const out = await runChatTurn(task, instruction, req.body?.platform);
+  return res.status(out.status || 200).json({ ...(out.body || { ok: true }), regenerated: true, round: R, version: newLiveIndex + 1 });
+});
+
+// Switch which attempt of a round is SHOWN — view-only, no flat-array mutation
+// (so it never fights a live-updating browse round). index == archived.length
+// selects the live attempt; a smaller index selects a frozen one.
+app.post('/tasks/:id/round/:r/view', async (req, res) => {
+  const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { _id: 0, variants: 1, taskId: 1 } });
+  if (!task) return res.status(404).json({ ok: false, error: 'not found' });
+  const r = Number(req.params.r);
+  const v = Number.isInteger(r) ? task.variants?.[String(r)] : null;
+  if (!v || !Array.isArray(v.archived) || !v.archived.length) {
+    return res.status(400).json({ ok: false, error: 'No versions for this round.' });
+  }
+  const index = Number(req.body?.index);
+  const maxIndex = v.archived.length; // == the live attempt's index
+  if (!Number.isInteger(index) || index < 0 || index > maxIndex) {
+    return res.status(400).json({ ok: false, error: 'Version out of range.' });
+  }
+  const doc = await tasksColl().findOneAndUpdate(
+    { taskId: task.taskId },
+    { $set: { [`variants.${r}.viewIndex`]: index, updatedAt: nowIso() } },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  res.json({ ok: true, task: doc?.value || doc });
+});
+
 // Whitelisted field updates (the extension persists progress through here).
 // `lastTypedText`: whatever the most recent type phase actually entered. The
 // publish verification used to key on `generatedText` alone, so a post whose
@@ -1576,7 +2263,9 @@ async function sessionRecords(task, max = 60) {
       const docs = await recordsColl()
         .find({ schemaId: s.schemaId, _taskId: task.taskId }).limit(max).toArray();
       rows.push(...docs.map((d) => d.result || {}));
-    } catch {}
+    } catch (e) {
+      console.warn(`[sessionRecords] schema ${s.schemaId}: ${e?.message || e}`);
+    }
     if (rows.length >= max) break;
   }
   if (rows.length < max) rows.push(...(task.collected || []).slice(0, max - rows.length));
@@ -1694,7 +2383,9 @@ async function answerIntrospection(model, question) {
       { role: 'user', content: question },
     ], { temperature: 0.1 });
     if (reply.trim()) return reply.trim();
-  } catch {}
+  } catch (e) {
+    console.warn(`[directAnswer] model ${model}: ${e?.message || e}`);
+  }
   // Model unavailable — the inventory itself is still a useful answer.
   return lines.join('\n');
 }
@@ -1755,7 +2446,9 @@ async function routeChat(task, message) {
       { role: 'user', content: message },
     ], { format: { type: 'object', properties: { mode: { type: 'string', enum: ['browse', 'answer', 'introspect', 'save_skill'] } }, required: ['mode'] } }));
     if (['answer', 'browse', 'introspect', 'save_skill'].includes(out.mode)) return out.mode;
-  } catch {}
+  } catch (e) {
+    console.warn(`[routeChat] model ${task.model}: ${e?.message || e}`);
+  }
   return a ? 'answer' : 'browse';   // model unreachable — heuristic decides
 }
 
@@ -1887,6 +2580,27 @@ function isTabQuestion(text) {
     || /\btabs?\b[^.?!]*\b(open|opened|running)\b/.test(s);
 }
 
+// --- Browser executor presence ---------------------------------------------
+// The Chrome extension is the ONLY thing that can run browser tools (list_tabs,
+// clicks, …), and it exists only while Chrome is open. It announces itself by
+// polling GET /tasks?executor=1 every ~30s (its ba-task-poll alarm). We remember
+// the last time we heard from it so a browser round we CANNOT possibly run — e.g.
+// "how many tabs are open?" when Chrome is closed — is answered honestly instead
+// of hanging forever on a list_tabs round no executor will ever pick up (the exact
+// symptom: a task stuck "running · Checking your open Chrome tabs…").
+// In-memory: after a backend restart this reads "offline" until the extension next
+// polls (≤30s). We UNDER-claim presence on purpose — a brief honest "not open" is
+// better than an infinite spinner.
+let lastExecutorSeenAt = 0;
+const EXECUTOR_ONLINE_MS = 70_000; // ~2 missed 30s polls of grace
+function executorOnline() { return Date.now() - lastExecutorSeenAt < EXECUTOR_ONLINE_MS; }
+
+// The honest answer when a tab question arrives but no browser executor is
+// connected (Chrome not open, or the extension disabled/not reloaded).
+const CHROME_NOT_OPEN_REPLY =
+  "Chrome doesn't appear to be open — I don't see a connected browser, so there "
+  + 'are no tabs to list. Open Chrome (with the Kajkor extension installed) and ask again.';
+
 // The most recent thing this session launched, for the honest reply. Strips the
 // "Launch: " / "App-launch session: " prefix and any trailing period.
 function lastLaunchLabel(task) {
@@ -2007,7 +2721,9 @@ async function compactSession(task) {
       { role: 'system', content: 'Compact this browser-task session into <=120 words of plain text: the original goal, what has been done so far, key results/numbers, and any user preferences to remember. No preamble.' },
       { role: 'user', content: `Original goal: ${task.goal}\nProgress: ${stats}\nTranscript:\n${transcript}` },
     ], { temperature: 0.2 })).trim();
-  } catch {}
+  } catch (e) {
+    console.warn(`[compactSession] model ${task.model}: ${e?.message || e}`);
+  }
   if (!summary) summary = `${task.goal} — ${stats}. ${chat.length} chat turns compacted (model offline; details in the event log).`;
   const keep = chat.slice(-2);
   await tasksColl().updateOne({ taskId: task.taskId }, {
@@ -2710,9 +3426,15 @@ async function injectLessons(ctx, heading) {
     if (!picked.length) return { block: '', ids: [] };
     const ids = picked.map((l) => l.lessonId);
     lessonsColl().updateMany({ lessonId: { $in: ids } },
-      { $inc: { injectedCount: 1 }, $set: { lastInjectedAt: nowIso() } }).catch(() => {});
+      { $inc: { injectedCount: 1 }, $set: { lastInjectedAt: nowIso() } })
+      .catch((e) => console.warn(`[injectLessons] injectedCount bump failed: ${e?.message || e}`));
     return { block: '\n\n' + lessons.formatLessons(picked, heading), ids };
-  } catch { return { block: '', ids: [] }; }
+  } catch (e) {
+    // Never throws by contract — a lesson lookup must not break planning — but a
+    // silent return made "my lessons stopped applying" undiagnosable.
+    console.warn(`[injectLessons] ${e?.message || e}`);
+    return { block: '', ids: [] };
+  }
 }
 
 // Credit/debit the lessons injected during a round once it reaches a terminal
@@ -2750,7 +3472,11 @@ app.delete('/lessons/:id', async (req, res) => {
 // out a task the user asked for.
 // Non-blocking by design: the task keeps running; the proposal sits in the
 // transcript until it is answered.
-const PROPOSAL_KINDS = new Set(['element.create', 'element.repoint', 'skill.update', 'skill.delete', 'lesson.create']);
+// `todo.add` / `routine.create` come from an explicit `/todo` or `/routine`
+// chat command. They ride the SAME approval gate as everything else the agent
+// wants to write, because "do this and save it as a todo" is genuinely
+// ambiguous — the card is what asks whether to run it as well as save it.
+const PROPOSAL_KINDS = new Set(['element.create', 'element.repoint', 'skill.update', 'skill.delete', 'lesson.create', 'todo.add', 'routine.create']);
 
 app.post('/tasks/:id/propose', async (req, res) => {
   const task = await tasksColl().findOne({ taskId: req.params.id }, { projection: { round: 1, taskId: 1 } });
@@ -2787,7 +3513,10 @@ app.post('/tasks/:id/proposals/:pid', async (req, res) => {
   const approve = String(req.body?.decision || '').toLowerCase() === 'approve';
   let result = { ok: true };
   if (approve) {
-    try { result = await applyProposal(p); } catch (e) { result = { ok: false, error: e.message || String(e) }; }
+    // `options.run` is the card's "Save and run now" button — the explicit
+    // answer to the ambiguity, given by the user rather than guessed at.
+    const opts = { run: !!req.body?.options?.run, task, auth: req.headers.authorization };
+    try { result = await applyProposal(p, opts); } catch (e) { result = { ok: false, error: e.message || String(e) }; }
   }
 
   const status = !approve ? 'declined' : result.ok ? 'approved' : 'failed';
@@ -2812,8 +3541,55 @@ app.post('/tasks/:id/proposals/:pid', async (req, res) => {
 
 // Carry out an APPROVED proposal. Kept in one place so nothing else can write
 // element/skill records on the agent's behalf.
-async function applyProposal(p) {
+async function applyProposal(p, opts = {}) {
   const d = p.payload || {};
+
+  // ---- chat-created todos / routines (phase 1 of chat-app-control) ---------
+  // Both write through the SAME shapes the Todos page uses, so a chat-made
+  // routine is indistinguishable from a hand-made one.
+  if (p.kind === 'routine.create') {
+    const instruction = String(d.instruction || '').trim();
+    if (!instruction) return { ok: false, error: 'instruction required' };
+    const routine = {
+      routineId: crypto.randomUUID(),
+      ...todos.cleanRoutine({
+        name: d.name || 'Untitled routine',
+        // ALWAYS manual: a routine that starts firing on a schedule because of
+        // one typed sentence is exactly what the approval card exists to stop.
+        // The user turns on a schedule in the Todos page, deliberately.
+        trigger: 'manual',
+        projectId: d.projectId || null,
+        templates: [{ label: d.name || 'Step', instruction, mode: 'draft' }],
+      }),
+      lastMaterialisedDate: null,
+      createdAt: nowIso(), updatedAt: nowIso(),
+    };
+    await routinesColl().insertOne({ ...routine });
+    if (!opts.run) return { ok: true, summary: `saved routine "${routine.name}" (manual — run it from Todos)` };
+    const r = await selfPost(`/routines/${routine.routineId}/run-now`, { scope: 'first', model: opts.task?.model || '' }, opts.auth);
+    return r?.ok
+      ? { ok: true, summary: `saved routine "${routine.name}" and started it` }
+      : { ok: true, summary: `saved routine "${routine.name}" — could not start it (${r?.error || 'unknown'})` };
+  }
+
+  if (p.kind === 'todo.add') {
+    const instruction = String(d.instruction || '').trim();
+    if (!instruction) return { ok: false, error: 'instruction required' };
+    const list = await chatTodoList(d.projectId || null);
+    const item = {
+      itemId: crypto.randomUUID(), templateId: null,
+      label: String(d.name || instruction).slice(0, 80),
+      instruction, inputId: null, values: {}, mode: 'draft', skillIds: [],
+      runAt: null, status: 'todo', taskId: null, startedAt: null, finishedAt: null,
+      note: '', reason: '', missing: todos.unfilledPlaceholders(instruction),
+    };
+    await todoListsColl().updateOne({ listId: list.listId }, { $push: { items: item }, $set: { updatedAt: nowIso() } });
+    if (!opts.run) return { ok: true, summary: `added a todo — “${item.label}” (run it from Todos)` };
+    const r = await selfPost(`/todolists/${list.listId}/items/${item.itemId}/run`, { model: opts.task?.model || '' }, opts.auth);
+    return r?.ok
+      ? { ok: true, summary: `added the todo and started it` }
+      : { ok: true, summary: `added the todo — could not start it (${r?.error || 'unknown'})` };
+  }
   if (p.kind === 'element.create') {
     if (!d.host || !d.name || !d.type) return { ok: false, error: 'host, name and type required' };
     if (!ELEMENT_TYPES.has(d.type)) return { ok: false, error: 'bad element type' };
@@ -2951,6 +3727,23 @@ async function runChatTurn(task, message, platform, imageIds = []) {
 
   // Keep the transcript small enough for a local model — compact automatically.
   if (task.chat.length > 24 || JSON.stringify(task.chat).length > 9000) await compactSession(task);
+
+  // Explicit app command (/todo …, /routine …): save work for later instead of
+  // doing it now. Checked FIRST, before every other route, because the whole
+  // point is that the instruction inside it must NOT be executed — planning it
+  // as a browse round is what would post to a live account while the "save
+  // this" half of the sentence got silently dropped.
+  const appCmd = appCommands.parseAppCommand(message);
+  if (appCmd) {
+    if (appCmd.error) {
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: { chat: { role: 'assistant', text: appCmd.error, at: nowIso(), round } }, $set: { updatedAt: nowIso() },
+      });
+      return { body: { ok: false, error: appCmd.error } };
+    }
+    const proposal = await pushAppProposal(task, appCmd, round);
+    return { body: { ok: true, mode: 'app-command', proposal } };
+  }
 
   // Explicit host command (/run …): PROPOSE only — the desktop app confirms and
   // executes. Never touches browser state; never auto-triggered.
@@ -3106,6 +3899,18 @@ async function runChatTurn(task, message, platform, imageIds = []) {
   // completes after one pass (executeLoop never repeats it). Checked BEFORE the
   // launch-status branch so "is chrome open, how many tabs?" lists tabs.
   if (isTabQuestion(message)) {
+    // No browser executor connected → don't dispatch a list_tabs round that would
+    // hang forever; answer honestly (same as the launch-status branch below).
+    if (!executorOnline()) {
+      await tasksColl().updateOne({ taskId: task.taskId }, {
+        $push: {
+          chat: { role: 'assistant', text: CHROME_NOT_OPEN_REPLY, at: nowIso(), round },
+          events: { at: nowIso(), kind: 'obs', msg: 'No browser executor connected — answered the tab question without listing tabs.', round },
+        },
+        $set: { updatedAt: nowIso() },
+      });
+      return { body: { ok: true, mode: 'answer' } };
+    }
     await tasksColl().updateOne({ taskId: task.taskId }, {
       $set: {
         currentInstruction: message,
@@ -3183,7 +3988,9 @@ async function runChatTurn(task, message, platform, imageIds = []) {
         ...task.chat.slice(-11, -1).map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text })),
         { role: 'user', content: message },
       ], { temperature: 0.2 })).trim();
-    } catch {}
+    } catch (e) {
+      console.warn(`[answerFromSession] model ${task.model}: ${e?.message || e}`);
+    }
     if (!reply) reply = 'I could not reach the model to analyze the data — is Ollama running?';
 
     // The session data can't answer it → don't tell the user we lack real-time
@@ -4481,9 +5288,21 @@ app.post('/skills/validate', async (req, res) => {
         skill.fields.forEach((f) => { let n = f.name, i = 2; while (seen.has(n)) n = f.name + '_' + (i++); f.name = n; seen.add(n); });
         if (touched) changes.push('AI refined field names');
       }
-    } catch {}
+    } catch (e) {
+      console.warn(`[llmRefineNames] model ${d.model}: ${e?.message || e}`);
+    }
   }
   res.json({ ok: true, skill, changes });
+});
+
+// Last middleware: turn an error into JSON. Without this a rejected CORS origin
+// (which throws inside the cors middleware) came back as Express's default HTML
+// 500 page, so a caller saw a parse error instead of the actual reason.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  const cors = /origin .* is not allowed/.test(err?.message || '');
+  if (!cors) console.error('[unhandled]', err?.message || err);
+  res.status(cors ? 403 : 500).json({ ok: false, error: err?.message || 'internal error' });
 });
 
 connectDb()

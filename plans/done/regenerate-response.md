@@ -1,7 +1,7 @@
 # Regenerate response — retry the last round when the result isn't good
 
-**Status:** built (2026-07-21) — backend verified (10-case :4010 run), renderer
-compiles clean, live UI click-through unverified. Decisions locked with the user.
+**Status:** DONE (2026-07-22) — backend verified (10-case :4010 run), renderer
+compiles clean, live UI click-through verified by the user. Decisions locked.
 
 ## Why
 
@@ -82,6 +82,6 @@ when the round is the last one, has a reply, is not running, and did NOT act.
 
 ## Left
 
-- Live click-through in the app. Backend verified on :4010.
+- ~~Live click-through in the app.~~ Verified by the user (2026-07-22).
 - Later (not now): regenerate an OLDER round (invalidates later rounds — out of
   scope); a version switcher (< 1/2 >) keeping both attempts.

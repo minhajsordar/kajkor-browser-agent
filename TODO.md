@@ -4,4 +4,6 @@
 
 - Selecting elements and teaching skills become nightmare, because if the page is designed with react i see selector get confused because it may not hold the correct unique selector. so what we can do is i will give full instruction in skill like "navigate to facebook and then find a element which includes text "What's on your mind" then it will open a popup form then find contenteditable="true" div element, then put the post text there. then find "Next" button with only "Next" Text inside. then it will navigate to next "Post settings" step, in that step find "Post" button with only "Post" text. then click on it to publish post. after post is done wait for 3 seconds and then clise the tab. "
 
-- 
+- I should be able to give data list/table etc to do analyze or do any task. for example a list table of some affiliate product list. so it should analyze and do task according to my instruction. 
+
+- Navigate to facebook.com start Scrolling Facebook posts, analyse each post text if it is selling e commerce website or any kinds of website then it dose match our services, if we give this service then open comment box. Show all comments, then analyse all comments, collect user id link, user query, is proposeable if not then don’t collect. Then check another until end, then close post view, then check next post. So on. 
