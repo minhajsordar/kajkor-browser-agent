@@ -1,0 +1,53 @@
+.block-spacing-setting-area{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px 4px;
+    grid-column: 1 / -1;
+    grid-template-columns: 44px 1fr;
+    padding: 0px 8px 8px;
+}
+.block-spacing-setting-container{
+    position: relative;
+    display: grid;
+    margin-top: 8px;
+    margin-right: 8px;
+    width: 224px;
+    height: 112px;
+    grid-template-columns: 36px 1px 36px 1fr 36px 1px 36px;
+    grid-template-rows: 24px 2px 24px 1fr 24px 2px 24px;
+    outline-style: none;
+    cursor: default;
+    user-select: none;
+}
+.block-spacing-setting-margin-container{
+    grid-area: 1 / 1 / -1 / -1;
+    display: grid;
+    grid-template-columns: 36px 1fr 36px;
+    grid-template-rows: 24px minmax(8px, 1fr) 24px;
+    justify-items: center;
+    width: 224px;
+    height: 112px;
+    border-radius: 4px;
+}
+.block-spacing-setting-margin-container .margin-svg-background{
+    grid-area: 1 / 1 / -1 / -1;
+    overflow: hidden;
+    border-radius: 2px;
+    filter: drop-shadow(rgba(255, 255, 255, 0.2) 0px -0.5px 0px) drop-shadow(rgba(0, 0, 0, 0.4) 0px 0px 1px) drop-shadow(rgba(0, 0, 0, 0.2) 0px 1px 0px);
+}
+.block-spacing-setting-padding-container{
+    grid-area: 3 / 3 / span 3 / span 3;
+    display: grid;
+    grid-template-columns: 36px 1fr 36px;
+    grid-template-rows: 24px minmax(8px, 1fr) 24px;
+    justify-items: center;
+    width: 150px;
+    height: 60px;
+}
+.block-spacing-setting-padding-container .padding-svg-background{
+    grid-area: 1 / 1 / -1 / -1;
+    overflow: hidden;
+    border-radius: 2px;
+    filter: drop-shadow(rgba(255, 255, 255, 0.2) 0px -0.5px 0px) drop-shadow(rgba(0, 0, 0, 0.4) 0px 0px 1px) drop-shadow(rgba(0, 0, 0, 0.2) 0px 1px 0px);
+}

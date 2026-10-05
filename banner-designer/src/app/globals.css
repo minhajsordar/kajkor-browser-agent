@@ -1,0 +1,336 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+:root {
+  --foreground-rgb: 0, 0, 0;
+  --background-start-rgb: 214, 219, 220;
+  --background-end-rgb: 255, 255, 255;
+  --colors-background-1: #292929;
+  --colors-action-secondary-background: linear-gradient(180deg, rgba(255, 255, 255, 0.13) 0%, rgba(255, 255, 255, 0.11) 100%);
+  --box-shadows-action-secondary: 0px 0.5px 1px rgba(0, 0, 0, 0.8),inset 0px 0.5px 0.5px rgba(255, 255, 255, 0.12)
+  --colors-border-1: rgba(255, 255, 255, 0.13);
+  --bp-designer-font-size-1: 1rem;
+  --bp-designer-font-size-2: 0.8rem;
+  --bp-designer-font-size-3: 0.6rem;
+  --bp-designer-font-size-4: 0.4rem;
+  /* Canva-style light chrome */
+  --bp-designer-bg-1: #e5e7eb;
+  --bp-designer-bg-2: #ffffff;
+  --bp-designer-bg-3: #ffffff;
+  --bp-designer-bg-4: #f4f4f6;
+  --bp-designer-bg-5: #f7f7f9;
+  --bp-designer-fg-1: #9ca3af;
+  --bp-designer-fg-2: #6b7280;
+  --bp-designer-fg-3: #374151;
+  --bp-designer-fg-4: #111827;
+  --bp-designer-card-border: 1px solid #e5e7eb;
+}
+
+/* Hidden scrollbars — workspace still scrolls (Canva keeps them invisible). */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* @media (prefers-color-scheme: dark) {
+  :root {
+    --foreground-rgb: 255, 255, 255;
+    --background-start-rgb: 0, 0, 0;
+    --background-end-rgb: 0, 0, 0;
+  }
+} */
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background-color: #fff;
+  /* background: linear-gradient(to bottom,
+      transparent,
+      rgb(var(--background-end-rgb))) rgb(var(--background-start-rgb)); */
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+.input-file-wrap {
+  overflow: hidden;
+  position: relative;
+  cursor: pointer;
+}
+
+.file-input {
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  padding-left: 100%;
+  margin-right: -100%;
+  cursor: pointer;
+}
+
+
+.swiper {
+  width: 100%;
+  height: 100%;
+}
+
+.swiper-slide {
+  text-align: center;
+  font-size: 18px;
+  background: #fff;
+
+  /* Center slide text vertically */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.swiper-slide img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+
+.swiper {
+  width: 100%;
+  height: 100%;
+}
+
+.swiper-slide {
+  text-align: center;
+  font-size: 18px;
+  background: #fff;
+
+  /* Center slide text vertically */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.swiper-slide img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.swiper-wrapper {
+  height: 100%;
+}
+
+.animated-svg-container svg {
+  max-height: 100%;
+  max-width: 100%;
+}
+
+/* img {
+  background: transparent url(/loader/motion-blur-2.svg) no-repeat 50%;
+  background-size: 80px;
+  height: 100%;
+  max-height: 100%;
+  max-width: 100%;
+  min-height: 140px;
+  min-width: 140px;
+  -o-object-fit: contain;
+  object-fit: contain;
+  width: 100%;
+} */
+
+h4 {
+  margin-top: 0;
+  font-weight: bold;
+}
+
+h4 {
+  font-size: 16px;
+  line-height: 20px;
+  margin-bottom: 5px;
+}
+
+a {
+  text-decoration: none;
+  background-color: transparent;
+  -webkit-text-decoration-skip: objects;
+  color: var(--s-primary);
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Builder images always carry a uid class + emitted height/width — the
+   generic reset must not shrink them (it could make a 628px-tall canvas
+   image render shorter and expose the white artboard background). */
+img:not([class]) {
+  vertical-align: middle;
+  border-style: none;
+  max-width: 100%;
+  height: auto;
+}
+img {
+  vertical-align: middle;
+  border-style: none;
+}
+
+a:hover {
+  color: var(--s-primary);
+}
+
+.p-items-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0 -5px;
+  padding: 0;
+  justify-content: flex-start;
+}
+
+.p-item {
+  flex: 0 0 20%;
+  max-width: 20%;
+  padding: 0 5px 10px;
+  margin-bottom: 0;
+  display: flex;
+  position: relative;
+}
+
+.p-item-inner {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  width: 100%;
+  background: #fff;
+  border-radius: 5px;
+  box-shadow: 0 1px 1px rgba(0, 0, 0, .1);
+}
+
+.p-item-inner:hover {
+  box-shadow: 0 2px 5px rgba(0, 0, 0, .1);
+}
+
+.marks {
+  display: flex;
+  position: absolute;
+  top: 15px;
+  left: 0;
+  z-index: 10;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.marks .mark {
+  background: var(--s-m-bg);
+  width: auto;
+  color: #fff;
+  font-size: 12px;
+  padding: 3px 10px;
+  line-height: 14px;
+  margin-bottom: 2px;
+  border-radius: 0 20px 20px 0;
+  flex: 0 0 auto;
+}
+
+.p-item-details {
+  padding: 15px;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.p-item-img {
+  text-align: center;
+  border-bottom: 3px solid rgba(55, 73, 187, .03);
+  flex: 0 0 220px;
+  padding: 20px;
+  margin: 0;
+}
+
+.p-item-img>a {
+  height: 228px;
+}
+
+.p-item-img img {
+  max-width: 100%;
+}
+
+.p-item-img img:hover {
+  opacity: .9;
+}
+
+.p-item-name {
+  margin: 0 0 15px;
+  line-height: 20px;
+  overflow: hidden;
+  font-weight: 600;
+  font-size: 14px;
+  position: relative;
+  height: auto;
+}
+
+.common-home .p-item-name {
+  font-weight: 400;
+  font-size: 15px;
+}
+
+.p-item-name a {
+  color: #111;
+}
+
+.p-item-name:hover a {
+  color: var(--s-primary);
+}
+
+.p-item-name:hover {
+  cursor: pointer;
+  text-decoration: none;
+  color: var(--s-primary);
+}
+
+.p-item-price {
+  line-height: 22px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--s-primary);
+}
+
+.p-item-price .price-old {
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: line-through;
+  color: #666;
+  padding-left: 5px;
+}
+
+@media (min-width:1280px) {
+  .common-home .p-item-name {
+    height: 60px;
+  }
+}
+
+@media (max-width:1279px) {
+  .p-item {
+    flex: 0 0 25%;
+    max-width: 25%;
+  }
+
+  .p-item-name {
+    font-size: 14px;
+  }
+}
+
+@media (max-width:767px) {
+  .p-item {
+    flex: 0 0 50%;
+    max-width: 50%;
+  }
+
+  .p-item-img {
+    flex: 0 0 auto;
+  }
+}

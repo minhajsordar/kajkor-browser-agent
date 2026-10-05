@@ -1,0 +1,256 @@
+.setting-area-bg{
+    background-color: var(--bp-designer-bg-5);
+    color: var(--bp-designer-fg-4);
+    border: var(--bp-designer-card-border);
+}
+.setting-accordion-header{
+    background-color: var(--bp-designer-bg-4) !important;
+    color: var(--bp-designer-fg-4) !important;
+    border: var(--bp-designer-card-border) !important;
+    padding: 0.5rem !important;
+    font-size: 0.75rem !important;
+    line-height: 1rem !important;
+    min-height: 30px !important;
+    height: 30px !important;
+}
+.setting-accordion-icon{
+    color: var(--bp-designer-fg-4) !important;
+}
+.setting-accordion-text{
+    color: var(--bp-designer-fg-4) !important;
+    font-size: 0.8rem !important;
+}
+.setting-accordion-details{
+    background-color: var(--bp-designer-bg-5) !important;
+    color: var(--bp-designer-fg-4) !important;
+    border: var(--bp-designer-card-border) !important;
+    padding: 0px !important;
+}
+
+.css-key-not-exist-in-style {
+    /* color: rgb(156 163 175 / 1); */
+    color: var(--bp-designer-fg-4) !important;
+    background:transparent;
+        /* #9ca3af */
+    ;
+}
+
+.css-key-value-inherited-from-default-in-style {
+    color: rgb(255, 188, 134);
+    background: rgba(191, 71, 7, 0.15);
+        /* #fb923c */
+    ;
+}
+
+.css-key-value-exist-in-style {
+    color: rgb(167, 209, 255);
+    background: rgba(0, 106, 204, 0.18);
+        /* #93c5fd */
+    ;
+}
+
+.setting-items-area {
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 44px 1fr 44px 1fr;
+    padding: 8px;
+}
+.setting-items-name{
+    cursor: default;
+    user-select: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: normal;
+    letter-spacing: -0.115px;
+    display: inline-flex;
+    padding: 2px;
+    margin-left: -2px;
+    border-radius: 2px;
+    max-width: 100%;
+    box-sizing: content-box;
+    justify-self: start;
+    position: relative;
+    opacity: 1;
+}
+.setting-item-text-style-area{
+    grid-column: 1 / -1;
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: 44px 1fr 44px 1fr;
+    padding: 0px;
+}
+.setting-items-name-text-style{
+
+    cursor: default;
+    user-select: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+    font-weight: 400;
+    line-height: normal;
+    letter-spacing: -0.2px;
+    display: inline-flex;
+    color: rgb(167, 209, 255);
+    background: rgba(0, 106, 204, 0.18);
+    padding: 2px;
+    margin-left: -2px;
+    border-radius: 2px;
+    max-width: 100%;
+    box-sizing: content-box;
+    justify-self: center;
+    position: relative;
+    opacity: 1;
+    grid-row-start: 2;
+    grid-column: 2 / span 1;
+}
+.setting-items-name-text-decoration{
+    cursor: default;
+    user-select: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: normal;
+    letter-spacing: -0.2px;
+    display: inline-flex;
+    color: rgb(167, 209, 255);
+    background: rgba(0, 106, 204, 0.18);
+    padding: 2px;
+    margin-left: -2px;
+    border-radius: 2px;
+    max-width: 100%;
+    box-sizing: content-box;
+    justify-self: center;
+    position: relative;
+    opacity: 1;
+    grid-row-start: 2;
+    grid-column: 3 / span 2;
+}
+.setting-items-box-1-4{
+    grid-column: 2 / -1;
+}
+.setting-items-box-1-2{
+    grid-column: 2 / span 1;
+}
+.setting-items-box-3-4{
+    grid-column: 4 / span 1;
+}
+.setting-items-box-2-4{
+    grid-column: 3 / span 2;
+}
+.setting-items-box-4{
+    grid-column: 4 / span 1;
+}
+
+.action-element-bg-color{
+    background-color: rgba(255, 255, 255, 0.13)
+}
+.action-element-bg-color:hover{
+    background-color: rgba(255, 255, 255, 0.23)
+}
+
+.setting-num-input{
+    background-color: transparent;
+    outline-color: rgb(156 163 175 / 1);
+    outline-style: solid;
+    outline-width: 0.5px;
+    width: 100%;
+    height: 22px;
+    padding: 2px 5px;
+    padding-right: 25px;
+    font-size: 10px;
+    border-radius: 2px;
+}
+.setting-num-input:focus{
+    outline-color: rgb(0, 123, 255)!important;
+}
+
+.more-typography-input-area{
+    overflow: visible;
+    margin-left: -8px;
+    margin-right: -8px;
+    grid-column: 1 / -1;
+}
+.more-typography-input-container{
+    display: flex;
+    flex-direction: column;
+    flex:0 1 auto;
+}
+
+
+.setting-input-tab-area {
+    font-size: 11px;
+    position: relative;
+    flex-basis: 100%;
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    column-gap: 1px;
+    background: var(--bp-designer-bg-5) !important;
+    box-shadow:  0px 0.5px 1px var(--bp-designer-bg-1), inset 0px 0.5px 0.5px var(--bp-designer-bg-3) !important;
+    overflow: visible;
+    border-radius: 3px !important;
+    padding: 0px !important;
+}
+
+.setting-input-active-tab {
+    outline: 0px;
+    cursor: default;
+    user-select: none;
+    padding: 0px;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: inherit;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    border-radius: 4px 0px 0px 4px;
+    border-width: 0px;
+    border-style: solid;
+    align-self: center;
+    border-top-right-radius: 3px !important;
+    border-bottom-right-radius: 3px !important;
+    border-top-left-radius: 3px !important;
+    border-bottom-left-radius: 3px !important;
+    background-color: var(--bp-designer-bg-4) !important;
+    color: var(--bp-designer-fg-4) !important;
+    box-shadow: rgba(0, 0, 0, 0.2) 0px 16px 16px -16px inset, rgba(0, 0, 0, 0.2) 0px 12px 12px -12px inset, rgba(0, 0, 0, 0.25) 0px 8px 8px -8px inset, rgba(0, 0, 0, 0.25) 0px 4px 4px -4px inset, rgba(0, 0, 0, 0.25) 0px 3px 3px -3px inset, rgba(0, 0, 0, 0.3) 0px 1px 1px -1px inset !important;
+}
+
+.setting-input-inactive-tab {
+    outline: 0px;
+    cursor: default;
+    user-select: none;
+    padding: 0px;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: inherit;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-width: 0px;
+    border-style: solid;
+    align-self: center;
+    background: transparent !important;
+    box-shadow: none !important;
+    color: var(--bp-designer-fg-4) !important;
+    height: 22px !important;
+    border-radius: 3px !important;
+    border-color: transparent !important;
+    margin-inline-start: 0px !important;
+}

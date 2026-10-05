@@ -1,0 +1,44 @@
+.flex-alignment-setting-label{
+    cursor: default;
+    user-select: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: normal;
+    letter-spacing: -0.4px;
+    display: inline-flex;
+    color: var(--colors-text-secondary);
+    background: transparent;
+    padding: 2px;
+    margin-left: -2px;
+    border-radius: 2px;
+    max-width: 100%;
+    box-sizing: content-box;
+    justify-self: start;
+    position: relative;
+    opacity: 1;
+}
+.flex-alignment-input-area{
+    display: grid;
+    grid-template-columns: 60px 1fr;
+    gap: 8px;
+}
+.flex-alignment-control-area{
+    position: relative;
+    width: 62px;
+    height: 62px;
+    border: 1px solid var(--colors-border-1);
+    background-color: var(--colors-ui-input-background);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.flex-xy-control-area{
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px;
+    -webkit-box-align: center;
+    align-items: center;
+}

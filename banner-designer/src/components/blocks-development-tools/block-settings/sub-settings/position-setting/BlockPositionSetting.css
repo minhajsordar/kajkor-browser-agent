@@ -1,0 +1,8 @@
+.position-setting-area{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 44px auto;
+    padding: 8px;
+}

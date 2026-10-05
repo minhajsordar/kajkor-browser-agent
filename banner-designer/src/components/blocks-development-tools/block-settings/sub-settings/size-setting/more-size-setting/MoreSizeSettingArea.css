@@ -1,0 +1,51 @@
+
+.more-size-setting-area{
+    overflow: visible;
+    margin-left: -8px;
+    margin-right: -8px;
+    grid-column: 1 / -1;
+}
+.more-size-setting-container{
+    display: flex;
+    flex-direction: column;
+    flex:0 1 auto;
+}
+.more-size-setting-dropdown-action-button{
+    border-bottom-color: rgba(255, 255, 255, 0.13);;
+        border-left-color: rgba(255, 255, 255, 0.13);;
+        border-right-color: rgba(255, 255, 255, 0.13);;
+        border-top-color: rgba(255, 255, 255, 0.13);;
+        outline: 0px;
+        cursor: default;
+        user-select: none;
+        padding: 0px 0px 0px 4px;
+        box-sizing: border-box;
+        position: relative;
+        justify-content: center;
+        margin-left: 8px;
+        margin-right: 8px;
+        height: 24px;
+        overflow: visible;
+        align-self: unset;
+        font-family: inherit;
+        font-size: inherit;
+        display: flex;
+        align-items: center;
+        border-radius: 4px;
+        color: rgb(156 163 175 / 1);
+        background: transparent;
+        border-width: 1px;
+        border-style: solid;
+        box-shadow: none;
+}
+.more-size-setting-dropdown-button-title{
+    font-size: 11px;
+}
+.more-size-setting-input-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 44px 1fr 44px 1fr;
+    padding: 8px 8px 0px;
+}

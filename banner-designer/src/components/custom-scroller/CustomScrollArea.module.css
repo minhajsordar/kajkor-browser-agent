@@ -1,0 +1,53 @@
+.scrollContainer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.scrollContent {
+  width: 100%;
+  height: 100%;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  scrollbar-width: none; /* Hide scrollbar in Firefox */
+  -ms-overflow-style: none; /* Hide scrollbar in IE */
+}
+
+.scrollContent::-webkit-scrollbar {
+  display: none; /* Hide scrollbar in WebKit */
+}
+
+.scrollContainer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 8px;
+  height: 100%;
+  background: transparent;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+
+.scrollContainer.showScrollbar::after {
+  background: rgba(136, 136, 136, 0.8);
+}
+
+.scrollContainer.showScrollbar .scrollContent::-webkit-scrollbar {
+  display: block;
+  width: 8px;
+}
+
+.scrollContainer.showScrollbar .scrollContent::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 4px;
+}
+
+.scrollContainer.showScrollbar .scrollContent::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+.scrollContainer.showScrollbar .scrollContent::-webkit-scrollbar-track {
+  background: transparent;
+}

@@ -1,0 +1,203 @@
+.display-setting-area{
+  align-items: center;
+  box-sizing: border-box;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 44px 1fr;
+  padding: 8px;
+}
+.display-setting-label{
+  cursor: default;
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-family: Roboto, sans-serif;
+  font-weight: 400;
+  line-height: normal;
+  letter-spacing: -0.115px;
+  display: inline-flex;
+  padding: 2px;
+  margin-left: -2px;
+  border-radius: 2px;
+  max-width: 100%;
+  box-sizing: content-box;
+  justify-self: start;
+  position: relative;
+  opacity: 1;
+}
+.display-css-input-setting-container{
+  position: relative;
+  flex-basis: 100%;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  column-gap: 1px;
+  border-radius: 4px;
+  grid-template-columns: 1fr 37px 37px 53px;
+  font-size: 11px;
+}
+.display-css-setting-block-input-button{
+  border-bottom-color: var(--colors-border-1);
+  border-left-color: var(--colors-border-1);
+  border-right-color: var(--colors-border-1);
+  border-top-color: var(--colors-border-1);
+  outline: 0px;
+  cursor: default;
+  user-select: none;
+  padding: 0px;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: inherit;
+  position: relative;
+  display: flex
+;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  border-radius: 4px 0px 0px 4px;
+  border-width: 0px;
+  border-style: solid;
+  align-self: center;
+}
+.display-css-setting-block-input-button-inner{
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.display-css-setting-flex-input-button{
+  border-bottom-color: var(--colors-border-1);
+    border-left-color: var(--colors-border-1);
+    border-right-color: var(--colors-border-1);
+    border-top-color: var(--colors-border-1);
+    outline: 0px;
+    cursor: default;
+    user-select: none;
+    padding: 0px;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: inherit;
+    position: relative;
+    display: flex
+;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    border-radius: 0px;
+    border-width: 0px;
+    border-style: solid;
+    align-self: center;
+}
+.display-css-setting-flex-input-button-inner{
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.display-css-setting-grid-input-button{
+  border-bottom-color: var(--colors-border-1);
+    border-left-color: var(--colors-border-1);
+    border-right-color: var(--colors-border-1);
+    border-top-color: var(--colors-border-1);
+    outline: 0px;
+    cursor: default;
+    user-select: none;
+    padding: 0px;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: inherit;
+    position: relative;
+    display: flex
+;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    border-radius: 0px;
+    border-width: 0px;
+    border-style: solid;
+    align-self: center;
+}
+.display-css-setting-grid-input-button-inner{
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.display-css-setting-none-input-button{
+  border-bottom-color: var(--colors-border-1);
+  border-left-color: var(--colors-border-1);
+  border-right-color: var(--colors-border-1);
+  border-top-color: var(--colors-border-1);
+  outline: 0px;
+  cursor: default;
+  user-select: none;
+  padding: 0px 12px 0px 0px;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: inherit;
+  position: relative;
+  display: flex
+;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  border-radius: 0px 4px 4px 0px;
+  border-width: 0px;
+  border-style: solid;
+  align-self: center;
+}
+.display-css-setting-none-input-button-inner{
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.other-display-option-dropdown-button{
+
+      display: inline-flex
+  ;
+      -webkit-box-align: center;
+      align-items: center;
+      -webkit-box-pack: center;
+      justify-content: center;
+      border: none;
+      text-decoration: none;
+      white-space: nowrap;
+      font-size: var(--wf-system---typography-font-size-body);
+      line-height: var(--wf-system---typography-line-height-body);
+      font-weight: var(--wf-system---typography-font-weight-normal);
+      font-family: var(--wf-system---typography-font-family-sans-serif);
+      background: transparent;
+      box-shadow: none;
+      padding: var(--wf-system---ui-icon-button-padding-compact);
+      border-radius: 2px;
+      cursor: default;
+      height: 20px;
+      margin-right: 2px;
+      position: absolute;
+      right: 0px;
+      transform: translateY(-50%);
+      top: 50%;
+      width: 14px;
+    }
+.other-display-option-dropdown-button .dropdown-inner{
+  gap: var(--local-gap, 8px);
+  height: auto;
+  display: flex;
+  flex-flow: row;
+  -webkit-box-align: center;
+  align-items: center;
+  -webkit-box-pack: center;
+  justify-content: center;
+  width: 100%;
+    }
+
+
+.display-flex-options-area{
+  padding: 0px 8px 8px;
+  align-items: center;
+  box-sizing: border-box;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 44px 1fr;
+  position: relative;
+}

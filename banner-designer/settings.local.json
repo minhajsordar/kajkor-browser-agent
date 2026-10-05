@@ -1,9 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Read",
-      "write",
-      "Bash"
+      "Bash", 
+      "Edit", 
+      "Write"
     ]
   }
 }

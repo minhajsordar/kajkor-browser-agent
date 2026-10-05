@@ -1,0 +1,21 @@
+.upload-files-button{
+    background-color: var(--bp-designer-bg-4);
+    padding: 0px;
+    border: var(--bp-designer-card-border);
+    width: max-content;
+    height: max-content;
+    overflow: hidden;
+    position: relative;
+}
+.upload-files-button input{
+    cursor: pointer;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    display: none;
+}
+.upload-files-button label{
+    cursor: pointer;
+    padding: 5px 10px;
+
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Volumes/MinhajExtSSD/dev/nodejs/vue/erp-soft-electro/frontend/src/components/input/**)",
+      "Read(//Volumes/MinhajExtSSD/dev/nodejs/vue/erp-soft-electro/frontend/src/layouts/**)",
+      "Read(//Volumes/MinhajExtSSD/dev/nodejs/vue/erp-soft-electro/frontend/src/stores/**)",
+      "Bash(npm run *)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  }
+}

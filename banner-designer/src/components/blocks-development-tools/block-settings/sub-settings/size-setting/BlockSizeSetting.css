@@ -1,0 +1,8 @@
+.block-size-setting-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 44px 1fr 44px 1fr;
+    padding: 8px;
+}

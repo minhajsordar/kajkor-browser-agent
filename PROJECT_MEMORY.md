@@ -11,6 +11,89 @@ history and reasoning behind them — the "why" and the "what's already there".
 
 ## Capabilities
 
+### 2026-09-18 — banner-designer: canvas/iframe rendering redesigned
+The editor iframe now fills the whole workspace (`100%×100%`) — the old
+approach (CSS `transform: scale()` on the iframe element + JS-sized
+wrapper + body-padding pasteboard) produced a different coordinate space
+per layer and caused scrollbars, misaligned selection outlines, and
+phantom white strips. All canvas layout now lives INSIDE the iframe:
+`.canvas-stage` (absolute inset:0, flex-centred) holds the artboard and
+gets `transform: scale(var(--canvas-scale))` about the viewport centre;
+`&editor=true` on the iframe src gates the pasteboard/editor CSS, the
+plain `?iframe=true` preview URL (kajkor screenshots) stays full-bleed.
+Zoom/fit is computed in the iframe from `pageBuilder.zoom` → CSS var +
+`window.__canvasScale`; drag/resize/drop handlers divide viewport-px
+deltas by it. Selection chrome sits outside the stage (constant-size
+handles at any zoom), uses `position:fixed` so body padding can't offset
+it, and is suppressed for `body`/stale selections (which also crashed
+`JSON.parse(undefined)`-style sites — stale-uid guards added across
+ParentElementFlow, useInitialCssValue, useSelectedStyle, useUpdateStyle,
+and a BlocksSettings render guard for ~40 settings panels). Editor-only
+CSS: artboard `overflow:visible` (spill = Canva pasteboard) and
+text elements never clip; containers keep `overflow:hidden` for crops.
+Scale lives on the stage, NOT `.banner-canvas`, so html-to-image export
+captures a clean unscaled node.
+
+### 2026-09-18 — banner-designer: generate-from-image fix pass
+`POST /api/agent/design` accepts `images` (≤4 base64/data-URL references) and
+runs two stages — a vision model describes the image, then the text model
+writes the JSON tree from the description. Review found `pickModel` fell
+through to TEXT models when no vision model was installed (the "no vision
+model" 502 was unreachable) and honored a text-only `OLLAMA_MODEL` for the
+vision stage — fixed; `pickModel(_, true)` now returns only vision models or
+null. `isVisionModel` is a name heuristic (Ollama has no capability flag);
+it now covers gemma3 (except :1b/:270m — text-only), pixtral, llama4,
+mistral-small3.x, glm-4v on top of vl/vision/llava/moondream.
+Second pass same day: the AI dialog now sends the current artboard size
+(`width`/`height` from body styles) — before, a generate on a resized canvas
+always produced a 1200×628 banner. The data-URL strip regex also broadened
+(`[^,]*` — `data:;base64,` and `;charset=` variants were sent wrapped and
+failed decode), `postJson` got a `res` error handler (a mid-response socket
+failure could hang the route forever), and the dialog now resets selection +
+keeps `pageContentSet` like TemplatesButton does.
+
+### 2026-09-18 — banner-designer: standalone AI banner agent + Canva-like editor
+`banner-designer/` (Next.js, port 5456) was a copy of a multi-tenant ecommerce
+CMS; everything except the visual builder was deleted and the builder became a
+banner designer. The kajkor agent delegates to it:
+`POST :5456/api/agent/design {instruction, bannerId?, width?, height?, model?}`
+→ Ollama (`/api/chat`, `format:'json'`) → `normalizeBanner` → banner + draft in
+Mongo (`banner_designer` db on the shared host) → `{bannerId, builderData,
+previewUrl}`; open `/?iframe=true&bannerId=X` in a tab to screenshot it.
+Designer UI at `/?bannerId=X`: fixed-size artboard (body element), children
+`position:absolute`, drag-move + corner-resize inside the preview iframe,
+snap guides, style panels + Quick props, size presets, PNG/JPG export
+(`html-to-image`), drafts + publish + version history, image uploads
+(`/api/upload`, `public/uploads`). Canva-style left rail (64px, icon+label):
+AI / Templates / Elements (search + shapes, drag-onto-canvas) / Text
+(presets + font combos) / Brand (localStorage kit) / Uploads / Projects.
+Undo/redo (Ctrl+Z/Y, 50-deep) lives in the parent's `history` store slice —
+the iframe forwards key presses via postMessage; every content mutation
+commits through `builderActions.commit`.
+
+Load-bearing details:
+- The element model is unchanged (uid map, `style.light.<bp>.{styles,custom,
+  hover}`); `systemAddedClass` MUST equal the map key or no CSS is emitted.
+  `attributes` (img src/alt) was added and is spread onto the tag.
+- The model is asked for a SIMPLE element TREE (`{styles, children:[...]}`),
+  not the storage map — small models produce trees naturally;
+  `utils/normalizeBanner.ts` (pure) accepts tree OR map and repairs output.
+  Local 3b model: ~1 min/design; 7b instruct: ~5 min. Pass `model` to pick.
+- banner-designer has no .git dir (user removed it) — its files are only in
+  the working tree. Full architecture notes: `banner-designer/AGENTS.md`;
+  plan: `plans/partially-done/banner-designer.md`.
+
+### 2026-09-18 — Plan written: OS-level mouse + keyboard control
+User asked for real cursor/keyboard control ("computer use"). Extension can
+never do it (sandbox) — the only place is the **Electron main process**, on the
+same propose→execute→post-result rails as `runHostCommand`/`launchApp`. Plan:
+`plans/not-started/os-input-control.md`. Two load-bearing facts for whoever
+builds it: **nut-js went subscription** (prebuilt packages are paid; OSS must
+be built from source — so `koffi` FFI → `SendInput` is the recommended dep),
+and `desktopCapturer`/`screen`/`globalShortcut` already give screenshots,
+display geometry and a global kill-switch hotkey for free. Open questions at
+the bottom of the plan await the user before code.
+
 ### 2026-09-18 — Security + observability hardening pass, and the first real test runner
 A review pass over the whole repo. Five changes, none of them behavioural for a
 normal run; the reasons matter more than the diffs.

@@ -1,0 +1,112 @@
+.ratio-setting-label{
+    cursor: default;
+    user-select: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: normal;
+    letter-spacing: -0.115px;
+    display: inline-flex;
+    padding: 2px;
+    margin-left: -2px;
+    border-radius: 2px;
+    max-width: 100%;
+    box-sizing: content-box;
+    place-self: start;
+    position: relative;
+    opacity: 1;
+    top: 4px;
+}
+.ratio-setting-dropdown-num-input-container{
+    --local-gap: 8px;
+    gap: var(--local-gap, 8px);
+    height: auto;
+    display: flex;
+    flex-flow: column;
+    -webkit-box-align: stretch;
+    align-items: stretch;
+    -webkit-box-pack: start;
+    justify-content: start;
+    width: 100%;
+}
+.ratio-setting-dropdown-input-container{
+    outline: 0px;
+    cursor: default;
+    user-select: none;
+    width: 100%;
+    flex-grow: unset;
+    padding: 0px;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: inherit;
+    position: relative;
+    align-items: center;
+    height: 24px;
+    border-radius: 4px;
+    border-width: 0px;
+    border-style: solid;
+    align-self: center;
+}
+.ratio-setting-num-input-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-column: 2 / span 2;
+    grid-template-columns: 1fr min-content 1fr;
+}
+.ratio-setting-width-num-input-container{
+    grid-column-start: 1;
+    grid-row-start: 1;
+    display: grid;
+    position: relative;
+    grid-template-columns: 1fr auto;
+    transform: translate3d(0px, 0px, 0px);
+}
+.ratio-setting-height-num-input-container{
+    grid-column-start: 3;
+    grid-row-start: 1;
+    display: grid;
+    position: relative;
+    grid-template-columns: 1fr auto;
+    transform: translate3d(0px, 0px, 0px);
+}
+.ratio-setting-width-height-seperator{
+    cursor: default;
+    user-select: none;
+    font-size: 11px;
+    font-family:  Roboto, sans-serif;
+    font-weight: 400;
+    line-height: 16px;
+    letter-spacing: -0.2px;
+    justify-self: center;
+    grid-column-start: 2;
+    grid-row-start: 1;
+}
+.ratio-setting-width-label{
+    cursor: default;
+    user-select: none;
+    font-size: 11px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: 16px;
+    letter-spacing: -0.2px;
+    justify-self: center;
+    grid-column-start: 1;
+    grid-row-start: 2;
+}
+.ratio-setting-height-label{
+    cursor: default;
+    user-select: none;
+    font-size: 11px;
+    font-family: Roboto, sans-serif;
+    font-weight: 400;
+    line-height: 16px;
+    letter-spacing: -0.2px;
+    justify-self: center;
+    grid-column-start: 3;
+    grid-row-start: 2;
+}

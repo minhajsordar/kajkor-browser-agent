@@ -1,0 +1,119 @@
+.typography-setting-dropdown-action-button{
+    border-bottom-color: rgba(255, 255, 255, 0.13);;
+        border-left-color: rgba(255, 255, 255, 0.13);;
+        border-right-color: rgba(255, 255, 255, 0.13);;
+        border-top-color: rgba(255, 255, 255, 0.13);;
+        outline: 0px;
+        cursor: default;
+        user-select: none;
+        padding: 0px 0px 0px 4px;
+        box-sizing: border-box;
+        position: relative;
+        justify-content: center;
+        margin-left: 8px;
+        margin-right: 8px;
+        height: 24px;
+        overflow: visible;
+        align-self: unset;
+        font-family: inherit;
+        font-size: inherit;
+        display: flex;
+        align-items: center;
+        border-radius: 4px;
+        color: rgb(156 163 175 / 1);
+        background: transparent;
+        border-width: 1px;
+        border-style: solid;
+        box-shadow: none;
+}
+.typography-setting-dropdown-button-title{
+    font-size: 11px;
+}
+.typography-spacing-indentation-columns-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: 34% auto 72px;
+    padding: 8px 8px 0px;
+}
+.typography-spacing-setting-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px;
+}
+.letter-spacing-input{
+    gap: 8px, 8px;
+    height: auto;
+    display: flex;
+    flex-flow: column;
+    -webkit-box-align: stretch;
+    align-items: stretch;
+    -webkit-box-pack: start;
+    position: relative;
+    justify-content: stretch;
+    width: 100%;
+    -webkit-box-flex: 1;
+    flex-grow: 1;
+}
+
+
+.typography-case-direction-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: auto auto 72px;
+    padding: 8px 8px 0px;
+}
+.typography-case-setting-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px;
+    grid-column: span 2;
+}
+.typography-direction-setting-container{
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px;
+}
+
+.typography-break-wrap-container{
+    grid-column: 1 / -1;
+    margin-right: -8px;
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: 44px 1fr 1fr;
+    padding: 8px;
+}
+.typography-overflow-wrap-container{
+    grid-column: 1 / -1;
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: 44px 1fr;
+    padding: 0px 8px 8px;
+}
+.typography-stroke-container{
+    grid-column: 1 / -1;
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: 44px 1fr 44px 1fr;
+    padding: 8px;
+}
+.typography-shadow-container{
+    grid-column: 1 / -1;
+    align-items: center;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    padding: 0px 8px;
+}
